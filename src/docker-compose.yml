@@ -1,0 +1,65 @@
+services:
+  colloquium-core:
+    build:
+      context: .
+      dockerfile: Dockerfile.core
+    container_name: colloquium-core
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./projects:/app/projects
+      - ./agent:/app/agent
+    networks:
+      - devspace-net
+    depends_on:
+      - mcp-sandbox
+  mcp-sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mcp-sandbox
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./projects:/app/projects
+      - /app/sandwiches
+    environment:
+      - RUST_LOG=debug
+    networks:
+      - devspace-net
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: frontend
+    volumes:
+      - ./frontend/rtm:/app/frontend
+      - ./logs:/app/logs
+    networks:
+      - devspace-net
+    depends_on:
+      - colloquium-core
+
+  nginx-router:
+    build:
+      context: .
+      dockerfile: Dockerfile.nginx
+    container_name: nginx-router
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
+    ports:
+      - "8008:8008"
+    networks:
+      - devspace-net
+    depends_on:
+      - colloquium-core
+      - frontend
+
+networks:
+  devspace-net:
+    driver: bridge
+
+volumes:
+  data_volume:
+  logs_volume:

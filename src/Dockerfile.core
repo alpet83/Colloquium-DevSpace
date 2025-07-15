@@ -1,0 +1,23 @@
+FROM python:3.11-slim
+
+
+# Создание виртуальной среды и установка зависимостей
+RUN python3 -m venv /app/venv
+ENV PATH="/app/venv/bin:$PATH"
+RUN pip install --no-cache-dir fastapi uvicorn openai requests asyncio gitpython
+RUN apt-get update && apt-get install -y git
+RUN apt install -y inetutils-ping net-tools traceroute dnsutils nano 
+RUN pip install watchgod toml
+# Рабочая директория
+WORKDIR /app/agent
+VOLUME /app/agent
+VOLUME /app/projects
+VOLUME /app/logs
+
+# Экспозит порта
+EXPOSE 8080
+
+# Запуск
+
+# CMD ["sh", "-c", "/app/agent/start_agent.sh"]
+CMD ["python3", "/app/agent/server.py"]

@@ -1,0 +1,17 @@
+FROM node:20
+
+# Рабочая директория
+WORKDIR /app/frontend
+
+VOLUME /app/frontend
+VOLUME /app/logs
+
+# Установка Vue CLI
+RUN npm install -g @vue/cli
+RUN apt update && apt -y install nano inetutils-ping traceroute
+# Экспозит порта
+EXPOSE 8088
+
+
+# Запуск
+CMD ["sh", "-c", "/app/frontend/start.sh"]
