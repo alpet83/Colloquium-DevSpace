@@ -1,57 +1,82 @@
+# /frontend/rtm/src/components/FileManager.vue, updated 2025-07-16 12:55 EEST
 <template>
-  <div>
-    <h3>Управление файлами</h3>
-    <table>
-      <thead>
-        <tr>
-          <th>Имя файла</th>
-          <th>Дата загрузки</th>
-          <th>Действия</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="file in files" :key="file.id">
-          <td>{{ file.file_name }}</td>
-          <td>{{ new Date(file.ts * 1000).toLocaleString() }}</td>
-          <td>
-            <input type="file" @change="$emit('update-file', file.id, $event)" />
-            <button @click="$emit('delete-file', file.id)">Удалить</button>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+  <div class="file-manager">
+    <h3>Файлы проекта</h3>
+    <div v-if="fileTree && Object.keys(fileTree).length">
+      <FileTree :tree="fileTree" :level="0" @select-file="handleSelectFile" />
+    </div>
+    <div v-else>
+      <p>Файлы не найдены</p>
+    </div>
   </div>
 </template>
 
 <script>
-export default {
+import { defineComponent, inject } from 'vue'
+import FileTree from './FileTree.vue'
+
+export default defineComponent({
   name: 'FileManager',
+  components: { FileTree },
   props: {
     files: Array
   },
-  emits: ['delete-file', 'update-file']
-}
+  emits: ['delete-file', 'update-file', 'select-file'],
+  setup() {
+    const mitt = inject('mitt')
+    return { mitt }
+  },
+  computed: {
+    fileTree() {
+      console.log('Building fileTree from files:', JSON.stringify(this.files, null, 2))
+      const tree = {}
+      this.files.forEach(file => {
+        // Удаляем ведущий слэш и нормализуем путь
+        const normalizedPath = file.file_name.startsWith('/') ? file.file_name.slice(1) : file.file_name
+        const parts = normalizedPath.split('/').filter(part => part)
+        let current = tree
+        parts.forEach((part, index) => {
+          if (index === parts.length - 1) {
+            current[part] = { type: 'file', id: file.id, ts: file.ts, project_id: file.project_id }
+          } else {
+            if (!current[part]) {
+              current[part] = { type: 'directory', children: {}, expanded: false }
+            }
+            current = current[part].children
+          }
+        })
+      })
+      console.log('Built fileTree:', JSON.stringify(tree, null, 2))
+      return tree
+    }
+  },
+  methods: {
+    handleSelectFile(fileId) {
+      console.log('Emitting select-file:', fileId)
+      this.mitt.emit('select-file', fileId)
+      this.$emit('select-file', fileId)
+    }
+  }
+})
 </script>
 
 <style>
-table {
+.file-manager {
   width: 100%;
-  border-collapse: collapse;
+  padding: 10px;
+  background: #333;
 }
-th, td {
-  border: 1px solid #ccc;
-  padding: 8px;
-  text-align: left;
-}
-th {
-  background: #f0f0f0;
-}
-@media (prefers-color-scheme: dark) {
-  th {
-    background: #333;
+@media (prefers-color-scheme: light) {
+  .file-manager {
+    background: #f0f0f0;
   }
-  td {
-    color: #fff;
+}
+.file-manager h3 {
+  color: #eee;
+}
+@media (prefers-color-scheme: light) {
+  .file-manager h3 {
+    color: #333;
   }
 }
 </style>

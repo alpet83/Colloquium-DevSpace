@@ -9,10 +9,22 @@ services:
       - ./logs:/app/logs
       - ./projects:/app/projects
       - ./agent:/app/agent
+      - ./tests:/app/tests
+      - ./docs:/app/docs
     networks:
       - devspace-net
     depends_on:
       - mcp-sandbox
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DEBUG_MODE=True
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8008/api/chat/list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
   mcp-sandbox:
     build:
       context: .

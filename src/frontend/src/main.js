@@ -1,15 +1,13 @@
-// /frontend/rtm/src/main.js, updated 2025-07-14 14:48 EEST
-
-import './assets/main.css'
+// /frontend/rtm/src/main.js, updated 2025-07-16 15:34 EEST
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'
+import mitt from 'mitt'
 import App from './App.vue'
-import router from './router'
 
 const app = createApp(App)
 const pinia = createPinia()
-
+const emitter = mitt()
 app.use(pinia)
-app.use(router)           
-app.mount('#app')         
-
+app.provide('mitt', emitter)
+app.mount('#app')
+console.log('App initialized with Pinia:', pinia)     

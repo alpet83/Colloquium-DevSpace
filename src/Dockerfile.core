@@ -7,12 +7,15 @@ ENV PATH="/app/venv/bin:$PATH"
 RUN pip install --no-cache-dir fastapi uvicorn openai requests asyncio gitpython
 RUN apt-get update && apt-get install -y git
 RUN apt install -y inetutils-ping net-tools traceroute dnsutils nano 
-RUN pip install watchgod toml
+RUN apt install -y sqlite3
+RUN pip install watchgod toml python-multipart
+RUN pip install sqlalchemy
 # Рабочая директория
 WORKDIR /app/agent
 VOLUME /app/agent
 VOLUME /app/projects
 VOLUME /app/logs
+VOLUME /app/tests
 
 # Экспозит порта
 EXPOSE 8080

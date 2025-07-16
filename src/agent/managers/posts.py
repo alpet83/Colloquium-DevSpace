@@ -1,14 +1,18 @@
-# /agent/managers/posts.py, updated 2025-07-14 19:20 EEST
+# /agent/managers/posts.py, updated 2025-07-15 21:45 EEST
 import time
 import logging
 import re
+import asyncio
+import traceback
 from managers.db import Database
 import globals
+
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s #%(levelname)s: %(message)s')
 
 class PostManager:
     def __init__(self, user_manager):
         self.user_manager = user_manager
-        self.db = Database()
+        self.db = Database.get_database()
         self.init_db()
 
     def init_db(self):
@@ -24,10 +28,8 @@ class PostManager:
                     FOREIGN KEY (user_id) REFERENCES users(id)
                 )
             ''')
-            logging.info("#INFO: Инициализирована БД: sqlite:////app/data/multichat.db")
-            logging.info("#INFO: Создание таблицы posts")
         except Exception as e:
-            logging.error(f"#ERROR: Ошибка инициализации БД posts: {str(e)}")
+            logging.error(f"Ошибка инициализации БД posts: {str(e)}")
             raise
 
     def add_message(self, chat_id, user_id, message):
@@ -38,11 +40,30 @@ class PostManager:
                 {'chat_id': chat_id, 'user_id': user_id, 'message': message, 'timestamp': timestamp}
             )
             post_id = self.db.fetch_one('SELECT last_insert_rowid()')[0]
-            logging.debug(f"#DEBUG: Добавлено сообщение post_id={post_id}, chat_id={chat_id}, user_id={user_id}")
+            logging.debug(f"Добавлено сообщение post_id={post_id}, chat_id={chat_id}, user_id={user_id}")
+            if user_id == 1:
+                logging.debug(f"Triggering replication for admin post_id={post_id}, chat_id={chat_id}")
+                if globals.replication_manager:
+                    try:
+                        loop = asyncio.get_event_loop()
+                        loop.create_task(self.trigger_replication(chat_id, post_id))
+                    except Exception as e:
+                        logging.error(f"Ошибка запуска репликации для admin post_id={post_id}, chat_id={chat_id}: {str(e)}")
+                else:
+                    logging.warning("ReplicationManager not initialized, skipping replication")
             return {"status": "ok", "post_id": post_id}
         except Exception as e:
-            logging.error(f"#ERROR: Ошибка добавления сообщения для chat_id={chat_id}, user_id={user_id}: {str(e)}")
+            logging.error(f"Ошибка добавления сообщения для chat_id={chat_id}, user_id={user_id}: {str(e)}")
             return {"error": str(e)}
+
+    async def trigger_replication(self, chat_id, post_id):
+        try:
+            logging.debug(f"Running replication for chat_id={chat_id}, post_id={post_id}")
+            await globals.replication_manager.replicate_to_llm(chat_id)
+            logging.debug(f"Replication completed for chat_id={chat_id}, post_id={post_id}")
+        except Exception as e:
+            traceback.print_exc()
+            logging.error(f"Ошибка репликации для chat_id={chat_id}, post_id={post_id}: {str(e)}")
 
     def get_history(self, chat_id):
         try:
@@ -76,24 +97,47 @@ class PostManager:
                         "file_names": file_names,
                         "user_name": post[5]
                     })
-            logging.debug(f"#DEBUG: Получена история для chat_id={chat_id}: {len(history)} сообщений")
+            # logging.debug(f"Получена история для chat_id={chat_id}: {len(history)} сообщений")
             return history
         except Exception as e:
-            logging.error(f"#ERROR: Ошибка получения истории для chat_id={chat_id}: {str(e)}")
+            logging.error(f"Ошибка получения истории для chat_id={chat_id}: {str(e)}")
+            return {"error": str(e)}
+
+    def get_post(self, post_id):
+        row = self.db.fetch_one(
+            'SELECT id, chat_id, user_id, message, timestamp FROM posts WHERE id = :post_id',
+            {'post_id': post_id}
+        )
+        return {'id': row[0], 'chat_id': row[1], 'user_id': row[2], 'message': row[3], 'timestamp': row[4]} if row else None
+
+    def edit_post(self, post_id, message):
+        try:
+            self.db.execute(
+                'UPDATE posts SET message = :message, timestamp = :timestamp WHERE id = :post_id',
+                {
+                    'post_id': post_id,
+                    'message': message,
+                    'timestamp': int(time.time())
+                }
+            )
+            logging.debug(f"Отредактировано сообщение post_id={post_id}")
+            return {"status": "ok"}
+        except Exception as e:
+            logging.error(f"Ошибка редактирования сообщения post_id={post_id}: {str(e)}")
             return {"error": str(e)}
 
     def delete_post(self, post_id, user_id):
         try:
             post = self.db.fetch_one('SELECT user_id FROM posts WHERE id = :post_id', {'post_id': post_id})
             if not post:
-                logging.info(f"#INFO: Сообщение post_id={post_id} не найдено")
+                logging.info(f"Сообщение post_id={post_id} не найдено")
                 return {"error": "Post not found"}
-            if post[0] != user_id:
-                logging.info(f"#INFO: Пользователь user_id={user_id} не имеет прав для удаления post_id={post_id}")
+            if post[0] != user_id and self.user_manager.get_user_role(user_id) != 'admin':
+                logging.info(f"Пользователь user_id={user_id} не имеет прав для удаления post_id={post_id}")
                 return {"error": "Permission denied"}
             self.db.execute('DELETE FROM posts WHERE id = :post_id', {'post_id': post_id})
-            logging.debug(f"#DEBUG: Удалено сообщение post_id={post_id} для user_id={user_id}")
+            logging.debug(f"Удалено сообщение post_id={post_id} для user_id={user_id}")
             return {"status": "ok"}
         except Exception as e:
-            logging.error(f"#ERROR: Ошибка удаления сообщения post_id={post_id}: {str(e)}")
+            logging.error(f"Ошибка удаления сообщения post_id={post_id}: {str(e)}")
             return {"error": str(e)}

@@ -3,11 +3,10 @@ from .db import Database
 
 class ChatManager:
     def __init__(self):
-        self.db = Database()
+        self.db = Database.get_database()
         self._create_tables()
 
     def _create_tables(self):
-        logging.info(f"#INFO: Создание таблицы chats")
         self.db.execute('''
             CREATE TABLE IF NOT EXISTS chats (
                 chat_id INTEGER PRIMARY KEY AUTOINCREMENT,

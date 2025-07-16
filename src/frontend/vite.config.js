@@ -10,7 +10,14 @@ export default defineConfig({
     vue(),
     vueDevTools(),
   ],
-  server: { host: '0.0.0.0', port: 8088 },
+  server: { 
+    host: '0.0.0.0', 
+    port: 8008, 
+    allowedHosts: ['vps.vpn'],
+    watch: {
+      disablePolling: true  // Отключение polling'а
+    }
+  },
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url))
