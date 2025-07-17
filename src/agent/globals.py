@@ -1,11 +1,16 @@
-# /agent/globals.py, updated 2025-07-14 17:14 EEST
+# /agent/globals.py, updated 2025-07-17 15:45 EEST
+import asyncio
+
 user_manager = None
 chat_manager = None
 post_manager = None
 file_manager = None
 project_manager = None
 replication_manager = None
+post_processor = None
 
+# Хранилище для событий переключения чата (user_id:chat_id -> asyncio.Event)
+chat_switch_events = {}
 
 LOG_DIR = "/app/logs"
 LOG_FILE = LOG_DIR + "/colloquium_core.log"

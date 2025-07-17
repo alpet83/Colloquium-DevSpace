@@ -1,6 +1,7 @@
-# /agent/routes/file_routes.py, updated 2025-07-16 10:48 EEST
+# /agent/routes/file_routes.py, updated 2025-07-17 19:42 EEST
 from fastapi import APIRouter, Request, UploadFile, File, Form, HTTPException, Query
 import logging
+import time
 from managers.db import Database
 import globals
 
@@ -24,9 +25,13 @@ async def upload_file(request: Request, file: UploadFile = File(...), chat_id: i
             return {"error": "Invalid session"}
         user_id = user_id[0]
         content = await file.read()
-        result = globals.file_manager.upload_file(chat_id, user_id, content, file_name, project_id)
-        logging.debug(f"#DEBUG: Файл загружен для chat_id={chat_id}, user_id={user_id}, file_name={file_name}, project_id={project_id}")
-        return result
+        timestamp = int(time.time())
+        file_id = globals.file_manager.add_file(content, file_name, timestamp, project_id)
+        if not file_id:
+            logging.error(f"#ERROR: Не удалось добавить файл file_name={file_name}, project_id={project_id}")
+            raise HTTPException(status_code=500, detail="Failed to add file")
+        logging.debug(f"#DEBUG: Файл загружен для chat_id={chat_id}, user_id={user_id}, file_name={file_name}, project_id={project_id}, file_id={file_id}")
+        return {"status": "ok", "file_id": file_id}
     except HTTPException as e:
         logging.error(f"#ERROR: HTTP ошибка в POST /chat/upload_file: {str(e)}")
         raise
@@ -51,9 +56,10 @@ async def update_file(request: Request, file: UploadFile = File(...), file_id: i
             return {"error": "Invalid session"}
         user_id = user_id[0]
         content = await file.read()
-        result = globals.file_manager.update_file(file_id, user_id, content, file_name, project_id)
+        timestamp = int(time.time())
+        globals.file_manager.update_file(file_id, content, file_name, timestamp, project_id)
         logging.debug(f"#DEBUG: Файл file_id={file_id} обновлён для user_id={user_id}, file_name={file_name}, project_id={project_id}")
-        return result
+        return {"status": "ok", "file_id": file_id}
     except HTTPException as e:
         logging.error(f"#ERROR: HTTP ошибка в POST /chat/update_file: {str(e)}")
         raise
@@ -82,9 +88,9 @@ async def delete_file(request: Request):
         if not file_id:
             logging.info(f"#INFO: Неверный параметр file_id={file_id} для IP {request.client.host}")
             return {"error": "Missing file_id"}
-        result = globals.file_manager.delete_file(file_id, user_id)
+        globals.file_manager.unlink(file_id)
         logging.debug(f"#DEBUG: Файл file_id={file_id} удалён для user_id={user_id}")
-        return result
+        return {"status": "ok"}
     except HTTPException as e:
         logging.error(f"#ERROR: HTTP ошибка в POST /chat/delete_file: {str(e)}")
         raise

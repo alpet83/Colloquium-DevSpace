@@ -18,6 +18,7 @@ from routes.chat_routes import router as chat_router
 from routes.post_routes import router as post_router
 from routes.file_routes import router as file_router
 from routes.project_routes import router as project_router
+from post_processor import PostProcessor
 from managers.users import UserManager
 from managers.chats import ChatManager
 from managers.posts import PostManager
@@ -85,12 +86,13 @@ def server_init():
         logging.debug("Подключение project_router")
         app.include_router(project_router)
 
+        globals.post_processor = PostProcessor()
         logging.info("Инициализация менеджеров")
         globals.user_manager = UserManager()
         globals.chat_manager = ChatManager()
         globals.post_manager = PostManager(globals.user_manager)
-        globals.file_manager = FileManager()
         globals.project_manager = ProjectManager()
+        globals.file_manager = FileManager()
         dbg = os.getenv("DEBUG_MODE", "0").lower()
         logging.debug(f"ENV DEBUG_MODE = {dbg}")
         globals.replication_manager = ReplicationManager(

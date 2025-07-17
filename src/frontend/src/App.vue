@@ -1,4 +1,4 @@
-# /frontend/rtm/src/App.vue, updated 2025-07-16 15:34 EEST
+# /frontend/rtm/src/App.vue, updated 2025-07-17 10:52 EEST
 <template>
   <div class="app-container">
     <div v-if="authStore.backendError" class="error-overlay">
@@ -8,7 +8,7 @@
       <Login />
     </div>
     <div v-else class="main-content">
-      <SideBar :chats="chatStore.chats" :selectedChatId="chatStore.selectedChatId" @select-chat="chatStore.selectChat" @delete-chat="chatStore.deleteChat" />
+      <LeftPanel :chats="chatStore.chats" :selectedChatId="chatStore.selectedChatId" @select-chat="chatStore.selectChat" @delete-chat="chatStore.deleteChat" />
       <ChatContainer class="chat-container" />
       <RightPanel class="right-panel" />
     </div>
@@ -20,7 +20,7 @@ import { defineComponent } from 'vue'
 import { useAuthStore } from './stores/auth'
 import { useChatStore } from './stores/chat'
 import Login from './components/Login.vue'
-import SideBar from './components/SideBar.vue'
+import LeftPanel from './components/LeftPanel.vue'
 import ChatContainer from './components/ChatContainer.vue'
 import RightPanel from './components/RightPanel.vue'
 
@@ -28,7 +28,7 @@ export default defineComponent({
   name: 'App',
   components: {
     Login,
-    SideBar,
+    LeftPanel,
     ChatContainer,
     RightPanel
   },
@@ -39,13 +39,22 @@ export default defineComponent({
   },
   mounted() {
     this.authStore.checkSession().then(() => {
-      console.log('App mounted, isLoggedIn:', this.authStore.isLoggedIn, 'chats:', this.chatStore.chats, 'files:', this.fileStore?.files || 'No fileStore')
+      console.log('App mounted, isLoggedIn:', this.authStore.isLoggedIn, 'chats:', JSON.stringify(this.chatStore.chats, null, 2))
     })
   }
 })
 </script>
 
 <style>
+body {
+  margin: 0;
+  background: #222;
+}
+@media (prefers-color-scheme: light) {
+  body {
+    background: #f0f0f0;
+  }
+}
 .app-container {
   display: flex;
   flex-direction: column;
@@ -75,7 +84,7 @@ export default defineComponent({
 }
 .right-panel {
   flex: 0 0 300px;
-  min-width: 30px; /* Минимальная ширина для свёрнутого состояния */
+  min-width: 30px;
   max-width: 300px;
   overflow-y: auto;
   background: #333;

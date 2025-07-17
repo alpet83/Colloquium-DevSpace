@@ -1,4 +1,4 @@
-// /frontend/rtm/src/stores/chat.js, created 2025-07-16 15:55 EEST
+// /frontend/rtm/src/stores/chat.js, updated 2025-07-17 15:38 EEST
 import { defineStore } from 'pinia'
 
 export const useChatStore = defineStore('chat', {
@@ -10,14 +10,17 @@ export const useChatStore = defineStore('chat', {
     newChatParentMessageId: null,
     chatError: '',
     backendError: false,
-    apiUrl: import.meta.env.VITE_API_URL || 'http://vps.vpn:8008/api'
+    apiUrl: import.meta.env.VITE_API_URL || 'http://vps.vpn:8008/api',
+    waitChanges: false,
+    stats: { tokens: null, num_sources_used: null },
+    pollingInterval: null,
+    isPolling: false
   }),
   actions: {
-    async fetchHistory() {
-      if (this.selectedChatId === null) return
+    async fetchChats() {
       try {
-        console.log('Fetching history:', this.apiUrl + `/chat/get?chat_id=${this.selectedChatId}`, 'Cookies:', document.cookie)
-        const res = await fetch(this.apiUrl + `/chat/get?chat_id=${this.selectedChatId}`, {
+        console.log('Fetching chats:', this.apiUrl + '/chat/list', 'Cookies:', document.cookie)
+        const res = await fetch(this.apiUrl + '/chat/list', {
           method: 'GET',
           credentials: 'include'
         })
@@ -28,7 +31,65 @@ export const useChatStore = defineStore('chat', {
         }
         const data = await res.json()
         if (res.ok && !data.error) {
-          this.history = data
+          this.chats = await this.buildChatTree(data)
+          console.log('Fetched chats:', JSON.stringify(this.chats, null, 2))
+          this.backendError = false
+          this.chatError = ''
+        } else {
+          console.error('Error fetching chats:', data)
+          this.chatError = data.error || 'Failed to fetch chats'
+        }
+      } catch (e) {
+        console.error('Error fetching chats:', e)
+        this.chatError = 'Failed to fetch chats'
+      }
+    },
+    async fetchHistory() {
+      if (this.selectedChatId === null || this.isPolling) return
+      this.isPolling = true
+      try {
+        const url = this.waitChanges
+          ? `${this.apiUrl}/chat/get?chat_id=${this.selectedChatId}&wait_changes=1`
+          : `${this.apiUrl}/chat/get?chat_id=${this.selectedChatId}`
+        console.log('Fetching history:', url, 'Cookies:', document.cookie)
+        const res = await fetch(url, {
+          method: 'GET',
+          credentials: 'include'
+        })
+        if (res.status === 500 || res.status === 502) {
+          console.error('Server error:', res.status)
+          this.backendError = true
+          return
+        }
+        const data = await res.json()
+        if (res.ok && !data.error) {
+          if (data.chat_history === 'chat switch') {
+            console.log('Chat switch detected, fetching full history')
+            this.waitChanges = false
+            await this.fetchHistory()
+          } else if (data.chat_history !== 'no changes') {
+            // Обновляем историю, обрабатывая добавления, изменения и удаления
+            const existingIds = new Set(this.history.map(post => post.id))
+            this.history = this.history.filter(post => !data.some(newPost => newPost.id === post.id && newPost.action === 'delete'))
+            data.forEach(newPost => {
+              if (newPost.action === 'delete') {
+                this.history = this.history.filter(post => post.id !== newPost.id)
+              } else if (!existingIds.has(newPost.id)) {
+                this.history.push(newPost)
+              } else {
+                const index = this.history.findIndex(post => post.id === newPost.id)
+                if (index !== -1) {
+                  this.history[index] = newPost
+                }
+              }
+            })
+            this.history.sort((a, b) => a.id - b.id)            
+            console.log('Deleted posts:', this.history.filter(post => post.action === 'delete'))
+            console.log('Fetch history params:', { chat_id: this.selectedChatId, wait_changes: this.waitChanges })
+            console.log('History response:', JSON.stringify(data, null, 2))
+          } else {
+            console.log('No changes in chat history')
+          }
           this.backendError = false
           this.chatError = ''
         } else {
@@ -38,6 +99,29 @@ export const useChatStore = defineStore('chat', {
       } catch (e) {
         console.error('Error fetching history:', e)
         this.chatError = 'Failed to fetch chat history'
+      } finally {
+        this.isPolling = false
+      }
+    },
+    async fetchChatStats() {
+      if (this.selectedChatId === null) return
+      try {
+        const res = await fetch(`${this.apiUrl}/chat/get_stats?chat_id=${this.selectedChatId}`, {
+          method: 'GET',
+          credentials: 'include'
+        })
+        if (res.ok) {
+          const data = await res.json()
+          this.stats = {
+            tokens: data.tokens,
+            num_sources_used: data.num_sources_used
+          }
+          console.log('Fetched chat stats:', this.stats)
+        } else {
+          console.error('Error fetching chat stats:', await res.json())
+        }
+      } catch (e) {
+        console.error('Error fetching chat stats:', e)
       }
     },
     async sendMessage(message) {
@@ -58,6 +142,7 @@ export const useChatStore = defineStore('chat', {
         const data = await res.json()
         if (res.ok && !data.error) {
           await this.fetchHistory()
+          await this.fetchChatStats()
           this.backendError = false
           this.chatError = ''
         } else {
@@ -86,6 +171,7 @@ export const useChatStore = defineStore('chat', {
         const data = await res.json()
         if (res.ok && !data.error) {
           await this.fetchHistory()
+          await this.fetchChatStats()
           this.backendError = false
           this.chatError = ''
         } else {
@@ -118,6 +204,7 @@ export const useChatStore = defineStore('chat', {
         const data = await res.json()
         if (res.ok && !data.error) {
           await this.fetchHistory()
+          await this.fetchChatStats()
           this.backendError = false
           this.chatError = ''
         } else {
@@ -147,8 +234,7 @@ export const useChatStore = defineStore('chat', {
         if (res.ok && !data.error) {
           this.newChatDescription = ''
           this.newChatParentMessageId = null
-          const chatsData = await (await fetch(this.apiUrl + '/chat/list', { credentials: 'include' })).json()
-          this.chats = await this.buildChatTree(chatsData)
+          await this.fetchChats()
           this.closeCreateChatModal()
           this.backendError = false
           this.chatError = ''
@@ -178,9 +264,8 @@ export const useChatStore = defineStore('chat', {
         }
         const data = await res.json()
         if (res.ok && !data.error) {
-          this.chats = await this.buildChatTree(await (await fetch(this.apiUrl + '/chat/list', { credentials: 'include' })).json())
           this.selectedChatId = null
-          this.history = []
+          await this.fetchChats()
           this.backendError = false
           this.chatError = ''
         } else {
@@ -192,8 +277,26 @@ export const useChatStore = defineStore('chat', {
         this.chatError = 'Failed to delete chat'
       }
     },
-    setChatId(chatId) {
+    async setChatId(chatId) {
+      if (this.selectedChatId === chatId) return
+      // Уведомляем бэкенд о смене чата
+      try {
+        console.log('Notifying chat switch:', this.apiUrl + '/chat/notify_switch', 'ChatId:', chatId, 'Cookies:', document.cookie)
+        await fetch(this.apiUrl + '/chat/notify_switch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId }),
+          credentials: 'include'
+        })
+      } catch (e) {
+        console.error('Error notifying chat switch:', e)
+      }
       this.selectedChatId = chatId
+      this.history = [] // Очищаем историю при переключении чата
+      this.waitChanges = false // Полная загрузка истории при выборе чата
+      console.log('Selected chat ID:', chatId)
+      await this.fetchHistory()
+      await this.fetchChatStats()
     },
     openCreateChatModal(parentMessageId) {
       console.log('openCreateChatModal called with parentMessageId:', parentMessageId)
@@ -209,64 +312,76 @@ export const useChatStore = defineStore('chat', {
       }
     },
     closeCreateChatModal() {
+      this.newChatDescription = ''
       this.newChatParentMessageId = null
       const modal = document.getElementById('createChatModal')
       if (modal) {
         modal.close()
       }
     },
+    startPolling() {
+      if (this.pollingInterval) {
+        clearInterval(this.pollingInterval)
+        console.log('Cleared previous polling interval')
+      }
+      this.pollingInterval = setInterval(() => {
+        if (this.selectedChatId && !this.isPolling) {
+          this.waitChanges = true // Пуллинг только для изменений
+          this.fetchHistory()
+        }
+      }, 15000) // Пуллинг каждые 15 секунд
+      console.log('Started polling with interval ID:', this.pollingInterval)
+    },
+    stopPolling() {
+      if (this.pollingInterval) {
+        clearInterval(this.pollingInterval)
+        console.log('Stopped polling with interval ID:', this.pollingInterval)
+        this.pollingInterval = null
+      }
+    },
     async buildChatTree(chats) {
-      console.log('Building chat tree with:', chats)
+      console.log('Building chat tree with:', JSON.stringify(chats, null, 2))
       const map = new Map()
       chats.forEach(chat => {
-        console.log('Processing chat:', chat)
         map.set(chat.chat_id, { ...chat, children: [] })
+        console.log(`Initialized chat ${chat.chat_id} with description: ${chat.description}`)
       })
       for (const chat of chats) {
         if (chat.parent_msg_id === null) {
-          map.get(chat.chat_id).children = []
+          console.log(`Root chat: ${chat.chat_id} (${chat.description})`)
+          continue
+        }
+        const parentMsg = await this.dbFetchParentMsg(chat.parent_msg_id)
+        if (parentMsg && map.has(parentMsg.chat_id)) {
+          console.log(`Adding chat_id: ${chat.chat_id} (${chat.description}) to parent chat_id: ${parentMsg.chat_id}`)
+          map.get(parentMsg.chat_id).children.push(map.get(chat.chat_id))
         } else {
-          try {
-            console.log('Fetching messages for chat_id:', chat.chat_id, 'Parent_msg_id:', chat.parent_msg_id, 'Cookies:', document.cookie)
-            const res = await fetch(this.apiUrl + `/chat/get?chat_id=${chat.chat_id}`, {
-              method: 'GET',
-              credentials: 'include'
-            })
-            if (res.status === 401) {
-              console.error('Unauthorized access for chat_id:', chat.chat_id, 'Response:', res.status)
-              this.chatError = 'Session expired'
-              continue
-            }
-            if (res.status === 500 || res.status === 502) {
-              console.error('Server error fetching messages for chat_id:', chat.chat_id, 'Status:', res.status)
-              this.backendError = true
-              continue
-            }
-            const messages = await res.json()
-            console.log('Messages for chat_id:', chat.chat_id, 'Data:', messages)
-            if (Array.isArray(messages)) {
-              map.get(chat.chat_id).messages = messages
-              const parentMsg = messages.find(msg => msg.id === chat.parent_msg_id)
-              if (parentMsg && map.get(parentMsg.chat_id)) {
-                console.log('Adding chat_id:', chat.chat_id, 'to parent chat_id:', parentMsg.chat_id)
-                map.get(parentMsg.chat_id).children.push(map.get(chat.chat_id))
-              } else {
-                console.warn('No parent message found for chat_id:', chat.chat_id, 'Parent_msg_id:', chat.parent_msg_id)
-                map.get(chat.chat_id).children = []
-              }
-            } else {
-              console.warn('Invalid data for chat_id:', chat.chat_id, 'Data:', messages)
-              this.chatError = messages.error || 'Failed to fetch messages for chat ' + chat.chat_id
-            }
-          } catch (e) {
-            console.error('Error fetching messages for chat_id:', chat.chat_id, 'Error:', e)
-            this.chatError = 'Failed to build chat tree'
-          }
+          console.warn(`No parent message found for chat_id: ${chat.chat_id}, parent_msg_id: ${chat.parent_msg_id}, setting as root`)
+          map.get(chat.chat_id).parent_msg_id = null
         }
       }
       const tree = Array.from(map.values()).filter(chat => chat.parent_msg_id === null)
-      console.log('Chat tree built:', tree)
+      console.log('Chat tree built:', JSON.stringify(tree, null, 2))
       return tree
+    },
+    async dbFetchParentMsg(parent_msg_id) {
+      try {
+        console.log(`Fetching parent message for post_id: ${parent_msg_id}`)
+        const res = await fetch(this.apiUrl + `/chat/get_parent_msg?post_id=${parent_msg_id}`, {
+          method: 'GET',
+          credentials: 'include'
+        })
+        if (res.status === 404 || !res.ok) {
+          console.warn('Parent message not found for post_id:', parent_msg_id)
+          return null
+        }
+        const data = await res.json()
+        console.log('Fetched parent message:', JSON.stringify(data, null, 2))
+        return data
+      } catch (e) {
+        console.error('Error fetching parent message:', e)
+        return null
+      }
     }
   }
 })

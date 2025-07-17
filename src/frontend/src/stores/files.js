@@ -1,4 +1,4 @@
-// /frontend/rtm/src/stores/files.js, created 2025-07-16 15:55 EEST
+// /frontend/rtm/src/stores/files.js, updated 2025-07-17 20:58 EEST
 import { defineStore } from 'pinia'
 
 export const useFileStore = defineStore('files', {
@@ -10,7 +10,7 @@ export const useFileStore = defineStore('files', {
     apiUrl: import.meta.env.VITE_API_URL || 'http://vps.vpn:8008/api'
   }),
   actions: {
-    async fetchFiles() {
+    async fetchFiles(project_id = null) {
       try {
         console.log('Fetching files:', this.apiUrl + '/chat/list_files', 'Cookies:', document.cookie)
         const res = await fetch(this.apiUrl + '/chat/list_files', {
@@ -120,13 +120,16 @@ export const useFileStore = defineStore('files', {
           await this.fetchFiles()
           this.backendError = false
           this.chatError = ''
+          return data // Возвращаем полный ответ с file_id
         } else {
           console.error('Error uploading file:', data)
           this.chatError = data.error || 'Failed to upload file'
+          throw new Error(data.error || 'Failed to upload file')
         }
       } catch (e) {
         console.error('Error uploading file:', e)
         this.chatError = 'Failed to upload file'
+        throw e
       }
     },
     clearAttachment() {
