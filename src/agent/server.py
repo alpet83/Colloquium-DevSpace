@@ -1,4 +1,4 @@
-# /agent/server.py, updated 2025-07-15 13:37 EEST
+# /agent/server.py, updated 2025-07-18 14:50 EEST
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
@@ -12,7 +12,7 @@ import toml
 import datetime
 import uvicorn
 from logging import FileHandler
-
+from lib.basic_logger import BasicLogger
 from routes.auth_routes import router as auth_router
 from routes.chat_routes import router as chat_router
 from routes.post_routes import router as post_router
@@ -29,6 +29,7 @@ import globals
 from globals import CONFIG_FILE, LOG_DIR, LOG_FILE, LOG_SERV, LOG_FORMAT
 
 app = FastAPI()
+log = globals.get_logger("core")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,21 +40,19 @@ app.add_middleware(
     expose_headers=["Set-Cookie"]
 )
 
-
 @app.middleware("http")
 async def log_requests_and_exceptions(request: Request, call_next):
-    # logging.debug(f"Запрос {request.method} {request.url}, Query: {request.query_params}, Cookies: {request.cookies}")
+    # NO_LOG: NEVER LOG HERE, NEVER AGAIN, IS PROHIBITED!
     try:
         response = await call_next(request)
-        # logging.debug(f"Ответ для {request.method} {request.url}: Status {response.status_code}")
         return response
     except RequestValidationError as exc:
-        logging.error(f"#ERROR: Валидационная ошибка для {request.method} {request.url}: {exc.errors()}")
+        log.error("Валидационная ошибка для %s %s: ~C95%s~C00", request.method, str(request.url), str(exc.errors()))
         raise
     except Exception as exc:
-        logging.error(f"#ERROR: Ошибка сервера для {request.method} {request.url}: {str(exc)}")
+        log.excpt("Ошибка сервера для %s %s: %s", request.method, str(request.url), str(exc),
+                  exc_info=(type(exc), exc, exc.__traceback__))
         raise
-
 
 def log_msg(message, tag="#INFO"):
     now = datetime.datetime.now()
@@ -71,30 +70,30 @@ def log_init():
 
 def server_init():
     try:
-        log_msg(f"Сервер Colloquium запускается...", "#INIT")
+        log_msg("Сервер Colloquium запускается...", "#INIT")
         if not os.path.exists(LOG_DIR):
             os.makedirs(LOG_DIR)
         log_init()
-        logging.debug("Подключение auth_router")
+        log.debug("Подключение auth_router")
         app.include_router(auth_router)
-        logging.debug("Подключение chat_router")
+        log.debug("Подключение chat_router")
         app.include_router(chat_router)
-        logging.debug("Подключение post_router")
+        log.debug("Подключение post_router")
         app.include_router(post_router)
-        logging.debug("Подключение file_router")
+        log.debug("Подключение file_router")
         app.include_router(file_router)
-        logging.debug("Подключение project_router")
+        log.debug("Подключение project_router")
         app.include_router(project_router)
 
         globals.post_processor = PostProcessor()
-        logging.info("Инициализация менеджеров")
+        log.info("Инициализация менеджеров")
         globals.user_manager = UserManager()
         globals.chat_manager = ChatManager()
         globals.post_manager = PostManager(globals.user_manager)
         globals.project_manager = ProjectManager()
         globals.file_manager = FileManager()
         dbg = os.getenv("DEBUG_MODE", "0").lower()
-        logging.debug(f"ENV DEBUG_MODE = {dbg}")
+        log.debug("ENV DEBUG_MODE=%s", dbg)
         globals.replication_manager = ReplicationManager(
             globals.user_manager,
             globals.chat_manager,
@@ -102,42 +101,37 @@ def server_init():
             globals.file_manager,
             debug_mode=(dbg != "0")
         )
-        logging.info("Менеджеры инициализированы")
+        log.info("Менеджеры инициализированы")
     except Exception as e:
-        log_msg(f"Ошибка инициализации сервера: {str(e)}", "#ERROR")
+        log_msg("Ошибка инициализации сервера: %s" % str(e), "#ERROR")
         raise
 
 shutdown_event = asyncio.Event()
 
-
 async def lifespan(app: FastAPI):
     config = toml.load(CONFIG_FILE)
     local_ip = socket.gethostbyname(socket.gethostname())
-    logging.info(f"#INFO: Ядро запущено на IP {local_ip}:8080")
+    log.info("Ядро запущено на IP=%s:8080", local_ip)
     asyncio.create_task(chat_loop())
     yield
-    logging.info("#INFO: Ядро остановлено")
+    log.info("Ядро остановлено")
 
 app.lifespan = lifespan
-
 
 async def chat_loop():
     while not shutdown_event.is_set():
         for chat_id in globals.chat_manager.list_chats(0):
-            await globals.replication_manager.replicate_to_llm(chat_id)
+            await globals.replication_manager.replicate_to_llm(chat_id['chat_id'])
         await asyncio.sleep(5)
 
-
 async def shutdown():
-    logging.info("#INFO: Получен сигнал завершения, инициируется graceful shutdown")
+    log.info("Получен сигнал завершения, инициируется graceful shutdown")
     shutdown_event.set()
     await server.shutdown()
 
-
 def handle_shutdown(signum, frame):
-    logging.info(f"#INFO: Получен сигнал {signum}, завершение работы")
+    log.info("Получен сигнал %d, завершение работы", signum)
     asyncio.create_task(shutdown())
-
 
 signal.signal(signal.SIGTERM, handle_shutdown)
 signal.signal(signal.SIGINT, handle_shutdown)
@@ -145,32 +139,38 @@ signal.signal(signal.SIGQUIT, handle_shutdown)
 
 if __name__ == "__main__":
     server_init()
-    uvicorn_config = uvicorn.config.LOGGING_CONFIG
-    uvicorn_config["formatters"]["default"] = {
-        "format": LOG_FORMAT
-    }
-    uvicorn_config["formatters"]["access"] = {
-        "format": LOG_FORMAT
-    }
-    uvicorn_config["handlers"]["default"] = {
-        "class": "logging.FileHandler",
-        "formatter": "default",
-        "filename": LOG_SERV,
-        "mode": "w"
-    }
-    uvicorn_config["handlers"]["access"] = {
-        "class": "logging.FileHandler",
-        "formatter": "access",
-        "filename": LOG_SERV,
-        "mode": "w"
-    }
-    uv_cfg = uvicorn.Config(
+    uvicorn_config = uvicorn.Config(
         app=app,
         host="0.0.0.0",
         port=8080,
         log_level="debug",
-        log_config=uvicorn_config,
+        log_config={
+            "version": 1,
+            "disable_existing_loggers": False,
+            "formatters": {
+                "default": {"format": LOG_FORMAT},
+                "access": {"format": LOG_FORMAT},
+            },
+            "handlers": {
+                "default": {
+                    "class": "logging.FileHandler",
+                    "formatter": "default",
+                    "filename": LOG_SERV,
+                    "mode": "w",
+                },
+                "access": {
+                    "class": "logging.FileHandler",
+                    "formatter": "access",
+                    "filename": LOG_SERV,
+                    "mode": "w",
+                },
+            },
+            "loggers": {
+                "uvicorn": {"handlers": ["default"], "level": "DEBUG"},
+                "uvicorn.access": {"handlers": ["access"], "level": "DEBUG", "propagate": False},
+            },
+        },
         timeout_graceful_shutdown=2,
     )
-    server = uvicorn.Server(config=uv_cfg)
+    server = uvicorn.Server(config=uvicorn_config)
     asyncio.run(server.serve())

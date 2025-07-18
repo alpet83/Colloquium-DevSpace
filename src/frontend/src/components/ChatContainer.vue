@@ -1,4 +1,4 @@
-<!-- /frontend/rtm/src/components/ChatContainer.vue, updated 2025-07-17 21:49 EEST -->
+<!-- /frontend/rtm/src/components/ChatContainer.vue, updated 2025-07-18 22:23 EEST -->
 <template>
   <div class="chat-container">
     <div class="tabs">
@@ -107,9 +107,7 @@ export default defineComponent({
     this.$nextTick(() => {
       this.autoResize({ target: this.$refs.messageInput }, 'messageInput')
     })
-    // Перехват console.error и console.warn
     this.overrideConsole()
-    // Запуск периодического запроса бэкенд-логов
     this.fetchBackendLogs()
     this.backendLogInterval = setInterval(this.fetchBackendLogs, 30000)
   },
@@ -165,6 +163,11 @@ export default defineComponent({
         }
       } catch (e) {
         console.error('Error fetching backend logs:', e)
+        this.debugLogs.push({
+          type: 'error',
+          message: `Failed to fetch backend logs: ${e.message}`,
+          timestamp: new Date().toLocaleString('ru-RU')
+        })
       }
     },
     startPolling() {
@@ -210,11 +213,21 @@ export default defineComponent({
         } else {
           console.error('Invalid upload response:', response)
           this.fileStore.chatError = 'Failed to upload file: Invalid response'
+          this.debugLogs.push({
+            type: 'error',
+            message: 'Failed to upload file: Invalid response',
+            timestamp: new Date().toLocaleString('ru-RU')
+          })
         }
         this.closeFileConfirmModal()
       } catch (error) {
         console.error('Error uploading file:', error)
         this.fileStore.chatError = `Failed to upload file: ${error.message}`
+        this.debugLogs.push({
+          type: 'error',
+          message: `Failed to upload file: ${error.message}`,
+          timestamp: new Date().toLocaleString('ru-RU')
+        })
       }
     },
     async sendMessage(event) {
@@ -234,6 +247,11 @@ export default defineComponent({
       } catch (error) {
         console.error('Error sending message:', error)
         this.chatStore.chatError = `Failed to send message: ${error.message}`
+        this.debugLogs.push({
+          type: 'error',
+          message: `Failed to send message: ${error.message}`,
+          timestamp: new Date().toLocaleString('ru-RU')
+        })
       }
     },
     openEditPostModal(postId, message) {
@@ -258,6 +276,11 @@ export default defineComponent({
       } catch (error) {
         console.error('Error editing post:', error)
         this.chatStore.chatError = `Failed to edit post: ${error.message}`
+        this.debugLogs.push({
+          type: 'error',
+          message: `Failed to edit post: ${error.message}`,
+          timestamp: new Date().toLocaleString('ru-RU')
+        })
       }
     },
     openCreateChatModal() {
@@ -274,6 +297,11 @@ export default defineComponent({
       } else {
         console.error('Invalid fileId received:', fileId)
         this.fileStore.chatError = 'Invalid file selection'
+        this.debugLogs.push({
+          type: 'error',
+          message: 'Invalid file selection',
+          timestamp: new Date().toLocaleString('ru-RU')
+        })
       }
       this.$refs.messageInput?.focus()
       this.$nextTick(() => {
@@ -289,6 +317,7 @@ export default defineComponent({
     },
     formatMessage(message, fileNames, userName, timestamp) {
       let formatted = message ? message.replace(/</g, '<').replace(/>/g, '>') : '[Post deleted]'
+      // Обработка @attached_file
       if (fileNames && fileNames.length) {
         fileNames.forEach(file => {
           const date = new Date(file.ts * 1000).toLocaleString('ru-RU', {
@@ -303,6 +332,22 @@ export default defineComponent({
           formatted = formatted.replace(regex, `<a href="#" @click.prevent="$emit('select-file', ${file.file_id})">File: ${file.file_name} (@attached_file#${file.file_id}, ${date})</a>`)
         })
       }
+      // Обработка <code_patch>
+      formatted = formatted.replace(
+        /<code_patch file_id="(\d+)">([\s\S]*?)<\/code_patch>/g,
+        (match, fileId, content) => {
+          const lines = content.split('\n').map(line => {
+            if (line.startsWith('-') && !line.startsWith('---')) {
+              return `<span class="patch-removed">${line}</span>`
+            } else if (line.startsWith('+')) {
+              return `<span class="patch-added">${line}</span>`
+            } else {
+              return `<span class="patch-unchanged">${line}</span>`
+            }
+          }).join('\n')
+          return `<pre class="code-patch">${lines}</pre>`
+        }
+      )
       const dateTime = new Date(timestamp * 1000).toLocaleString('ru-RU', {
         day: '2-digit',
         month: '2-digit',
@@ -324,13 +369,31 @@ export default defineComponent({
       if (newChatId !== null) {
         this.chatStore.waitChanges = false
         this.chatStore.fetchHistory()
+        this.fileStore.fetchFiles() // Обновляем список файлов при смене чата
         this.startPolling()
       }
     },
     'chatStore.history': {
-      handler(newHistory) {
+      async handler(newHistory, oldHistory) {
         console.log('Deleted posts:', newHistory.filter(post => post.action === 'delete'))
         this.scrollToBottom()
+        // Обновляем список файлов, если есть посты с @attach#
+        if (oldHistory) {
+          const hasAttach = newHistory.some(post => post.message && post.message.includes('@attach#'))
+          if (hasAttach) {
+            console.log('Post with @attach# detected in history, fetching files')
+            try {
+              await this.fileStore.fetchFiles()
+            } catch (error) {
+              console.error('Error fetching files:', error)
+              this.debugLogs.push({
+                type: 'error',
+                message: `Failed to fetch files: ${error.message}`,
+                timestamp: new Date().toLocaleString('ru-RU')
+              })
+            }
+          }
+        }
       },
       deep: true,
       immediate: true
@@ -526,5 +589,31 @@ dialog input, dialog textarea {
 .deleted-post {
   color: #888;
   font-style: italic;
+}
+.code-patch {
+  background: #222;
+  padding: 8px;
+  border-radius: 5px;
+  font-family: monospace;
+  white-space: pre-wrap;
+}
+@media (prefers-color-scheme: light) {
+  .code-patch {
+    background: #f5f5f5;
+  }
+}
+.patch-removed {
+  color: #ff4444;
+}
+.patch-added {
+  color: #00cc00;
+}
+.patch-unchanged {
+  color: #eee;
+}
+@media (prefers-color-scheme: light) {
+  .patch-unchanged {
+    color: #333;
+  }
 }
 </style>

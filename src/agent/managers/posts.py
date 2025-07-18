@@ -1,19 +1,18 @@
-# /agent/managers/posts.py, updated 2025-07-17 20:58 EEST
+# /agent/managers/posts.py, updated 2025-07-18 21:47 EEST
 import time
-import logging
 import re
 import asyncio
-import traceback
 from managers.db import Database, DataTable
 import globals
+from lib.basic_logger import BasicLogger
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s #%(levelname)s: %(message)s')
+log = globals.get_logger("postman")
 
 class PostManager:
     def __init__(self, user_manager):
         self.user_manager = user_manager
         self.db = Database.get_database()
-        self.changes_history = {}  # Словарь для хранения изменённых post_id по chat_id
+        self.changes_history = {}
         self.posts_table = DataTable(
             table_name="posts",
             template=[
@@ -33,35 +32,50 @@ class PostManager:
             self.changes_history[chat_id] = []
         effective_post_id = -post_id if action == "delete" else post_id
         self.changes_history[chat_id].append(effective_post_id)
-        logging.debug(f"Added change for chat_id={chat_id}, post_id={effective_post_id}")
+        log.debug("Added change for chat_id=%d, post_id=%d, action=%s", chat_id, effective_post_id, action)
 
     def get_changes(self, chat_id):
-        """Возвращает changes_history для указанного chat_id и очищает его."""
+        """Возвращает changes_history для указанного chat_id без очистки."""
         changes = self.changes_history.get(chat_id, [])
-        self.changes_history[chat_id] = []
-        if changes:  # Логируем только непустые изменения
-            logging.debug(f"Retrieved and cleared changes for chat_id={chat_id}: {changes}")
+        if changes:
+            log.debug("Retrieved changes for chat_id=%d: ~C95%s~C00", chat_id, str(changes))
         return changes
+
+    def clear_changes(self, chat_id):
+        """Очищает changes_history для указанного chat_id."""
+        if chat_id in self.changes_history:
+            log.debug("Cleared changes for chat_id=%d", chat_id)
+            self.changes_history[chat_id] = []
 
     def add_message(self, chat_id, user_id, message):
         try:
             timestamp = int(time.time())
-            # Проверяем, является ли сообщение командой @agent
             user_row = self.db.fetch_one('SELECT llm_class, user_name FROM users WHERE user_id = :user_id', {'user_id': user_id})
             is_llm = user_row and user_row[0] is not None
             user_name = user_row[1] if user_row else 'unknown'
-            processed_message = message
+            result = None
             agent_message = None
-            if not is_llm and message.strip().startswith('@agent') and message.strip() != '@agent':
+            message = message.strip()
+            if not is_llm and message.startswith('@agent') and message != '@agent':
                 try:
-                    processed_message = globals.post_processor.process_response(chat_id, user_id, message)
-                    if not processed_message:
-                        processed_message = message  # Если процессор не вернул текст, сохраняем исходное сообщение
+                    result = globals.post_processor.process_response(chat_id, user_id, message)
+                    log.debug("Результат process_response: ~C95%s~C00", str(result)[:50])
+                    if isinstance(result, dict):
+                        status = result.get("status")
+                        processed_message = result.get("processed_msg", message)
+                        agent_message = result.get("agent_reply")
+                        has_code_file = result.get("has_code_file", False)
+                        if status != "success":
+                            log.warn("post_processor returned status: %s", status)
+                            agent_message = f"@{user_name} {agent_message or 'Unknown error'}"
+                    else:
+                        raise ValueError("Unexpected process_response result type: %s" % type(result))
                 except Exception as e:
-                    logging.error(f"Ошибка обработки сообщения в post_processor: {str(e)}")
-                    processed_message = message  # Сохраняем исходное сообщение
+                    log.excpt("Ошибка обработки сообщения в post_processor: %s", str(e), exc_info=(type(e), e, e.__traceback__))
+                    processed_message = message
                     agent_message = f"@{user_name} Error processing message: {str(e)}"
-            # Сохраняем обработанное сообщение пользователя
+            else:
+                processed_message = message
             self.posts_table.insert_into({
                 'chat_id': chat_id,
                 'user_id': user_id,
@@ -70,67 +84,70 @@ class PostManager:
             })
             post_id = self.db.fetch_one('SELECT last_insert_rowid()')[0]
             self.add_change(chat_id, post_id, "add")
-            logging.debug(f"Добавлено сообщение post_id={post_id}, chat_id={chat_id}, user_id={user_id}, message={processed_message[:50]}...")
+            log.debug("Добавлено сообщение post_id=%d, chat_id=%d, user_id=%d, message=%s",
+                      post_id, chat_id, user_id, processed_message[:50])
 
-            # Публикуем ответ от агента, если он есть
-            if not is_llm and message.strip().startswith('@agent') and message.strip() != '@agent':
-                final_agent_message = agent_message or f"@{user_name} {processed_message}"
-                if processed_message != message or agent_message:  # Публикуем только при успешной обработке или ошибке
-                    self.posts_table.insert_into({
-                        'chat_id': chat_id,
-                        'user_id': 2,  # Агент
-                        'message': final_agent_message,
-                        'timestamp': timestamp + 1
-                    })
-                    agent_post_id = self.db.fetch_one('SELECT last_insert_rowid()')[0]
-                    self.add_change(chat_id, agent_post_id, "add")
-                    logging.debug(f"Добавлен ответ агента post_id={agent_post_id}, chat_id={chat_id}, message={final_agent_message[:50]}...")
-            # Запускаем репликацию, если сообщение не начинается с @agent
-            if not is_llm and globals.replication_manager and not message.strip().startswith('@agent'):
-                logging.debug(f"Triggering replication for post_id={post_id}, chat_id={chat_id}, user_id={user_id}")
+            if not is_llm and message.startswith('@agent') and message != '@agent' and agent_message:
+                self.posts_table.insert_into({
+                    'chat_id': chat_id,
+                    'user_id': 2,
+                    'message': agent_message,
+                    'timestamp': timestamp + 1
+                })
+                agent_post_id = self.db.fetch_one('SELECT last_insert_rowid()')[0]
+                self.add_change(chat_id, agent_post_id, "add")
+                log.debug("Добавлен ответ агента post_id=%d, chat_id=%d, message=%s",
+                          agent_post_id, chat_id, agent_message[:50])
+                # Обновляем оригинальный пост только для <code_file>
+                if has_code_file and result.get("status") == "success":
+                    self.edit_post(post_id, processed_message, user_id)
+                    log.debug("Обновлён пост post_id=%d с processed_message=%s", post_id, processed_message[:50])
+            if not is_llm and globals.replication_manager and not message.startswith('@agent'):
+                log.debug("Triggering replication for post_id=%d, chat_id=%d, user_id=%d", post_id, chat_id, user_id)
                 try:
                     loop = asyncio.get_event_loop()
                     loop.create_task(self.trigger_replication(chat_id, post_id))
                 except Exception as e:
-                    logging.error(f"Ошибка запуска репликации для post_id={post_id}, chat_id={chat_id}: {str(e)}")
+                    log.excpt("Ошибка запуска репликации для post_id=%d, chat_id=%d: %s", post_id, chat_id, str(e), exc_info=(type(e), e, e.__traceback__))
                     self.posts_table.insert_into({
                         'chat_id': chat_id,
-                        'user_id': 2,  # agent
+                        'user_id': 2,
                         'message': f"@{user_name} Failed to trigger replication: {str(e)}",
                         'timestamp': int(time.time())
                     })
                     self.add_change(chat_id, self.db.fetch_one('SELECT last_insert_rowid()')[0], "add")
-                    logging.debug(f"Added error message to chat_id={chat_id} for user_id=2")
+                    log.debug("Added error message to chat_id=%d for user_id=2", chat_id)
             else:
-                logging.debug(f"Skipping replication for post_id={post_id}, chat_id={chat_id}, user_id={user_id}, is_llm={is_llm}, starts_with_@agent={message.strip().startswith('@agent')}")
+                log.debug("Skipping replication for post_id=%d, chat_id=%d, user_id=%d, is_llm=%s, starts_with_@agent=%s",
+                          post_id, chat_id, user_id, str(is_llm), str(message.startswith('@agent')))
             return {"status": "ok", "post_id": post_id}
         except Exception as e:
-            logging.error(f"Ошибка добавления сообщения для chat_id={chat_id}, user_id={user_id}: {str(e)}")
+            log.excpt("Ошибка добавления сообщения для chat_id=%d, user_id=%d: %s", chat_id, user_id, str(e), exc_info=(type(e), e, e.__traceback__))
             return {"error": str(e)}
 
     async def trigger_replication(self, chat_id, post_id):
         try:
-            logging.debug(f"Running replication for chat_id={chat_id}, post_id={post_id}")
+            log.debug("Running replication for chat_id=%d, post_id=%d", chat_id, post_id)
             await globals.replication_manager.replicate_to_llm(chat_id)
-            logging.debug(f"Replication completed for chat_id={chat_id}, post_id={post_id}")
+            log.debug("Replication completed for chat_id=%d, post_id=%d", chat_id, post_id)
         except Exception as e:
-            logging.error(f"Ошибка репликации для chat_id={chat_id}, post_id={post_id}: {str(e)}")
+            log.excpt("Ошибка репликации для chat_id=%d, post_id=%d: %s", chat_id, post_id, str(e), exc_info=(type(e), e, e.__traceback__))
             user_row = self.db.fetch_one('SELECT user_name FROM users WHERE user_id = :user_id', {'user_id': 2})
             user_name = user_row[0] if user_row else 'agent'
             self.posts_table.insert_into({
                 'chat_id': chat_id,
-                'user_id': 2,  # agent
+                'user_id': 2,
                 'message': f"@{user_name} Replication error: {str(e)}",
                 'timestamp': int(time.time())
             })
             self.add_change(chat_id, self.db.fetch_one('SELECT last_insert_rowid()')[0], "add")
-            logging.debug(f"Added replication error message to chat_id={chat_id} for user_id=2")
-            traceback.print_exc()
+            log.debug("Added replication error message to chat_id=%d for user_id=2", chat_id)
 
     def get_history(self, chat_id, only_changes=False):
         try:
             changes = self.get_changes(chat_id)
             if only_changes and not changes:
+                # NO_LOG!
                 return {"chat_history": "no changes"}
 
             history = []
@@ -138,7 +155,6 @@ class PostManager:
             deleted_ids = [-pid for pid in changes if pid < 0] if only_changes else []
             hierarchy = globals.chat_manager.get_chat_hierarchy(chat_id)
 
-            # Обрабатываем удалённые посты из changes_history
             if only_changes:
                 for deleted_id in deleted_ids:
                     history.append({
@@ -152,7 +168,6 @@ class PostManager:
                         "action": "delete"
                     })
 
-            # Обрабатываем существующие посты
             for c_id in hierarchy:
                 query = f"SELECT p.id, p.chat_id, p.user_id, p.message, p.timestamp, u.user_name FROM posts p JOIN users u ON p.user_id = u.user_id WHERE p.chat_id = :chat_id"
                 params = {'chat_id': c_id}
@@ -164,17 +179,17 @@ class PostManager:
                         query += f" AND p.id IN ({','.join([':pid' + str(i) for i in range(len(post_ids))])})"
                         for i, pid in enumerate(post_ids):
                             params[f'pid{i}'] = pid
-                query += " ORDER BY p.id"  # Сортировка по id вместо timestamp
+                query += " ORDER BY p.id"
                 posts = self.db.fetch_all(query, params)
                 for post in posts:
                     action = "delete" if post[0] in deleted_ids else "add"
                     message = None if action == "delete" else post[3]
-                    file_ids = re.findall(r'@attach#(\d+)', message or "")
+                    file_ids = re.findall(r'@attached_file#(\d+)', message or "")
                     file_names = []
                     for file_id in file_ids:
                         file_data = self.db.fetch_one(
                             'SELECT file_name, ts FROM attached_files WHERE id = :file_id',
-                            {'file_id': file_id}
+                            {'file_id': int(file_id)}
                         )
                         if file_data:
                             file_names.append({"file_id": int(file_id), "file_name": file_data[0].lstrip('@'), "ts": file_data[1]})
@@ -188,11 +203,12 @@ class PostManager:
                         "user_name": post[5],
                         "action": action
                     })
-            logging.debug(f"Returning history for chat_id={chat_id}: {len(history)} posts, only_changes={only_changes}")
+            if history and only_changes:
+                self.clear_changes(chat_id)
+            log.debug("Получена история для chat_id=%d: %d сообщений, only_changes=%s", chat_id, len(history), str(only_changes))
             return history
         except Exception as e:
-            logging.error(f"Ошибка получения истории для chat_id={chat_id}: {str(e)}")
-            traceback.print_exc()
+            log.excpt("Ошибка получения истории для chat_id=%d: %s", chat_id, str(e), exc_info=(type(e), e, e.__traceback__))
             return {"error": str(e)}
 
     def get_post(self, post_id):
@@ -217,29 +233,29 @@ class PostManager:
                 limit=1
             )
             if not post:
-                logging.info(f"Сообщение post_id={post_id} не найдено")
+                log.info("Сообщение post_id=%d не найдено", post_id)
                 return {"error": "Post not found"}
             post_user_id, chat_id = post[0]
             if post_user_id != user_id and self.user_manager.get_user_role(user_id) != 'admin':
-                logging.info(f"Пользователь user_id={user_id} не имеет прав для редактирования post_id={post_id}")
+                log.info("Пользователь user_id=%d не имеет прав для редактирования post_id=%d", user_id, post_id)
                 self.posts_table.insert_into({
                     'chat_id': chat_id,
-                    'user_id': 2,  # agent
+                    'user_id': 2,
                     'message': f"Permission denied: User {user_id} cannot edit post_id={post_id} owned by user {post_user_id}",
                     'timestamp': int(time.time())
                 })
                 self.add_change(chat_id, self.db.fetch_one('SELECT last_insert_rowid()')[0], "add")
-                logging.debug(f"Added permission error message to chat_id={chat_id} for user_id=2")
+                log.debug("Added permission error message to chat_id=%d for user_id=2", chat_id)
                 return {"error": "Permission denied"}
             self.posts_table.update(
                 conditions={'id': post_id},
                 values={'message': message, 'timestamp': int(time.time())}
             )
             self.add_change(chat_id, post_id, "edit")
-            logging.debug(f"Отредактировано сообщение post_id={post_id} от user_id={user_id}")
+            log.debug("Отредактировано сообщение post_id=%d для user_id=%d", post_id, user_id)
             return {"status": "ok"}
         except Exception as e:
-            logging.error(f"Ошибка редактирования сообщения post_id={post_id}: {str(e)}")
+            log.excpt("Ошибка редактирования сообщения post_id=%d: %s", post_id, str(e), exc_info=(type(e), e, e.__traceback__))
             return {"error": str(e)}
 
     def delete_post(self, post_id, user_id):
@@ -250,16 +266,16 @@ class PostManager:
                 limit=1
             )
             if not post:
-                logging.info(f"Сообщение post_id={post_id} не найдено")
+                log.info("Сообщение post_id=%d не найдено", post_id)
                 return {"error": "Post not found"}
             post_user_id, chat_id = post[0]
             if post_user_id != user_id and self.user_manager.get_user_role(user_id) != 'admin':
-                logging.info(f"Пользователь user_id={user_id} не имеет прав для удаления post_id={post_id}")
+                log.info("Пользователь user_id=%d не имеет прав для удаления post_id=%d", user_id, post_id)
                 return {"error": "Permission denied"}
             self.posts_table.delete_from(conditions={'id': post_id})
             self.add_change(chat_id, post_id, "delete")
-            logging.debug(f"Удалено сообщение post_id={post_id} для user_id={user_id}")
+            log.debug("Удалено сообщение post_id=%d для user_id=%d", post_id, user_id)
             return {"status": "ok"}
         except Exception as e:
-            logging.error(f"Ошибка удаления сообщения post_id={post_id}: {str(e)}")
+            log.excpt("Ошибка удаления сообщения post_id=%d: %s", post_id, str(e), exc_info=(type(e), e, e.__traceback__))
             return {"error": str(e)}

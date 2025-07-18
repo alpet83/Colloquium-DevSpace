@@ -1,8 +1,11 @@
-# /agent/llm_api.py, updated 2025-07-16 21:42 EEST
-import logging
+# /agent/llm_api.py, updated 2025-07-18 14:50 EEST
 import aiohttp
 import json
 from typing import Dict, Optional
+from lib.basic_logger import BasicLogger
+import globals
+
+log = globals.get_logger("llm_api")
 
 class LLMConnection:
     def __init__(self, config: Dict):
@@ -10,7 +13,7 @@ class LLMConnection:
         self.model = config.get("model", "default")
 
     async def call(self, prompt: str, search_parameters: Optional[Dict] = None) -> Dict:
-        logging.warning(f"Base LLMConnection called for model={self.model}, not implemented")
+        log.warn("Базовый LLMConnection вызван для model=%s, не реализован", self.model)
         return {}
 
 class XAIConnection(LLMConnection):
@@ -19,7 +22,8 @@ class XAIConnection(LLMConnection):
         self.base_url = "https://api.x.ai/v1"
 
     async def call(self, prompt: str, search_parameters: Optional[Dict] = None) -> Dict:
-        logging.debug(f"XAIConnection call: model={self.model}, prompt_length={len(prompt)}, search_parameters={search_parameters}")
+        log.debug("XAIConnection вызов: model=%s, prompt_length=%d, search_parameters=~C95%s~C00",
+                  self.model, len(prompt), str(search_parameters))
         try:
             async with aiohttp.ClientSession() as session:
                 payload = {
@@ -38,16 +42,16 @@ class XAIConnection(LLMConnection):
                     json=payload
                 ) as response:
                     if response.status != 200:
-                        logging.error(f"XAI API error: status={response.status}, response={await response.text()}")
+                        log.error("Ошибка XAI API: status=%d, response=%s", response.status, await response.text())
                         return {}
                     result = await response.json()
-                    logging.debug(f"XAI API response: {json.dumps(result, indent=2)}")
+                    log.debug("Ответ XAI API: ~C95%s~C00", json.dumps(result, indent=2))
                     return {
                         "text": result.get("choices", [{}])[0].get("message", {}).get("content", ""),
                         "usage": result.get("usage", {})
                     }
         except Exception as e:
-            logging.error(f"XAIConnection error: {str(e)}")
+            log.excpt("Ошибка XAIConnection: %s", str(e), exc_info=(type(e), e, e.__traceback__))
             return {}
 
 class OpenAIConnection(LLMConnection):
@@ -56,7 +60,8 @@ class OpenAIConnection(LLMConnection):
         self.base_url = "https://api.openai.com/v1"
 
     async def call(self, prompt: str, search_parameters: Optional[Dict] = None) -> Dict:
-        logging.debug(f"OpenAIConnection call: model={self.model}, prompt_length={len(prompt)}, search_parameters={search_parameters}")
+        log.debug("OpenAIConnection вызов: model=%s, prompt_length=%d, search_parameters=~C95%s~C00",
+                  self.model, len(prompt), str(search_parameters))
         try:
             async with aiohttp.ClientSession() as session:
                 payload = {
@@ -75,14 +80,14 @@ class OpenAIConnection(LLMConnection):
                     json=payload
                 ) as response:
                     if response.status != 200:
-                        logging.error(f"OpenAI API error: status={response.status}, response={await response.text()}")
+                        log.error("Ошибка OpenAI API: status=%d, response=%s", response.status, await response.text())
                         return {}
                     result = await response.json()
-                    logging.debug(f"OpenAI API response: {json.dumps(result, indent=2)}")
+                    log.debug("Ответ OpenAI API: ~C95%s~C00", json.dumps(result, indent=2))
                     return {
                         "text": result.get("choices", [{}])[0].get("message", {}).get("content", ""),
                         "usage": result.get("usage", {})
                     }
         except Exception as e:
-            logging.error(f"OpenAIConnection error: {str(e)}")
+            log.excpt("Ошибка OpenAIConnection: %s", str(e), exc_info=(type(e), e, e.__traceback__))
             return {}

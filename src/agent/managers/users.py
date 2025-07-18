@@ -1,11 +1,12 @@
-# /agent/managers/users.py, updated 2025-07-15 22:45 EEST
+# /agent/managers/users.py, updated 2025-07-18 14:28 EEST
 import hashlib
 import binascii
 import os
-import logging
 from .db import Database
+from lib.basic_logger import BasicLogger
+import globals
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s: %(message)s')
+log = globals.get_logger("userman")
 
 class UserManager:
     def __init__(self):
@@ -14,7 +15,7 @@ class UserManager:
         self._init_admin_user()
 
     def _create_tables(self):
-        logging.info("Создание таблицы users")
+        log.info("Создание таблицы users")
         self.db.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,23 +38,21 @@ class UserManager:
                 'INSERT INTO users (user_name, llm_class, llm_token, password_hash, salt) VALUES (:user_name, NULL, NULL, :password_hash, :salt)',
                 {'user_name': 'admin', 'password_hash': server_hash, 'salt': salt_hex}
             )
-            logging.info("Создан пользователь admin с паролем colloqium")
-
+            log.info("Создан пользователь admin с паролем %s", "colloquium")
         count = self.db.fetch_one('SELECT COUNT(*) FROM users WHERE user_name = :username', {'username': 'agent'})
         if count[0] == 0:
             self.db.execute(
                 'INSERT INTO users (user_name, llm_class, llm_token, password_hash, salt) VALUES (:user_name, NULL, NULL, NULL, NULL)',
                 {'user_name': 'agent'}
             )
-            logging.info("Создан системный пользователь agent")
-
+            log.info("Создан системный пользователь %s", "agent")
         count = self.db.fetch_one('SELECT COUNT(*) FROM users WHERE user_name = :username', {'username': 'grok'})
         if count[0] == 0:
             self.db.execute(
                 'INSERT INTO users (user_name, llm_class, llm_token, password_hash, salt) VALUES (:user_name, :llm_class, :llm_token, NULL, NULL)',
                 {'user_name': 'grok', 'llm_class': 'grok-3', 'llm_token': '<your_xai_api_key>'}
             )
-            logging.info("Создан пользователь grok с llm_class=grok-3")
+            log.info("Создан пользователь %s с llm_class=%s", "grok", "grok-3")
 
     def check_auth(self, username, password):
         row = self.db.fetch_one(
@@ -61,13 +60,13 @@ class UserManager:
             {'username': username}
         )
         if not row:
-            logging.info(f"Неверное имя пользователя: {username}")
+            log.info("Неверное имя пользователя: %s", username)
             return None
         user_id, stored_hash, salt_hex = row
         salt = binascii.unhexlify(salt_hex)
         server_hash = hashlib.sha256(salt + password.encode()).hexdigest()
         if server_hash != stored_hash:
-            logging.info(f"Неверный пароль для username={username}")
+            log.info("Неверный пароль для username=%s", username)
             return None
         return user_id
 

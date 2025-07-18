@@ -1,7 +1,10 @@
-# /agent/managers/db.py, updated 2025-07-17 13:43 EEST
-import logging
+# /agent/managers/db.py, updated 2025-07-18 14:39 EEST
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
+from lib.basic_logger import BasicLogger
+import globals
+
+log = globals.get_logger("db")
 
 class Database:
     _instance = None
@@ -15,7 +18,7 @@ class Database:
     def __init__(self):
         self.engine = create_engine('sqlite:////app/data/multichat.db', echo=False)
         self._init_tables()
-        logging.info(f"Инициализирована БД: {self.engine.url}")
+        log.info("Инициализирована БД: %s", str(self.engine.url))
 
     def _init_tables(self):
         self.execute("""
@@ -38,7 +41,8 @@ class Database:
                 conn.commit()
                 return result
         except SQLAlchemyError as e:
-            logging.error(f"Ошибка выполнения запроса: {query}, params={params}, error={str(e)}")
+            log.excpt("Ошибка выполнения запроса: %s, params=~C95%s~C00, error=%s",
+                      query, str(params), str(e), exc_info=(type(e), e, e.__traceback__))
             raise
 
     def fetch_one(self, query, params=None):
@@ -49,7 +53,8 @@ class Database:
                 row = result.fetchone()
                 return row
         except SQLAlchemyError as e:
-            logging.error(f"Ошибка fetch_one: {query}, params={params}, error={str(e)}")
+            log.excpt("Ошибка fetch_one: %s, params=~C95%s~C00, error=%s",
+                      query, str(params), str(e), exc_info=(type(e), e, e.__traceback__))
             raise
 
     def fetch_all(self, query, params=None):
@@ -58,9 +63,11 @@ class Database:
                 params = params if params is not None else {}
                 result = conn.execute(text(query), params)
                 rows = result.fetchall()
+                log.debug("Выбрано %d строк из запроса: %s, params=~C95%s~C00", len(rows), query, str(params))
                 return rows
         except SQLAlchemyError as e:
-            logging.error(f"Ошибка fetch_all: {query}, params={params}, error={str(e)}")
+            log.excpt("Ошибка fetch_all: %s, params=~C95%s~C00, error=%s",
+                      query, str(params), str(e), exc_info=(type(e), e, e.__traceback__))
             raise
 
 class DataTable:
@@ -77,9 +84,9 @@ class DataTable:
             fields = ", ".join(self.template)
             query = f"CREATE TABLE IF NOT EXISTS {self.table_name} ({fields})"
             self.db.execute(query)
-            logging.debug(f"Table {self.table_name} created or already exists")
+            log.debug("Таблица %s создана или уже существует", self.table_name)
         except Exception as e:
-            logging.error(f"Failed to create table {self.table_name}: {str(e)}")
+            log.excpt("Не удалось создать таблицу %s: %s", self.table_name, str(e), exc_info=(type(e), e, e.__traceback__))
             raise
 
     def upgrade(self):
@@ -100,11 +107,11 @@ class DataTable:
             for column_def in missing_columns:
                 query = f"ALTER TABLE {self.table_name} ADD COLUMN {column_def}"
                 self.db.execute(query)
-                logging.debug(f"Added column {column_def} to table {self.table_name}")
+                log.debug("Добавлен столбец %s в таблицу %s", column_def, self.table_name)
             if not missing_columns:
-                logging.debug(f"Table {self.table_name} is up-to-date")
+                log.debug("Таблица %s актуальна", self.table_name)
         except Exception as e:
-            logging.error(f"Failed to upgrade table {self.table_name}: {str(e)}")
+            log.excpt("Не удалось обновить таблицу %s: %s", self.table_name, str(e), exc_info=(type(e), e, e.__traceback__))
             raise
 
     def insert_into(self, values: dict, ignore: bool = False):
@@ -115,10 +122,10 @@ class DataTable:
             insert_type = "INSERT OR IGNORE" if ignore else "INSERT"
             query = f"{insert_type} INTO {self.table_name} ({fields}) VALUES ({placeholders})"
             self.db.execute(query, values)
-            logging.debug(f"Inserted into {self.table_name}: {values}")
+            log.debug("Вставлено в %s: ~C95%s~C00", self.table_name, str(values))
             return self.db.fetch_one(f"SELECT last_insert_rowid()")[0]
         except Exception as e:
-            logging.error(f"Failed to insert into {self.table_name}: {str(e)}")
+            log.excpt("Не удалось вставить в %s: %s", self.table_name, str(e), exc_info=(type(e), e, e.__traceback__))
             raise
 
     def insert_or_replace(self, values: dict):
@@ -128,10 +135,10 @@ class DataTable:
             placeholders = ", ".join([f":{key}" for key in values.keys()])
             query = f"INSERT OR REPLACE INTO {self.table_name} ({fields}) VALUES ({placeholders})"
             self.db.execute(query, values)
-            logging.debug(f"Inserted or replaced into {self.table_name}: {values}")
+            log.debug("Вставлено или заменено в %s: ~C95%s~C00", self.table_name, str(values))
             return self.db.fetch_one(f"SELECT last_insert_rowid()")[0]
         except Exception as e:
-            logging.error(f"Failed to insert or replace into {self.table_name}: {str(e)}")
+            log.excpt("Не удалось вставить или заменить в %s: %s", self.table_name, str(e), exc_info=(type(e), e, e.__traceback__))
             raise
 
     def update(self, values: dict, conditions: dict):
@@ -142,9 +149,9 @@ class DataTable:
             query = f"UPDATE {self.table_name} SET {set_clause} WHERE {conditions_clause}"
             params = {**values, **{f"cond_{key}": value for key, value in conditions.items()}}
             self.db.execute(query, params)
-            logging.debug(f"Updated {self.table_name}: values={values}, conditions={conditions}")
+            log.debug("Обновлено %s: values=~C95%s~C00, conditions=~C95%s~C00", self.table_name, str(values), str(conditions))
         except Exception as e:
-            logging.error(f"Failed to update {self.table_name}: {str(e)}")
+            log.excpt("Не удалось обновить %s: %s", self.table_name, str(e), exc_info=(type(e), e, e.__traceback__))
             raise
 
     def delete_from(self, conditions: dict):
@@ -154,9 +161,9 @@ class DataTable:
             query = f"DELETE FROM {self.table_name} WHERE {conditions_clause}"
             params = conditions
             self.db.execute(query, params)
-            logging.debug(f"Deleted from {self.table_name}: conditions={conditions}")
+            log.debug("Удалено из %s: conditions=~C95%s~C00", self.table_name, str(conditions))
         except Exception as e:
-            logging.error(f"Failed to delete from {self.table_name}: {str(e)}")
+            log.excpt("Не удалось удалить из %s: %s", self.table_name, str(e), exc_info=(type(e), e, e.__traceback__))
             raise
 
     def select_from(self, conditions: dict = None, order_by: str = None, limit: int = None, joins: list = None, columns: list = None):
@@ -178,8 +185,8 @@ class DataTable:
             if limit:
                 query += f" LIMIT {limit}"
             result = self.db.fetch_all(query, params)
-            logging.debug(f"Selected from {self.table_name}: {len(result)} rows, query={query}")
+            log.debug("Выбрано %d строк из %s: query=%s", len(result), self.table_name, query)
             return result
         except Exception as e:
-            logging.error(f"Failed select query {query}: {str(e)}")
+            log.excpt("Не удалось выполнить выборку %s: %s", query, str(e), exc_info=(type(e), e, e.__traceback__))
             raise

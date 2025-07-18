@@ -1,6 +1,9 @@
-# /agent/managers/chats.py, updated 2025-07-17 22:04 EEST
-import logging
+# /agent/managers/chats.py, updated 2025-07-18 14:19 EEST
 from .db import Database
+from lib.basic_logger import BasicLogger
+import globals
+
+log = globals.get_logger("chatman")
 
 class ChatManager:
     def __init__(self):
@@ -23,7 +26,9 @@ class ChatManager:
             'SELECT chat_id, chat_description, user_list, parent_msg_id FROM chats WHERE user_list = :all OR user_list LIKE :user_id',
             {'all': 'all', 'user_id': f'%{user_id}%'}
         )
-        return [{"chat_id": chat[0], "description": chat[1], "user_list": chat[2], "parent_msg_id": chat[3]} for chat in chats]
+        result = [{"chat_id": chat[0], "description": chat[1], "user_list": chat[2], "parent_msg_id": chat[3]} for chat in chats]
+        log.debug("Возвращено %d чатов для user_id=%d", len(result), user_id)
+        return result
 
     def create_chat(self, description, user_id, parent_msg_id=None):
         result = self.db.execute(
@@ -31,27 +36,31 @@ class ChatManager:
             {'description': description, 'user_list': str(user_id), 'parent_msg_id': parent_msg_id}
         )
         chat_id = self.db.fetch_one('SELECT last_insert_rowid()')[0]
-        logging.debug(f"Created chat chat_id={chat_id} for user_id={user_id}")
+        log.debug("Создан чат chat_id=%d для user_id=%d", chat_id, user_id)
         return chat_id
 
     def delete_chat(self, chat_id, user_id):
-        count = self.db.fetch_one(
-            'SELECT COUNT(*) FROM chats WHERE parent_msg_id IN (SELECT id FROM posts WHERE chat_id = :chat_id)',
-            {'chat_id': chat_id}
-        )
-        if count[0] > 0:
-            logging.info(f"#INFO: Cannot delete chat {chat_id} as it has sub-chats")
-            return {"error": "Cannot delete chat with sub-chats"}
-        self.db.execute('DELETE FROM posts WHERE chat_id = :chat_id', {'chat_id': chat_id})
-        result = self.db.execute(
-            'DELETE FROM chats WHERE chat_id = :chat_id AND user_list LIKE :user_id',
-            {'chat_id': chat_id, 'user_id': f'%{user_id}%'}
-        )
-        if result.rowcount == 0:
-            logging.info(f"#INFO: Chat {chat_id} not found or user {user_id} unauthorized")
-            return {"error": "Chat not found or unauthorized"}
-        logging.info(f"#INFO: Deleted chat {chat_id} by user {user_id}")
-        return {"status": "ok"}
+        try:
+            count = self.db.fetch_one(
+                'SELECT COUNT(*) FROM chats WHERE parent_msg_id IN (SELECT id FROM posts WHERE chat_id = :chat_id)',
+                {'chat_id': chat_id}
+            )
+            if count[0] > 0:
+                log.info("Невозможно удалить чат chat_id=%d, так как он имеет подчаты", chat_id)
+                return {"error": "Cannot delete chat with sub-chats"}
+            self.db.execute('DELETE FROM posts WHERE chat_id = :chat_id', {'chat_id': chat_id})
+            result = self.db.execute(
+                'DELETE FROM chats WHERE chat_id = :chat_id AND user_list LIKE :user_id',
+                {'chat_id': chat_id, 'user_id': f'%{user_id}%'}
+            )
+            if result.rowcount == 0:
+                log.info("Чат chat_id=%d не найден или пользователь user_id=%d не авторизован", chat_id, user_id)
+                return {"error": "Chat not found or unauthorized"}
+            log.info("Удалён чат chat_id=%d пользователем user_id=%d", chat_id, user_id)
+            return {"status": "ok"}
+        except Exception as e:
+            log.excpt("Ошибка удаления чата chat_id=%d: %s", chat_id, str(e), exc_info=(type(e), e, e.__traceback__))
+            return {"error": str(e)}
 
     def get_chat_hierarchy(self, chat_id):
         hierarchy = []
@@ -72,7 +81,7 @@ class ChatManager:
                     chat_id = None
             else:
                 break
-        logging.debug(f"Chat hierarchy for chat_id={chat_id}: {hierarchy}")
+        #  log.debug("Иерархия чатов для chat_id=%d: ~C95%s~C00", chat_id, str(hierarchy))
         return hierarchy[::-1]
 
     def get_file_stats(self, chat_id):
@@ -92,8 +101,8 @@ class ChatManager:
                     } for file in files
                 ]
             }
-            logging.debug(f"Retrieved file stats for chat_id={chat_id}: {stats['total_files']} files")
+            log.debug("Получена статистика файлов для chat_id=%d: %d файлов", chat_id, stats['total_files'])
             return stats
         except Exception as e:
-            logging.error(f"Error retrieving file stats for chat_id={chat_id}: {str(e)}")
+            log.excpt("Ошибка получения статистики файлов для chat_id=%d: %s", chat_id, str(e), exc_info=(type(e), e, e.__traceback__))
             return {"error": str(e)}
