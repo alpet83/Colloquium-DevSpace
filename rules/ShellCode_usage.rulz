@@ -1,0 +1,129 @@
+# ShellCode Usage Rules for LLM
+
+## Overview
+This document outlines the rules for LLMs to execute Linux commands using the `<shell_code>` tag in the Colloquium-DevSpace project, running on two containers: `colloquium-core` (local execution) and `mcp-sandbox` (REST API execution). Commands are processed by `/app/agent/lib/execute_commands.py` and displayed in the frontend via `ChatContainer.vue`. The rules ensure safe, consistent command execution with proper logging and output formatting.
+
+## `<shell_code>` Tag Structure
+The `<shell_code>` tag encapsulates Linux commands with optional attributes and sub-tags for interactive input. It is processed by `llm_hands.py` and executed via `execute_commands.py`.
+
+### Attributes
+- **timeout** (optional, default: 300):
+  - Specifies execution timeout in seconds (integer).
+  - Example: `timeout="10"` limits execution to 10 seconds.
+- **mcp** (optional, default: true):
+  - Boolean (`true`/`false`) indicating execution via `mcp-sandbox` (`true`) or locally on `colloquium-core` (`false`).
+  - Example: `mcp="true"` uses REST API `/exec_commands` on `mcp-sandbox`.
+- **user_name** (optional, default: "Unknown"):
+  - Username for logging and response formatting.
+  - Example: `user_name="alice"` associates the command with user "alice".
+- **project_name** (optional, default: "default"):
+  - Specifies the project context for `mcp-sandbox` execution.
+  - Required if `mcp="true"`, ignored for local execution.
+  - Example: `project_name="trade_report"`.
+
+### Sub-tags
+- **`<user_input>`** (optional):
+  - Defines interactive input for commands requiring user response.
+  - Attributes:
+    - `rqs`: String to match in `stdout` to trigger input.
+    - `ack`: String to send to `stdin` when `rqs` is matched.
+  - Example: `<user_input rqs="password" ack="1234"/>` sends "1234" when "password" appears in `stdout`.
+
+### Syntax Example
+```xml
+@agent <shell_code timeout="10" user_name="alice" project_name="trade_report">
+ls -l /
+<user_input rqs="password" ack="1234"/>
+</shell_code>
+```
+
+## Execution Process
+1. **Parsing**:
+   - `llm_hands.py` extracts `<shell_code>` and attributes via regex.
+   - Sub-tags `<user_input>` are parsed and passed as `user_inputs` list.
+2. **Execution**:
+   - If `mcp="true"`:
+     - Sends POST request to `http://mcp-sandbox:8084/exec_commands` with JSON payload:
+       ```json
+       {"command": "ls -l /", "user_inputs": [{"rqs": "password", "ack": "1234"}], "project_name": "trade_report", "timeout": 10}
+       ```
+     - Requires `Authorization: Bearer Grok-xAI-Agent-The-Best`.
+   - If `mcp="false"`:
+     - Calls `execute` in `execute_commands.py` locally on `colloquium-core`.
+3. **Output Handling**:
+   - `execute_commands.py` runs the command as user `agent` in `/app/projects`.
+   - Creates temporary script `/app/projects/cmds.sh` with `chmod 755` and `chown agent`.
+   - Uses `select` to read `stdout`/`stderr` in real-time for interactive input.
+   - Logs full output to `/app/logs/exec.stdout` and `/app/logs/exec.stderr`.
+   - Limits output to 100 lines or 4KB in `<stdout>` and `<stderr>` tags.
+
+## Expected Results
+- **Success**:
+  - Status: `"success"`.
+  - Output: Wrapped in `<stdout>` (and `<stderr>` if errors occur).
+  - Example for `ls -l /`:
+    ```xml
+    <stdout>total 64
+    dir1 dir2 file1.txt ...
+    </stdout>
+    ```
+  - Logs:
+    - `/app/logs/exec.stdout`: `[YYYY-MM-DD HH:MM:SS] Command: ls -l /
+      total 64
+      dir1 dir2 file1.txt ...`
+    - `/app/logs/llm_hands/YYYY-MM-DD/llm_hands_HHMM.log`: `[YYYY-MM-DD HH:MM:SS,fff] #INFO: Команда выполнена через MCP: ls -l /, статус=200, ...`
+    - `/app/logs/mcp_errors.log`: `[YYYY-MM-DD HH:MM:SS,fff] #INFO: Команда ls -l / для default: Success`
+- **Error**:
+  - Status: `"error"` or `"warn"` (for timeout).
+  - Output: Error message in `<stdout>` or `<stderr>`.
+  - Example for `ls -l /nonexistent`:
+    ```xml
+    <stdout></stdout>
+    <stderr>ls: cannot access '/nonexistent': No such file or directory</stderr>
+    ```
+  - Logs:
+    - `/app/logs/exec.stderr`: `[YYYY-MM-DD HH:MM:SS] Command: ls -l /nonexistent
+      ls: cannot access '/nonexistent': No such file or directory`
+    - `/app/logs/mcp_errors.log`: `[YYYY-MM-DD HH:MM:SS,fff] #INFO: Команда ls -l /nonexistent для default: Error`
+- **Timeout**:
+  - Status: `"warn"`.
+  - Output: `<stdout>Error: Command timed out</stdout>`.
+  - Logs: Similar to error case with `#ERROR: Таймаут выполнения команды`.
+
+
+## Examples
+1. **Simple Command**:
+   ```xml
+   @agent <shell_code timeout="10">
+   ls -l /
+   </shell_code>
+   ```
+   - Result: `<stdout>total 64\nbin dev home ... </stdout>`
+   - Logs: `/app/logs/exec.stdout` contains full `ls -l /` output.
+
+2. **Command with Large Output**:
+   ```xml
+   @agent <shell_code timeout="10">
+   find / -type f
+   </shell_code>
+   ```
+   - Result: `<stdout>/path/to/file1\n/path/to/file2\n... (output truncated due to size limit)</stdout>`
+   - Logs: Full output in `/app/logs/exec.stdout`.
+
+3. **Interactive Command**:
+   ```xml
+   @agent <shell_code timeout="10">
+   sudo apt install -y inetutils-ping
+   </shell_code>
+   ```
+   - Result: `<stdout><apt_update_output></stdout><stderr>[sudo] password for agent:</stderr>`
+   - Logs: `/app/logs/exec.stdout`, `/app/logs/exec.stderr` contain respective outputs.
+
+## Constraints
+- Commands run as `agent` user in `/app/projects`.
+- Output limited to 100 lines or 4KB.
+- Timeout must be positive integer (default: 300 seconds).
+- `mcp="true"` requires `project_name` or defaults to `"default"`.
+- Logs are written to `/app/logs/exec.stdout`, `/app/logs/exec.stderr`, `/app/logs/llm_hands/`, `/app/logs/mcp_errors.log`.
+- `NO_LOG!` rule prohibits debug logs for `/chat/get` endpoint.
+

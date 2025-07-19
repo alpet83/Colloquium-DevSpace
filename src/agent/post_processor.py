@@ -1,4 +1,4 @@
-# /agent/managers/post_processor.py, updated 2025-07-18 20:10 EEST
+# /agent/managers/post_processor.py, updated 2025-07-19 09:42 EEST
 import re
 import datetime
 import globals
@@ -8,6 +8,7 @@ from llm_hands import process_message
 from lib.basic_logger import BasicLogger
 
 log = globals.get_logger("postproc")
+
 
 class PostProcessor:
     def __init__(self):
@@ -28,7 +29,7 @@ class PostProcessor:
     def process_response(self, chat_id: int, user_id: int, response: str, post_id: int = None) -> dict:
         """Обрабатывает ответ LLM, извлекая цитаты, команды редактирования, файлы и патчи, вызывая llm_hands."""
         log.debug("Обработка ответа для chat_id=%d, user_id=%d, post_id=%s, response_type=%s, response=%s",
-                 chat_id, user_id, str(post_id) if post_id is not None else "None", type(response), response[:50])
+                  chat_id, user_id, str(post_id) if post_id is not None else "None", type(response), response[:50])
 
         # Декодируем response, если он байтовый
         if isinstance(response, bytes):
@@ -36,15 +37,17 @@ class PostProcessor:
             log.warn("Response был байтовым, декодирован в строку: %s", response[:50])
         elif not isinstance(response, str):
             log.error("Неверный тип ответа: %s", type(response))
-            return {"status": "error", "processed_msg": response, "agent_reply": "Error: Invalid response type"}
+            return {"handled_cmds": 0, "failed_cmds": 1, "processed_msg": response,
+                    "agent_reply": "Error: Invalid response type"}
 
         # Проверяем команды для llm_hands
         user_name = globals.user_manager.get_user_name(user_id)
         hands_response = process_message(response, int(datetime.datetime.now(datetime.UTC).timestamp()), user_name)
-        if hands_response:
-            log.debug("llm_hands response: status=%s, processed_msg=%s, agent_reply=%s",
-                     hands_response["status"], hands_response["processed_msg"][:50],
-                     hands_response["agent_reply"][:50] if hands_response["agent_reply"] else None)
+        if hands_response and (hands_response["handled_cmds"] > 0 or hands_response["failed_cmds"] > 0):
+            log.debug("llm_hands response: handled_cmds=%d, failed_cmds=%d, processed_msg=%s, agent_reply=%s",
+                      hands_response["handled_cmds"], hands_response["failed_cmds"],
+                      hands_response["processed_msg"][:50],
+                      hands_response["agent_reply"][:50] if hands_response["agent_reply"] else None)
             return hands_response
 
         # Извлечение и сохранение цитат
@@ -63,20 +66,25 @@ class PostProcessor:
             result = globals.post_manager.edit_post(post_id, new_content, user_id)
             if result.get("error"):
                 log.warn("Не удалось отредактировать post_id=%d для user_id=%d: %s", post_id, user_id, result['error'])
-                return {"status": "error", "processed_msg": processed_response, "agent_reply": f"Error: {result['error']} ❌"}
+                return {"handled_cmds": 0, "failed_cmds": 1, "processed_msg": processed_response,
+                        "agent_reply": f"Error: {result['error']} ❌"}
             log.debug("Отредактирован post_id=%d с новым содержимым=%s", post_id, new_content[:50])
-            return {"status": "success", "processed_msg": processed_response.replace(match.group(0), f"Edited post_id={post_id} ✅"),
+            return {"handled_cmds": 1, "failed_cmds": 0,
+                    "processed_msg": processed_response.replace(match.group(0), f"Edited post_id={post_id} ✅"),
                     "agent_reply": f"Edited post_id={post_id} ✅"}
 
-        matches = list(re.finditer(r'<edit_post id="(\d+)">([\s\S]*?)</edit_post>', processed_response, flags=re.DOTALL))
+        matches = list(re.finditer(r'<edit_post id="(\d+)">([\s\S]*?)</edit_post>', processed_response,
+                                   flags=re.DOTALL))
         agent_reply = []
+        handled_cmds = 0
+        failed_cmds = 0
         for match in matches:
             result = handle_edit_post(match)
             processed_response = result["processed_msg"]
             if result["agent_reply"]:
                 agent_reply.append(result["agent_reply"])
-            if result["status"] == "error":
-                processed_response = response
+            handled_cmds += result["handled_cmds"]
+            failed_cmds += result["failed_cmds"]
 
         # Замена @quote#id
         def replace_quote_ref(match):
@@ -90,11 +98,13 @@ class PostProcessor:
             return match.group(0)
 
         processed_response = re.sub(r'@quote#(\d+)', replace_quote_ref, processed_response)
-        status = "error" if agent_reply and all(r.startswith("Error:") for r in agent_reply) else "success"
         agent_reply_text = "\n".join(agent_reply) if agent_reply else None
-        log.debug("Обработанный ответ для chat_id=%d: status=%s, processed_msg=%s, agent_reply=%s",
-                 chat_id, status, processed_response[:50], agent_reply_text[:50] if agent_reply_text else None)
-        return {"status": status, "processed_msg": processed_response, "agent_reply": agent_reply_text}
+        log.debug(
+            "Обработанный ответ для chat_id=%d: handled_cmds=%d, failed_cmds=%d, processed_msg=%s, agent_reply=%s",
+            chat_id, handled_cmds, failed_cmds, processed_response[:50],
+            agent_reply_text[:50] if agent_reply_text else None)
+        return {"handled_cmds": handled_cmds, "failed_cmds": failed_cmds, "processed_msg": processed_response,
+                "agent_reply": agent_reply_text}
 
     def _save_quote(self, chat_id: int, user_id: int, content: str) -> int:
         """Сохраняет цитату в таблицу quotes и возвращает quote_id."""

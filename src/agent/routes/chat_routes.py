@@ -1,5 +1,6 @@
-# /agent/routes/chat_routes.py, updated 2025-07-18 17:07 EEST
+# /agent/routes/chat_routes.py, updated 2025-07-19 21:30 EEST
 from fastapi import APIRouter, Request, HTTPException
+import asyncio
 import time
 import re
 import os
@@ -10,23 +11,28 @@ from lib.basic_logger import BasicLogger
 router = APIRouter()
 log = globals.get_logger("chatman")
 
+
+def check_session(request: Request) -> int:
+    db: Database = Database.get_database()
+    """Проверяет сессию и возвращает user_id или вызывает HTTPException."""
+    session_id = request.cookies.get("session_id")
+    if not session_id:
+        log.info(f"Отсутствует session_id для IP={request.client.host}")
+        raise HTTPException(status_code=401, detail="No session")
+    user_id = db.fetch_one(
+        'SELECT user_id FROM sessions WHERE session_id = :session_id',
+        {'session_id': session_id}
+    )
+    if not user_id:
+        log.info(f"Неверный session_id для IP={request.client.host}")
+        raise HTTPException(status_code=401, detail="Invalid session")
+    return user_id[0]
+
 @router.get("/chat/list")
 async def list_chats(request: Request):
-    db = Database.get_database()
     log.debug("Запрос GET /chat/list, IP=%s, Cookies=~C95%s~C00", request.client.host, str(request.cookies))
     try:
-        session_id = request.cookies.get("session_id")
-        if not session_id:
-            log.info("Отсутствует session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="No session")
-        user_id = db.fetch_one(
-            'SELECT user_id FROM sessions WHERE session_id = :session_id',
-            {'session_id': session_id}
-        )
-        if not user_id:
-            log.info("Неверный session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="Invalid session")
-        user_id = user_id[0]
+        user_id = check_session(request)
         chats = globals.chat_manager.list_chats(user_id)
         log.debug("Возвращено %d чатов для user_id=%d", len(chats), user_id)
         return chats
@@ -42,18 +48,7 @@ async def create_chat(request: Request):
     db = Database.get_database()
     log.debug("Запрос POST /chat/create, IP=%s, Cookies=~C95%s~C00", request.client.host, str(request.cookies))
     try:
-        session_id = request.cookies.get("session_id")
-        if not session_id:
-            log.info("Отсутствует session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="No session")
-        user_id = db.fetch_one(
-            'SELECT user_id FROM sessions WHERE session_id = :session_id',
-            {'session_id': session_id}
-        )
-        if not user_id:
-            log.info("Неверный session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="Invalid session")
-        user_id = user_id[0]
+        user_id = check_session(request)
         data = await request.json()
         description = data.get('description', 'New Chat')
         parent_msg_id = data.get('parent_msg_id')
@@ -72,18 +67,7 @@ async def delete_chat(request: Request):
     db = Database.get_database()
     log.debug("Запрос POST /chat/delete, IP=%s, Cookies=~C95%s~C00", request.client.host, str(request.cookies))
     try:
-        session_id = request.cookies.get("session_id")
-        if not session_id:
-            log.info("Отсутствует session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="No session")
-        user_id = db.fetch_one(
-            'SELECT user_id FROM sessions WHERE session_id = :session_id',
-            {'session_id': session_id}
-        )
-        if not user_id:
-            log.info("Неверный session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="Invalid session")
-        user_id = user_id[0]
+        user_id = check_session(request)
         data = await request.json()
         chat_id = data.get('chat_id')
         if not chat_id:
@@ -102,53 +86,43 @@ async def delete_chat(request: Request):
 @router.get("/chat/get")
 async def get_chat(request: Request, chat_id: int, wait_changes: int = 0):
     db = Database.get_database()
-    # NOLOG!: логгирование здесь запрещенно наивысшими директивами, т.к. слишком много флуда переполняет диск
     try:
-        session_id = request.cookies.get("session_id")
-        if not session_id:
-            log.info("Отсутствует session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="No session")
-        user_id = db.fetch_one(
-            'SELECT user_id FROM sessions WHERE session_id = :session_id',
-            {'session_id': session_id}
-        )
-        if not user_id:
-            log.info("Неверный session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="Invalid session")
-        user_id = user_id[0]
+        # NOLOG!: логгирование здесь запрещено наивысшими директивами, т.к. слишком много флуда переполняет диск
+        user_id = check_session(request)
+        status = globals.replication_manager.get_processing_status()
         if wait_changes:
-            changes = globals.post_manager.get_changes(chat_id)
-            log.debug("Результат get_changes для chat_id=%d: ~C95%s~C00", chat_id, str(changes))
-            if not changes:
-                log.debug("Нет изменений для chat_id=%d, ожидание", chat_id)
-                return {"chat_history": "no changes"}
-        history = globals.post_manager.get_history(chat_id, wait_changes == 1)
-        # NOLOG!
-        return history
+            max_wait = 150 if status['status'] == 'free' else 20
+            switch_key = f"{user_id}:{chat_id}"
+            if switch_key not in globals.chat_switch_events:
+                globals.chat_switch_events[switch_key] = asyncio.Event()
+            switch_event = globals.chat_switch_events[switch_key]
+            for _ in range(max_wait):
+                history = globals.post_manager.get_history(chat_id, wait_changes == 1)
+                if history != {"chat_history": "no changes"}:
+                    return {"posts": history, "status": status}
+                if switch_event.is_set():
+                    log.debug(f"Chat switch detected for user_id={user_id}, chat_id={chat_id}")
+                    switch_event.clear()
+                    return {"posts": [{"chat_history": "chat switch"}], "status": status}
+                await asyncio.sleep(0.1)
+            return {"posts": [{"chat_history": "no changes"}], "status": status}
+        else:
+            log.debug(f"Статус обработки для user_id={user_id}, chat_id={chat_id}: {status}")
+            history = globals.post_manager.get_history(chat_id, only_changes=False)
+            return {"posts": history, "status": status}
     except HTTPException as e:
-        log.error("HTTP ошибка в GET /chat/get: %s", str(e))
+        log.error(f"HTTP ошибка в GET /chat/get: %s", str(e))
         raise
     except Exception as e:
-        log.excpt("Ошибка сервера в GET /chat/get: %s", str(e), exc_info=(type(e), e, e.__traceback__))
-        raise HTTPException(status_code=500, detail="Server error: %s" % str(e))
+        log.excpt(f"Ошибка сервера в GET /chat/get: %s", str(e), exc_info=(type(e), e, e.__traceback__))
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 
 @router.post("/chat/notify_switch")
 async def notify_chat_switch(request: Request):
     db = Database.get_database()
     log.debug("Запрос POST /chat/notify_switch, IP=%s, Cookies=~C95%s~C00", request.client.host, str(request.cookies))
     try:
-        session_id = request.cookies.get("session_id")
-        if not session_id:
-            log.info("Отсутствует session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="No session")
-        user_id = db.fetch_one(
-            'SELECT user_id FROM sessions WHERE session_id = :session_id',
-            {'session_id': session_id}
-        )
-        if not user_id:
-            log.info("Неверный session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="Invalid session")
-        user_id = user_id[0]
+        user_id = check_session(request)
         data = await request.json()
         chat_id = data.get('chat_id')
         if not chat_id:
@@ -169,18 +143,7 @@ async def post_message(request: Request):
     db = Database.get_database()
     log.debug("Запрос POST /chat/post, IP=%s, Cookies=~C95%s~C00", request.client.host, str(request.cookies))
     try:
-        session_id = request.cookies.get("session_id")
-        if not session_id:
-            log.info("Отсутствует session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="No session")
-        user_id = db.fetch_one(
-            'SELECT user_id FROM sessions WHERE session_id = :session_id',
-            {'session_id': session_id}
-        )
-        if not user_id:
-            log.info("Неверный session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="Invalid session")
-        user_id = user_id[0]
+        user_id = check_session(request)
         data = await request.json()
         chat_id = data.get('chat_id')
         message = data.get('message')
@@ -202,18 +165,7 @@ async def edit_post(request: Request):
     db = Database.get_database()
     log.debug("Запрос POST /chat/edit_post, IP=%s, Cookies=~C95%s~C00", request.client.host, str(request.cookies))
     try:
-        session_id = request.cookies.get("session_id")
-        if not session_id:
-            log.info("Отсутствует session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="No session")
-        user_id = db.fetch_one(
-            'SELECT user_id FROM sessions WHERE session_id = :session_id',
-            {'session_id': session_id}
-        )
-        if not user_id:
-            log.info("Неверный session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="Invalid session")
-        user_id = user_id[0]
+        user_id = check_session(request)
         data = await request.json()
         post_id = data.get('post_id')
         message = data.get('message')
@@ -235,18 +187,7 @@ async def delete_post(request: Request):
     db = Database.get_database()
     log.debug("Запрос POST /chat/delete_post, IP=%s, Cookies=~C95%s~C00", request.client.host, str(request.cookies))
     try:
-        session_id = request.cookies.get("session_id")
-        if not session_id:
-            log.info("Отсутствует session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="No session")
-        user_id = db.fetch_one(
-            'SELECT user_id FROM sessions WHERE session_id = :session_id',
-            {'session_id': session_id}
-        )
-        if not user_id:
-            log.info("Неверный session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="Invalid session")
-        user_id = user_id[0]
+        user_id = check_session(request)
         data = await request.json()
         post_id = data.get('post_id')
         if not post_id:
@@ -267,18 +208,7 @@ async def get_chat_stats(request: Request, chat_id: int):
     db = Database.get_database()
     # NOLOG!
     try:
-        session_id = request.cookies.get("session_id")
-        if not session_id:
-            log.info("Отсутствует session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="No session")
-        user_id = db.fetch_one(
-            'SELECT user_id FROM sessions WHERE session_id = :session_id',
-            {'session_id': session_id}
-        )
-        if not user_id:
-            log.info("Неверный session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="Invalid session")
-        user_id = user_id[0]
+        user_id = check_session(request)
         chat = db.fetch_one(
             'SELECT chat_id FROM chats WHERE chat_id = :chat_id',
             {'chat_id': chat_id}
@@ -305,31 +235,18 @@ async def get_parent_msg(request: Request, post_id: int):
     db = Database.get_database()
     log.debug("Запрос GET /chat/get_parent_msg, post_id=%d, IP=%s, Cookies=~C95%s~C00", post_id, request.client.host, str(request.cookies))
     try:
-        session_id = request.cookies.get("session_id")
-        if not session_id:
-            log.info("Отсутствует session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="No session")
-        user_id = db.fetch_one(
-            'SELECT user_id FROM sessions WHERE session_id = :session_id',
-            {'session_id': session_id}
-        )
-        if not user_id:
-            log.info("Неверный session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="Invalid session")
-        user_id = user_id[0]
+        user_id = check_session(request)
         msg = db.fetch_one(
             'SELECT id, chat_id, user_id, message, timestamp FROM posts WHERE id = :post_id',
             {'post_id': post_id}
         )
         if not msg:
             log.info("Сообщение post_id=%d не найдено для user_id=%d", post_id, user_id)
-            # Проверяем, есть ли чаты, ссылающиеся на это сообщение
             affected_chats = db.fetch_all(
                 'SELECT chat_id, parent_msg_id FROM chats WHERE parent_msg_id = :post_id',
                 {'post_id': post_id}
             )
             for chat_id, parent_msg_id in affected_chats:
-                # Ищем ближайшее доступное сообщение в том же чате
                 chat = db.fetch_one(
                     'SELECT chat_id FROM chats WHERE chat_id = :chat_id',
                     {'chat_id': chat_id}
@@ -345,7 +262,6 @@ async def get_parent_msg(request: Request, post_id: int):
                         {'new_parent_msg_id': new_parent_msg_id, 'chat_id': chat_id}
                     )
                     log.debug("Обновлён parent_msg_id для chat_id=%d: %d -> %s", chat_id, parent_msg_id, str(new_parent_msg_id) if new_parent_msg_id is not None else "None")
-            # Возвращаем null, так как сообщение не найдено
             return None
         result = {
             "id": msg[0],
@@ -368,19 +284,8 @@ async def get_logs(request: Request):
     db = Database.get_database()
     # NOLOG!
     try:
-        session_id = request.cookies.get("session_id")
-        if not session_id:
-            log.info("Отсутствует session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="No session")
-        user_id = db.fetch_one(
-            'SELECT user_id FROM sessions WHERE session_id = :session_id',
-            {'session_id': session_id}
-        )
-        if not user_id:
-            log.info("Неверный session_id для IP=%s", request.client.host)
-            raise HTTPException(status_code=401, detail="Invalid session")
-        user_id = user_id[0]
-        log_file = "/app/logs/colloquium_core.log"
+        user_id = check_session(request)
+        log_file = globals.LOG_FILE
         logs = []
         if os.path.exists(log_file):
             with open(log_file, "r", encoding="utf-8") as f:

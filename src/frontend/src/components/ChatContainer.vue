@@ -1,4 +1,4 @@
-<!-- /frontend/rtm/src/components/ChatContainer.vue, updated 2025-07-18 22:23 EEST -->
+<!-- /frontend/rtm/src/components/ChatContainer.vue, updated 2025-07-19 21:15 EEST -->
 <template>
   <div class="chat-container">
     <div class="tabs">
@@ -36,7 +36,7 @@
       {{ chatStore.chatError || fileStore.chatError || authStore.backendError }}
     </p>
     <div v-if="activeTab === 'chat'" class="messages" ref="messagesContainer">
-      <div v-for="(msg, index) in chatStore.history" :key="msg.id" :class="['message', { 'admin-message': msg.user_id === 1, 'deleted': msg.action === 'delete' }]">
+      <div v-for="(msg, index) in chatStore.history" :key="msg.id" :class="['message', { 'admin-message': msg.user_id === 1, 'agent-message': msg.user_id === 2, 'deleted': msg.action === 'delete' }]">
         <p v-if="msg.action !== 'delete'" v-html="formatMessage(msg.message, msg.file_names, msg.user_name, msg.timestamp)"></p>
         <p v-else class="deleted-post">
           <strong>{{ msg.user_name }}</strong> ({{ formatTimestamp(msg.timestamp) }}): [Post deleted]
@@ -53,6 +53,9 @@
       </div>
     </div>
     <div v-if="activeTab === 'chat'" class="message-input">
+      <p v-if="chatStore.status.status === 'busy'" class="processing-status">
+        Идёт обработка запроса {{ chatStore.status.actor }}, прошло {{ chatStore.status.elapsed }} секунд...
+      </p>
       <textarea
         v-model="newMessage"
         ref="messageInput"
@@ -160,6 +163,11 @@ export default defineComponent({
           console.log('Fetched backend logs:', data)
         } else {
           console.error('Error fetching backend logs:', await res.json())
+          this.debugLogs.push({
+            type: 'error',
+            message: 'Failed to fetch backend logs: Invalid response',
+            timestamp: new Date().toLocaleString('ru-RU')
+          })
         }
       } catch (e) {
         console.error('Error fetching backend logs:', e)
@@ -233,6 +241,16 @@ export default defineComponent({
     async sendMessage(event) {
       if (event.shiftKey) return
       if (!this.newMessage && !this.fileStore.pendingAttachment) return
+      if (this.chatStore.status.status === 'busy') {
+        console.warn('Отправка заблокирована: идёт обработка запроса', this.chatStore.status);
+        this.chatStore.chatError = 'Отправка заблокирована: идёт обработка запроса';
+        this.debugLogs.push({
+          type: 'warn',
+          message: `Отправка заблокирована: идёт обработка запроса ${this.chatStore.status.actor} (${this.chatStore.status.elapsed} секунд)`,
+          timestamp: new Date().toLocaleString('ru-RU')
+        });
+        return;
+      }
       let finalMessage = this.newMessage.trim()
       if (this.fileStore.pendingAttachment) {
         finalMessage += ` @attach#${this.fileStore.pendingAttachment.file_id}`
@@ -295,13 +313,13 @@ export default defineComponent({
         this.newMessage += ` @attach#${fileId}`
         this.fileStore.pendingAttachment = this.fileStore.files.find(file => file.id === fileId) || null
       } else {
-        console.error('Invalid fileId received:', fileId)
-        this.fileStore.chatError = 'Invalid file selection'
+        console.error('Invalid fileId received:', fileId);
+        this.fileStore.chatError = 'Invalid file selection';
         this.debugLogs.push({
           type: 'error',
           message: 'Invalid file selection',
           timestamp: new Date().toLocaleString('ru-RU')
-        })
+        });
       }
       this.$refs.messageInput?.focus()
       this.$nextTick(() => {
@@ -348,6 +366,19 @@ export default defineComponent({
           return `<pre class="code-patch">${lines}</pre>`
         }
       )
+      // Обработка <shell_code>, <stdout>, <stderr>
+      formatted = formatted.replace(
+        /<shell_code(?:\s+[^>]*)?>([\s\S]*?)<\/shell_code>/g,
+        (match, content) => `<pre class="shell-code">${content}</pre>`
+      )
+      formatted = formatted.replace(
+        /<stdout>([\s\S]*?)<\/stdout>/g,
+        (match, content) => `<pre class="stdout">${content}</pre>`
+      )
+      formatted = formatted.replace(
+        /<stderr>([\s\S]*?)<\/stderr>/g,
+        (match, content) => `<pre class="stderr">${content}</pre>`
+      )
       const dateTime = new Date(timestamp * 1000).toLocaleString('ru-RU', {
         day: '2-digit',
         month: '2-digit',
@@ -369,7 +400,7 @@ export default defineComponent({
       if (newChatId !== null) {
         this.chatStore.waitChanges = false
         this.chatStore.fetchHistory()
-        this.fileStore.fetchFiles() // Обновляем список файлов при смене чата
+        this.fileStore.fetchFiles()
         this.startPolling()
       }
     },
@@ -377,7 +408,6 @@ export default defineComponent({
       async handler(newHistory, oldHistory) {
         console.log('Deleted posts:', newHistory.filter(post => post.action === 'delete'))
         this.scrollToBottom()
-        // Обновляем список файлов, если есть посты с @attach#
         if (oldHistory) {
           const hasAttach = newHistory.some(post => post.message && post.message.includes('@attach#'))
           if (hasAttach) {
@@ -479,12 +509,18 @@ export default defineComponent({
 .admin-message {
   background: #555;
 }
+.agent-message {
+  margin-left: 20px;
+}
 @media (prefers-color-scheme: light) {
   .message {
     background: #f0f0f0;
   }
   .admin-message {
     background: #e0e0e0;
+  }
+  .agent-message {
+    margin-left: 20px;
   }
 }
 .message p {
@@ -586,20 +622,63 @@ dialog input, dialog textarea {
   color: red;
   margin: 10px;
 }
+.processing-status {
+  margin: 10px;
+  color: #ccccaa; /* Нежный жёлтый для тёмной темы */
+}
+@media (prefers-color-scheme: light) {
+  .processing-status {
+    color: #666;
+  }
+}
 .deleted-post {
   color: #888;
   font-style: italic;
 }
-.code-patch {
+.code-patch, .shell-code, .stdout, .stderr {
   background: #222;
   padding: 8px;
   border-radius: 5px;
   font-family: monospace;
   white-space: pre-wrap;
+  border: 1px solid;
 }
 @media (prefers-color-scheme: light) {
-  .code-patch {
+  .code-patch, .shell-code, .stdout, .stderr {
     background: #f5f5f5;
+  }
+}
+.code-patch {
+  border-color: #555;
+}
+.shell-code {
+  color: #ff8c00;
+  border-color: #ff8c00;
+}
+@media (prefers-color-scheme: light) {
+  .shell-code {
+    color: #d2691e;
+    border-color: #d2691e;
+  }
+}
+.stdout {
+  color: #d3d3d3;
+  border-color: #d3d3d3;
+}
+@media (prefers-color-scheme: light) {
+  .stdout {
+    color: #666;
+    border-color: #666;
+  }
+}
+.stderr {
+  color: #ff4444;
+  border-color: #ff4444;
+}
+@media (prefers-color-scheme: light) {
+  .stderr {
+    color: #cc0000;
+    border-color: #cc0000;
   }
 }
 .patch-removed {

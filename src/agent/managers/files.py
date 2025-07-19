@@ -1,7 +1,8 @@
-# /agent/managers/files.py, updated 2025-07-18 22:08 EEST
+# /agent/managers/files.py, updated 2025-07-19 09:00 EEST
 import globals
 import os
 import time
+import pwd
 from pathlib import Path
 from .db import Database, DataTable
 from .project import ProjectManager
@@ -78,7 +79,7 @@ class FileManager:
         """Проверяет существование файла по file_name и project_id, сначала для ссылки (@file_name), затем для вложения (file_name)."""
         conditions = {'file_name': f"@{file_name}"}
         if project_id is not None:
-            conditions['project_id'] = project_id
+            conditions['project_id'] = project_id # излюбленное место для ошибки Grok
         row = self.files_table.select_from(
             columns=['id'],
             conditions=conditions,
@@ -90,7 +91,7 @@ class FileManager:
 
         conditions = {'file_name': file_name}
         if project_id is not None:
-            conditions['project_id': project_id
+            conditions['project_id'] = project_id
         row = self.files_table.select_from(
             columns=['id'],
             conditions=conditions,
@@ -100,7 +101,7 @@ class FileManager:
             log.debug("Файл существует: file_name=%s, project_id=%s, id=%d", file_name, str(project_id), row[0][0])
             return row[0][0]
 
-        log.debug("Файл не найден: file_name=%s, project_id=%s", file_name, str(project_id))
+        # log.debug("Файл не найден: file_name=%s, project_id=%s", file_name, str(project_id))
         return None
 
     def get_file(self, file_id):
@@ -123,6 +124,7 @@ class FileManager:
         return file_data
 
     def add_file(self, content, file_name, timestamp, project_id=None):
+        file_name = str(file_name).lstrip("@").lstrip("/")
         # Проверка безопасности пути
         try:
             safe_path = (Path('/app/projects') / file_name).resolve()
@@ -135,7 +137,6 @@ class FileManager:
 
         file_id = self.exists(file_name, project_id)
         if file_id:
-            log.debug("Файл file_name=%s, project_id=%s уже существует, id=%d", file_name, str(project_id), file_id)
             return file_id
         file_id = self.files_table.insert_into(
             values={
@@ -148,6 +149,13 @@ class FileManager:
         )
         if content:
             globals.project_manager.write_file(file_name, content.decode('utf-8', errors='replace'))
+            # Устанавливаем владельца agent для нового файла
+            try:
+                file_path = Path('/app/projects') / file_name
+                os.chown(file_path, pwd.getpwnam('agent').pw_uid, -1)
+                log.debug("Установлен владелец agent для файла: %s", file_name)
+            except Exception as e:
+                log.excpt("Ошибка установки владельца для файла %s: %s", file_name, str(e), exc_info=(type(e), e, e.__traceback__))
         log.debug("Добавлен файл id=%d, file_name=%s, project_id=%s", file_id, file_name, str(project_id))
         return file_id
 
@@ -181,7 +189,10 @@ class FileManager:
             if content:
                 try:
                     globals.project_manager.write_file(clean_file_name, content.decode('utf-8', errors='replace'))
-                    log.debug("Записан файл на диск: %s", clean_file_name)
+                    # Устанавливаем владельца agent для обновлённого файла
+                    file_path = Path('/app/projects') / clean_file_name
+                    os.chown(file_path, pwd.getpwnam('agent').pw_uid, -1)
+                    log.debug("Установлен владелец agent для файла: %s", clean_file_name)
                     db_content = None  # Не дублируем контент для ссылок
                 except Exception as e:
                     log.excpt("Ошибка записи файла %s: %s", clean_file_name, str(e), exc_info=(type(e), e, e.__traceback__))
@@ -232,6 +243,12 @@ class FileManager:
             return None
         with open(backup_path, 'wb') as f:
             f.write(content)
+        # Устанавливаем владельца agent для бэкапа
+        try:
+            os.chown(backup_path, pwd.getpwnam('agent').pw_uid, -1)
+            log.debug("Установлен владелец agent для бэкапа: %s", backup_path)
+        except Exception as e:
+            log.excpt("Ошибка установки владельца для бэкапа %s: %s", backup_path, str(e), exc_info=(type(e), e, e.__traceback__))
         log.debug("Создан бэкап: %s", backup_path)
         return backup_path
 
@@ -277,7 +294,7 @@ class FileManager:
                 file_path = Path('/app/projects') / clean_file_name
                 if not file_path.exists():
                     self.files_table.delete_from(conditions={'id': file_id})
-                    deleted.append(file_name)
+                    deleted.append(f"{file_id}:{file_name}:{project_id}")
                     log.debug("Удалена отсутствующая ссылка: id=%d, file_name=%s", file_id, file_name)
                 else:
                     files.append({'id': file_id, 'file_name': clean_file_name, 'ts': ts, 'project_id': project_id})

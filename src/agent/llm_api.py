@@ -1,9 +1,10 @@
-# /agent/llm_api.py, updated 2025-07-18 14:50 EEST
+# /app/agent/lib/llm_api.py, updated 2025-07-19 17:31 EEST
 import aiohttp
 import json
 from typing import Dict, Optional
-from lib.basic_logger import BasicLogger
+from managers.db import Database
 import globals
+import datetime
 
 log = globals.get_logger("llm_api")
 
@@ -16,10 +17,16 @@ class LLMConnection:
         log.warn("Базовый LLMConnection вызван для model=%s, не реализован", self.model)
         return {}
 
+    def set_search_params(self, user_id: int) -> Dict:
+        """Заглушка для настройки параметров поиска."""
+        log.debug("Заглушка set_search_params вызвана для user_id=%d", user_id)
+        return {}
+
 class XAIConnection(LLMConnection):
     def __init__(self, config: Dict):
         super().__init__(config)
         self.base_url = "https://api.x.ai/v1"
+        self.db = Database.get_database()
 
     async def call(self, prompt: str, search_parameters: Optional[Dict] = None) -> Dict:
         log.debug("XAIConnection вызов: model=%s, prompt_length=%d, search_parameters=~C95%s~C00",
@@ -54,6 +61,35 @@ class XAIConnection(LLMConnection):
             log.excpt("Ошибка XAIConnection: %s", str(e), exc_info=(type(e), e, e.__traceback__))
             return {}
 
+    def set_search_params(self, user_id: int) -> Dict:
+        """Настраивает параметры поиска для xAI API."""
+        log.debug("Настройка search_parameters для user_id=%d", user_id)
+        settings = self.db.fetch_one(
+            'SELECT search_mode, search_sources, max_search_results, from_date, to_date FROM user_settings '
+            'WHERE user_id = :user_id',
+            {'user_id': user_id}
+        )
+        if settings:
+            try:
+                sources = json.loads(settings[1]) if settings[1] else ['web', 'x', 'news']
+                sources = [{"type": src} for src in sources if src in ['web', 'x', 'news']]
+            except json.JSONDecodeError:
+                sources = [{"type": "web"}, {"type": "x"}, {"type": "news"}]
+            return {
+                "mode": settings[0] or "off",
+                "sources": sources,
+                "max_search_results": settings[2] or 20,
+                "from_date": settings[3],
+                "to_date": settings[4]
+            }
+        return {
+            "mode": "off",
+            "sources": [{"type": "web"}, {"type": "x"}, {"type": "news"}],
+            "max_search_results": 20,
+            "from_date": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d"),
+            "to_date": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d")
+        }
+
 class OpenAIConnection(LLMConnection):
     def __init__(self, config: Dict):
         super().__init__(config)
@@ -70,7 +106,15 @@ class OpenAIConnection(LLMConnection):
                     "max_tokens": 4096
                 }
                 if search_parameters:
-                    payload["search_parameters"] = search_parameters
+                    payload["tools"] = [{
+                        "type": "web_search",
+                        "web_search": {
+                            "query": search_parameters.get("query", prompt),
+                            "max_results": search_parameters.get("max_results", 5),
+                            "search_depth": search_parameters.get("search_depth", "basic")
+                        }
+                    }]
+                    payload["tool_choice"] = "web_search"
                 async with session.post(
                     f"{self.base_url}/chat/completions",
                     headers={
@@ -84,8 +128,16 @@ class OpenAIConnection(LLMConnection):
                         return {}
                     result = await response.json()
                     log.debug("Ответ OpenAI API: ~C95%s~C00", json.dumps(result, indent=2))
+                    text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    search_results = []
+                    if "tools" in payload:
+                        tool_calls = result.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])
+                        for call in tool_calls:
+                            if call.get("function", {}).get("name") == "web_search":
+                                search_results = json.loads(call.get("function", {}).get("arguments", "{}")).get("results", [])
                     return {
-                        "text": result.get("choices", [{}])[0].get("message", {}).get("content", ""),
+                        "text": text,
+                        "search_results": search_results,
                         "usage": result.get("usage", {})
                     }
         except Exception as e:

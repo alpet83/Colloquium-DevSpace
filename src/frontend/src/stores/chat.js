@@ -1,4 +1,4 @@
-// /frontend/rtm/src/stores/chat.js, updated 2025-07-17 15:38 EEST
+// /frontend/rtm/src/stores/chat.js, updated 2025-07-19 23:59 EEST
 import { defineStore } from 'pinia'
 
 export const useChatStore = defineStore('chat', {
@@ -13,6 +13,7 @@ export const useChatStore = defineStore('chat', {
     apiUrl: import.meta.env.VITE_API_URL || 'http://vps.vpn:8008/api',
     waitChanges: false,
     stats: { tokens: null, num_sources_used: null },
+    status: { status: 'free' },
     pollingInterval: null,
     isPolling: false
   }),
@@ -47,6 +48,12 @@ export const useChatStore = defineStore('chat', {
     async fetchHistory() {
       if (this.selectedChatId === null || this.isPolling) return
       this.isPolling = true
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => {
+        controller.abort()
+        console.warn('Fetch history timeout after 15s for chat_id:', this.selectedChatId)
+        this.chatError = 'Fetch history timeout'
+      }, 15000)
       try {
         const url = this.waitChanges
           ? `${this.apiUrl}/chat/get?chat_id=${this.selectedChatId}&wait_changes=1`
@@ -54,8 +61,10 @@ export const useChatStore = defineStore('chat', {
         console.log('Fetching history:', url, 'Cookies:', document.cookie)
         const res = await fetch(url, {
           method: 'GET',
-          credentials: 'include'
+          credentials: 'include',
+          signal: controller.signal
         })
+        clearTimeout(timeoutId)
         if (res.status === 500 || res.status === 502) {
           console.error('Server error:', res.status)
           this.backendError = true
@@ -63,15 +72,19 @@ export const useChatStore = defineStore('chat', {
         }
         const data = await res.json()
         if (res.ok && !data.error) {
-          if (data.chat_history === 'chat switch') {
+          if (data.posts && data.posts.length === 1 && data.posts[0].chat_history === 'chat switch') {
             console.log('Chat switch detected, fetching full history')
             this.waitChanges = false
+            this.status = data.status
             await this.fetchHistory()
-          } else if (data.chat_history !== 'no changes') {
+          } else if (data.posts && data.posts.length === 1 && data.posts[0].chat_history === 'no changes') {
+            this.status = data.status
+            console.log('No changes in chat history, status:', this.status)
+          } else {
             // Обновляем историю, обрабатывая добавления, изменения и удаления
             const existingIds = new Set(this.history.map(post => post.id))
-            this.history = this.history.filter(post => !data.some(newPost => newPost.id === post.id && newPost.action === 'delete'))
-            data.forEach(newPost => {
+            this.history = this.history.filter(post => !data.posts.some(newPost => newPost.id === post.id && newPost.action === 'delete'))
+            data.posts.forEach(newPost => {
               if (newPost.action === 'delete') {
                 this.history = this.history.filter(post => post.id !== newPost.id)
               } else if (!existingIds.has(newPost.id)) {
@@ -83,12 +96,11 @@ export const useChatStore = defineStore('chat', {
                 }
               }
             })
-            this.history.sort((a, b) => a.id - b.id)            
+            this.history.sort((a, b) => a.id - b.id)
+            this.status = data.status
             console.log('Deleted posts:', this.history.filter(post => post.action === 'delete'))
             console.log('Fetch history params:', { chat_id: this.selectedChatId, wait_changes: this.waitChanges })
-            console.log('History response:', JSON.stringify(data, null, 2))
-          } else {
-            console.log('No changes in chat history')
+            console.log('History response:', JSON.stringify(data.posts, null, 2))
           }
           this.backendError = false
           this.chatError = ''
@@ -97,10 +109,16 @@ export const useChatStore = defineStore('chat', {
           this.chatError = data.error || 'Failed to fetch chat history'
         }
       } catch (e) {
-        console.error('Error fetching history:', e)
-        this.chatError = 'Failed to fetch chat history'
+        if (e.name === 'AbortError') {
+          console.warn('Fetch history aborted due to timeout for chat_id:', this.selectedChatId)
+          this.chatError = 'Fetch history timeout'
+        } else {
+          console.error('Error fetching history:', e)
+          this.chatError = 'Failed to fetch chat history'
+        }
       } finally {
         this.isPolling = false
+        clearTimeout(timeoutId)
       }
     },
     async fetchChatStats() {
@@ -313,7 +331,7 @@ export const useChatStore = defineStore('chat', {
     },
     closeCreateChatModal() {
       this.newChatDescription = ''
-      this.newChatParentMessageId = null
+      this.newChatParentMessageId, this.newChatParentMessageId = null
       const modal = document.getElementById('createChatModal')
       if (modal) {
         modal.close()
@@ -329,7 +347,7 @@ export const useChatStore = defineStore('chat', {
           this.waitChanges = true // Пуллинг только для изменений
           this.fetchHistory()
         }
-      }, 15000) // Пуллинг каждые 15 секунд
+      }, 1000) // Пуллинг каждую секунду
       console.log('Started polling with interval ID:', this.pollingInterval)
     },
     stopPolling() {

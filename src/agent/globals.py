@@ -1,5 +1,4 @@
 # /agent/globals.py, updated 2025-07-17 15:45 EEST
-import asyncio
 from lib.basic_logger import BasicLogger
 
 user_manager = None
@@ -19,6 +18,7 @@ LOG_SERV = LOG_DIR + "/colloquium_serv.log"
 LOG_FORMAT = '[%(asctime)s]. #%(levelname)s(%(name)s): %(message)s'
 
 CONFIG_FILE = "/app/data/colloquium_config.toml"
+PRE_PROMPT_PATH = "/app/docs/llm_pre_prompt.md"
 
 # /agent/globals.py, updated 2025-07-18 09:10 EEST
 

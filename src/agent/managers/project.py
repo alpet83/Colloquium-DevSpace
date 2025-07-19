@@ -51,6 +51,7 @@ class ProjectManager:
         self.local_git = row[0][3]
         self.public_git = row[0][4]
         self.dependencies = row[0][5]
+        self.scan_project_files()
         log.debug("Загружен проект id=%d, project_name=%s", self.project_id, self.project_name)
 
     def update(self, project_name, description=None, local_git=None, public_git=None, dependencies=None):
@@ -139,12 +140,18 @@ class ProjectManager:
         log.debug("Возвращено %d проектов", len(projects))
         return projects
 
-    def scan_project_files(self, project_name):
+    def scan_project_files(self, project_name=None):
+        if project_name is None:
+            project_name = self.project_name
+        if project_name is None:
+            return []
+
         try:
             project_dir = self.projects_dir / project_name
             if not project_dir.exists():
                 log.warn("Директория проекта %s не существует", project_name)
                 return []
+            log.debug("Сканирование файлов проекта в %s", project_dir)
             files = []
             for file_path in project_dir.rglob('*'):
                 if file_path.is_file() and not any(part.startswith('.') for part in file_path.parts):
@@ -157,7 +164,11 @@ class ProjectManager:
                         'full_path': str(file_path),
                         'ts': int(file_path.stat().st_mtime)
                     })
-            log.debug("Найдено %d файлов в проекте %s", len(files), project_name)
+                    file_mod = os.path.getmtime(file_path)
+                    reg_path = Path(project_name) / relative_path    # like project_name/src
+                    if self.project_name == project_name:   # регистрация файла в БД, как компонента проекта
+                        globals.file_manager.add_file(None, reg_path, file_mod, self.project_id)
+            log.debug("Найдено %d поддерживаемых файлов в проекте %s", len(files), project_name)
             return files
         except Exception as e:
             log.excpt("Ошибка сканирования файлов проекта %s: %s", project_name, str(e), exc_info=(type(e), e, e.__traceback__))

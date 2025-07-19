@@ -180,8 +180,8 @@ class BasicLogger:
             self.log_fd.close()
             self.log_fd = None
         self.archive()
-        self.log_msg("~C93#CLOSED_LOG:~C00 real name %s called due %s from %s",
-                     self.real_name, reason, self._format_backtrace())
+        # trace = self._format_backtrace()
+        # self.log_msg("~C93#CLOSED_LOG:~C00 real name %s called due %s from %s", self.real_name, reason, trace)
         self.real_name = ""
         self.file_name = ""
 

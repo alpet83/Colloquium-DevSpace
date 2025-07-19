@@ -1,7 +1,8 @@
-# /agent/server.py, updated 2025-07-18 14:50 EEST
+# /agent/server.py, updated 2025-07-19 09:55 EEST
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 import asyncio
 import logging
 import socket
@@ -13,9 +14,9 @@ import datetime
 import uvicorn
 from logging import FileHandler
 from lib.basic_logger import BasicLogger
+from lib.file_watchdog import watch_files
 from routes.auth_routes import router as auth_router
 from routes.chat_routes import router as chat_router
-from routes.post_routes import router as post_router
 from routes.file_routes import router as file_router
 from routes.project_routes import router as project_router
 from post_processor import PostProcessor
@@ -28,6 +29,10 @@ from managers.replication import ReplicationManager
 import globals
 from globals import CONFIG_FILE, LOG_DIR, LOG_FILE, LOG_SERV, LOG_FORMAT
 
+class UnicornException(Exception):
+    def __init__(self, name: str):
+        self.name = name
+
 app = FastAPI()
 log = globals.get_logger("core")
 
@@ -39,6 +44,7 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization", "Cookie", "Set-Cookie", "Accept"],
     expose_headers=["Set-Cookie"]
 )
+
 
 @app.middleware("http")
 async def log_requests_and_exceptions(request: Request, call_next):
@@ -53,6 +59,17 @@ async def log_requests_and_exceptions(request: Request, call_next):
         log.excpt("Ошибка сервера для %s %s: %s", request.method, str(request.url), str(exc),
                   exc_info=(type(exc), exc, exc.__traceback__))
         raise
+
+
+@app.exception_handler(UnicornException)
+async def unicorn_exception_handler(request: Request, exc: UnicornException):
+    log.excpt("Unicorn raised %s", str(exc),
+                      exc_info=(type(exc), exc, exc.__traceback__))
+    return JSONResponse(
+        status_code=418,
+        content={"message": f"Oops! {exc.name} did something. There goes a rainbow..."},
+    )
+
 
 def log_msg(message, tag="#INFO"):
     now = datetime.datetime.now()
@@ -78,8 +95,6 @@ def server_init():
         app.include_router(auth_router)
         log.debug("Подключение chat_router")
         app.include_router(chat_router)
-        log.debug("Подключение post_router")
-        app.include_router(post_router)
         log.debug("Подключение file_router")
         app.include_router(file_router)
         log.debug("Подключение project_router")
@@ -94,14 +109,10 @@ def server_init():
         globals.file_manager = FileManager()
         dbg = os.getenv("DEBUG_MODE", "0").lower()
         log.debug("ENV DEBUG_MODE=%s", dbg)
-        globals.replication_manager = ReplicationManager(
-            globals.user_manager,
-            globals.chat_manager,
-            globals.post_manager,
-            globals.file_manager,
-            debug_mode=(dbg != "0")
-        )
+        globals.replication_manager = ReplicationManager(debug_mode=(dbg != "0"))
         log.info("Менеджеры инициализированы")
+        log.info("Установка прав для пользователя agent на /app/projects")
+        os.system("chown agent -R /app/projects")
     except Exception as e:
         log_msg("Ошибка инициализации сервера: %s" % str(e), "#ERROR")
         raise
@@ -109,25 +120,24 @@ def server_init():
 shutdown_event = asyncio.Event()
 
 async def lifespan(app: FastAPI):
-    config = toml.load(CONFIG_FILE)
+    log_init()
     local_ip = socket.gethostbyname(socket.gethostname())
     log.info("Ядро запущено на IP=%s:8080", local_ip)
-    asyncio.create_task(chat_loop())
+    asyncio.create_task(watch_files(shutdown_event))
     yield
     log.info("Ядро остановлено")
 
-app.lifespan = lifespan
-
-async def chat_loop():
-    while not shutdown_event.is_set():
-        for chat_id in globals.chat_manager.list_chats(0):
-            await globals.replication_manager.replicate_to_llm(chat_id['chat_id'])
-        await asyncio.sleep(5)
+# app.lifespan = lifespan
 
 async def shutdown():
     log.info("Получен сигнал завершения, инициируется graceful shutdown")
+    for logger_name in ['core', 'llm_hands', 'postman', 'fileman', 'postproc']:
+        logger = globals.get_logger(logger_name)
+        log.info("Очистка логов для %s", logger_name)
+        logger.cleanup()
     shutdown_event.set()
-    await server.shutdown()
+    await asyncio.sleep(1)  # Дать время на завершение операций
+    log.info("Завершение работы сервера")
 
 def handle_shutdown(signum, frame):
     log.info("Получен сигнал %d, завершение работы", signum)

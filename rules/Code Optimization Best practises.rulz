@@ -1,0 +1,188 @@
+Code Optimization Best Practices for LLM
+Overview
+This document summarizes best practices for optimizing Python code, based on our experience refining execute_commands.py in the Colloquium-DevSpace project. The goal is to reduce token count, improve readability, and maintain functionality by using mini-functions, dedicated classes, and short, clear variable/function names. These practices ensure compliance with CLA rules (e.g., Rule 15: Control token count, Rule 17: Avoid code duplication) while avoiding errors like those encountered during optimization.
+Key Principles
+
+Minimize Token Count:
+Reduce code verbosity to lower token count (words + symbols, excluding comments/empty lines).
+Example: In execute_commands.py, replaced process.stdin.close() (7 tokens) with _in.close() (3 tokens).
+
+
+Eliminate Code Duplication:
+Extract repeated logic into reusable functions or classes.
+Example: Created write_to_log and truncate_output to avoid duplicate log writing and output truncation.
+
+
+Use Dedicated Classes:
+Encapsulate related functionality in classes to improve structure and reduce repetition.
+Example: Introduced StdX class to manage stdout/stderr streams, indexes, and lines.
+
+
+Short, Clear Names:
+Use concise, descriptive variable/function names to balance brevity and clarity.
+Example: _in, _out, _err instead of process.stdin, process.stdout, process.stderr.
+
+
+Preserve Functionality:
+Avoid removing critical logic during optimization (e.g., active variable in execute_commands.py).
+Test changes with unit tests (e.g., exec_test.py) to ensure correctness.
+
+
+Follow Project Style:
+Adhere to PEP 8, keep lines ≤ 120 characters (CLA Rule 7).
+Use clear comments and module headers (CLA Rule 18).
+
+
+
+Lessons from execute_commands.py Optimization
+The optimization of execute_commands.py (from initial version to 15:25 EEST) reduced tokens from 766 to 630 (~17.8% decrease) while fixing issues like incomplete output capture and descriptor leaks. Key steps and lessons:
+Initial Issues
+
+Incomplete Output Capture:
+Problem: Early versions used readline() without select, missing output for short-lived processes (e.g., ls -l /).
+Fix: Adopted select with active variable to read stdout/stderr until EOF (15:25 EEST).
+Lesson: Avoid combining readline() and communicate() without proper synchronization.
+
+
+Resource Leaks:
+Problem: Unclosed descriptors caused ResourceWarning in tests.
+Fix: Added explicit close() calls, later replaced with StdX.__del__.
+Lesson: Always ensure resource cleanup, preferably automatically via destructors.
+
+
+Code Duplication:
+Problem: Repeated code for stdout/stderr handling and log writing.
+Fix: Introduced write_to_log, truncate_output, and StdX class.
+Lesson: Extract repeated logic into reusable functions/classes.
+
+
+
+Optimization Steps
+
+Local Variables:
+Replaced process.stdin, process.stdout, process.stderr with _in, _out, _err.
+Example: process.stdin.write(...) → _in.write(...) (saves ~4 tokens per use).
+Token Impact: Reduced ~20 tokens across multiple calls.
+
+
+Mini-Functions:
+Created write_to_log(file_path, timestamp, command, lines) for log writing.
+Before: with open(STDOUT_LOG_FILE, 'a') as stdout_log: ... repeated twice.
+After: Single call write_to_log(STDOUT_LOG_FILE, timestamp, shell_command, stdout_lines).
+Token Impact: Saved ~15 tokens by eliminating duplicate with blocks.
+
+
+Created truncate_output(lines, max_lines=100, max_bytes=4096) for output truncation.
+Before: Repeated truncation logic for stdout and stderr.
+After: Unified truncation, reused for both streams.
+Token Impact: Saved ~10 tokens.
+
+
+
+
+Dedicated Class (StdX):
+Introduced StdX with stream, lines, read, store, output, __del__.
+Before: Separate handling for stdout/stderr in select loop.
+After: Unified handling with _out = StdX(process.stdout), _err = StdX(process.stderr).
+Token Impact: Saved ~20 tokens by consolidating stream logic.
+
+
+Automatic descriptor closing via __del__ eliminated close_descriptors.
+Token Impact: Saved ~10 tokens.
+
+Short Names:
+Used reads[0]/reads[1] instead of _out.fileno()/_err.fileno() (7 tokens → 4 tokens per use).
+Token Impact: Saved ~4 tokens across multiple checks.
+
+Error Avoidance:
+Mistake: Removed active variable, breaking output capture for short-lived processes.
+Fix: Restored active with active |= bool(line) or bool(err) (15:25 EEST).
+Lesson: Test critical logic (e.g., with exec_test.py) before optimization.
+
+Mistake: Used active |= func(), potentially skipping function calls.
+Fix: Used explicit line = _out.read(...), active |= bool(line).
+Lesson: Avoid |= with functions to ensure execution.
+
+Final Token Count
+
+Initial: 766 tokens (614 words + 152 symbols, 13:15 EEST).
+Final: 630 tokens (498 words + 132 symbols, 15:25 EEST).
+Reduction: ~17.8% (136 tokens saved).
+
+Best Practices
+
+Use Mini-Functions:
+Extract small, reusable functions/methods for repetitive tasks copypaste (e.g., write_log for logging).
+Keep functions focused (single responsibility).
+Example: StdX.output handles both stdout and stderr formatting.
+
+Leverage Classes for Encapsulation:
+Use classes to group related data and behavior (e.g., StdX for stream management).
+Implement __del__ for automatic resource cleanup.
+Example: StdX reduced code duplication in select loop.
+
+
+Short, Descriptive Names:
+Use concise names like _in, _out, _err for local variables.
+Avoid overly long names like process.stdin unless necessary for clarity.
+Example: _in.close() vs. process.stdin.close() saves 4 tokens.
+
+
+Test-Driven Optimization:
+Validate changes with unit tests (e.g., exec_test.py for ls -l / output).
+Example: Test ensured stdout contains >1 line, catching removal of active.
+
+
+Avoid Risky Constructs:
+Avoid |= with functions (e.g., active |= func()) to prevent skipped calls.
+Use explicit assignments (e.g., line = func(); active |= bool(line)).
+
+
+Log and Debug:
+Add debug prints (e.g., #EXEC: process is running) for diagnostics.
+Ensure logs are written to files (e.g., /app/logs/exec.stdout) for traceability.
+
+
+Comply with Style Guidelines:
+Follow PEP 8, keep lines ≤ 120 characters.
+Include module headers and clear comments (CLA Rule 18).
+
+Examples from execute_commands.py
+
+Before (Verbose):with open(STDOUT_LOG_FILE, 'a') as stdout_log:
+    stdout_log.write(f"[{timestamp}] Command: {shell_command}\n")
+    if stdout_lines:
+        stdout_log.write('\n'.join(stdout_lines) + '\n')
+    stdout_log.flush()
+
+
+Tokens: ~20 per block, repeated twice.
+
+
+After:_out.store(STDOUT_LOG_FILE)
+
+
+Tokens: ~10, reused for stdout and stderr.
+
+
+Before (Duplicated Stream Handling):if _out.fileno() in poll_result:
+    line = _out.readline().strip()
+    if line:
+        stdout_lines.append(line)
+        log.debug("stdout: %s", line)
+
+
+Tokens: ~15 per stream, repeated for stdout/stderr.
+
+
+After (StdX Class):stdout = StdX(process.stdout)
+_out = StdX(process.stdout)
+_err = StdX(process.stderr)
+line = _out.read(fds, 'stdout') 
+err = _err.read(fds, 'stderr')
+active |= bool(line) or bool(err)
+
+
+Tokens: ~10 per stream, unified logic.
+
+
