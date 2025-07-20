@@ -46,13 +46,6 @@ class UserManager:
                 {'user_name': 'agent'}
             )
             log.info("Создан системный пользователь %s", "agent")
-        count = self.db.fetch_one('SELECT COUNT(*) FROM users WHERE user_name = :username', {'username': 'grok'})
-        if count[0] == 0:
-            self.db.execute(
-                'INSERT INTO users (user_name, llm_class, llm_token, password_hash, salt) VALUES (:user_name, :llm_class, :llm_token, NULL, NULL)',
-                {'user_name': 'grok', 'llm_class': 'grok-3', 'llm_token': '<your_xai_api_key>'}
-            )
-            log.info("Создан пользователь %s с llm_class=%s", "grok", "grok-3")
 
     def check_auth(self, username, password):
         row = self.db.fetch_one(

@@ -20,6 +20,7 @@ from routes.chat_routes import router as chat_router
 from routes.file_routes import router as file_router
 from routes.project_routes import router as project_router
 from post_processor import PostProcessor
+from managers.db import DataTable
 from managers.users import UserManager
 from managers.chats import ChatManager
 from managers.posts import PostManager
@@ -91,14 +92,14 @@ def server_init():
         if not os.path.exists(LOG_DIR):
             os.makedirs(LOG_DIR)
         log_init()
-        log.debug("Подключение auth_router")
-        app.include_router(auth_router)
-        log.debug("Подключение chat_router")
-        app.include_router(chat_router)
-        log.debug("Подключение file_router")
-        app.include_router(file_router)
-        log.debug("Подключение project_router")
-        app.include_router(project_router)
+        globals.sessions_table = DataTable(table_name='sessions',
+                                           template=[
+                                               'session_id TEXT PRIMARY KEY',
+                                               'user_id INTEGER',
+                                               'active_chat INTEGER'
+                                           ]
+                                           )
+
 
         globals.post_processor = PostProcessor()
         log.info("Инициализация менеджеров")
@@ -113,6 +114,16 @@ def server_init():
         log.info("Менеджеры инициализированы")
         log.info("Установка прав для пользователя agent на /app/projects")
         os.system("chown agent -R /app/projects")
+
+        log.debug("Подключение auth_router")
+        app.include_router(auth_router)
+        log.debug("Подключение chat_router")
+        app.include_router(chat_router)
+        log.debug("Подключение file_router")
+        app.include_router(file_router)
+        log.debug("Подключение project_router")
+        app.include_router(project_router)
+
     except Exception as e:
         log_msg("Ошибка инициализации сервера: %s" % str(e), "#ERROR")
         raise

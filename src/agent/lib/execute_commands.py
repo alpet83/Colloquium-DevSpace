@@ -26,10 +26,11 @@ class StdX:
         """Считывает строку из потока, если она есть, возвращает True, если данные получены."""
         _fd = self.fd()
         if _fd in fds:
-            line = self.stream.readline().strip()
-            if line:
-                self.lines.append(line)
-                log.debug("%s: %s", tag, line)
+            line = self.stream.readline()
+            if isinstance(line, str):
+                if len(line) > 1:
+                    self.lines.append(line)
+                    log.debug("%s: '%s'", tag, line.strip("\n"))
                 return line
         return False
 

@@ -1,5 +1,6 @@
 # /agent/globals.py, updated 2025-07-17 15:45 EEST
 from lib.basic_logger import BasicLogger
+from fastapi import Request, HTTPException
 
 user_manager = None
 chat_manager = None
@@ -32,7 +33,40 @@ post_processor = None
 file_manager = None
 user_manager = None
 
-def get_logger(name, stdout = None):
+sessions_table = None
+
+
+def get_logger(name, stdout=None):
     if name not in loggers:
         loggers[name] = BasicLogger(name, name, stdout)
     return loggers[name]
+
+
+def check_session(request: Request) -> int:
+    """Проверяет сессию и возвращает user_id или вызывает HTTPException."""
+    log = get_logger('session')
+    session_id = request.cookies.get("session_id")
+    if not session_id:
+        log.info(f"Отсутствует session_id для IP={request.client.host}")
+        raise HTTPException(status_code=401, detail="No session")
+
+    row = sessions_table.select_row(columns=['user_id'], conditions={'session_id': session_id})
+    if not row:
+        log.info(f"Неверный session_id для IP={request.client.host}")
+        raise HTTPException(status_code=401, detail="Invalid session")
+    uid = row[0]
+    log.debug('Session %s: user_id %s', session_id, str(uid))
+    return uid
+
+
+def handle_exception(message: str, e: Exception, _raise: bool = True):
+    """Общая функция для обработки исключений и логирования."""
+    log = get_logger("exception")
+    if isinstance(e, HTTPException):
+        log.error(f"HTTP ошибка: {message}: {str(e)}")
+        if _raise:
+            raise e
+    else:
+        log.excpt(f"Ошибка сервера: {message}: {str(e)}", e=e)
+        if _raise:
+            raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")

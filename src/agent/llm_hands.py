@@ -1,7 +1,8 @@
-# /app/agent/llm_hands.py, updated 2025-07-19 23:30 EEST
+# /app/agent/llm_hands.py, updated 2025-07-20 17:26 EEST
 import re
 import requests
 import time
+import hashlib
 from datetime import datetime
 from llm_api import LLMConnection
 import globals
@@ -12,10 +13,16 @@ from pathlib import Path
 MCP_URL = "http://mcp-sandbox:8084"
 log = globals.get_logger("llm_hands")
 
+def res_success(user, msg, pmsg=None):
+    return {"status": "success", "message": msg, "processed_message": pmsg, "user_name": user}
+
+def res_error(user, msg, pmsg=None):
+    return {"status": "error", "message": msg, "processed_message": pmsg, "user_name": user}
 
 class BlockProcessor:
     def __init__(self, tag):
         self.tag = tag
+        self.replace = True
 
     def process(self, post_message):
         pattern = fr'<{self.tag}(?:\s+([^>]+))?>\s*([\s\S]*?)\s*</{self.tag}>'
@@ -31,12 +38,12 @@ class BlockProcessor:
             result = self.handle_block(attrs, block_code)
             if result["status"] == "error":
                 failed_cmds += 1
-                agent_messages.append(f"@{result.get('user_name', 'Unknown')} {result['message']}")
+                agent_messages.append(f"@{result.get('user_name', '@self')} {result['message']}")
             else:
                 handled_cmds += 1
                 agent_messages.append(result["message"])
                 msg = result.get('processed_message', '')
-                if msg:
+                if msg and self.replace:
                     processed_message = processed_message.replace(match.group(0), msg)
         log.debug("Обработано %d команд, неуспешно %d для тега %s", handled_cmds, failed_cmds, self.tag)
         return {
@@ -56,10 +63,10 @@ class BlockProcessor:
     def handle_block(self, attrs, block_code):
         raise NotImplementedError("Subclasses must implement handle_block")
 
-
 class CommandProcessor(BlockProcessor):
     def __init__(self):
-        super().__init__('command')
+        super().__init__('cmd')
+        self.replace = False
 
     def handle_block(self, attrs, block_code):
         command = block_code.strip().split()[0].lower() if block_code.strip().split() else None
@@ -67,26 +74,23 @@ class CommandProcessor(BlockProcessor):
         log.debug("Обработка команды: %s", command or "None")
         if not command:
             log.error("Пустая команда")
-            return {"status": "error", "message": "Error: Empty command", "user_name": user_name}
+            return res_error(user_name, "Error: Empty command")
         if command == 'ping':
-            return {"status": "success", "message": f"@{user_name} pong", "user_name": user_name}
+            return res_success(user_name, f"@{user_name} pong")
         elif command == 'run_test':
             params = {'project_name': 'default', 'test_name': 'test'}
             resp = requests.get(f"{MCP_URL}/run_test", params=params,
                                 headers={'Authorization': 'Bearer Grok-xAI-Agent-The-Best'})
             response = resp.text if resp.status_code == 200 else f"Ошибка: {resp.status_code}"
-            return {"status": "success" if resp.status_code == 200 else "error",
-                    "message": f"@{user_name} {response}", "user_name": user_name}
+            return res_success(user_name, f"@{user_name} {response}") if resp.status_code == 200 else res_error(user_name, f"@{user_name} {response}")
         elif command == 'commit':
-            data = {'project_name': 'default', 'msg': 'commit msg'}
-            resp = requests.post(f"{MCP_URL}/commit", json=data,
+            params = {'project_name': 'default', 'msg': 'commit msg'}
+            resp = requests.post(f"{MCP_URL}/commit", json=params,
                                  headers={'Authorization': 'Bearer Grok-xAI-Agent-The-Best'})
             response = resp.text if resp.status_code == 200 else f"Ошибка: {resp.status_code}"
-            return {"status": "success" if resp.status_code == 200 else "error",
-                    "message": f"@{user_name} {response}", "user_name": user_name}
+            return res_success(user_name, f"@{user_name} {response}") if resp.status_code == 200 else res_error(user_name, f"@{user_name} {response}")
         log.error("Неподдерживаемая команда: %s", command)
-        return {"status": "error", "message": f"Error: Unsupported command '{command}'", "user_name": user_name}
-
+        return res_error(user_name, f"AgentError: Unsupported command '{command}'")
 
 class FileEditProcessor(BlockProcessor):
     def __init__(self):
@@ -94,36 +98,42 @@ class FileEditProcessor(BlockProcessor):
 
     def handle_block(self, attrs, block_code):
         file_name = attrs.get('name')
+        user_name = attrs.get('user_name', '@self')
         if not file_name:
             log.error("Отсутствует атрибут name в code_file")
-            return {"status": "error", "message": "Error: Missing file name", "user_name": attrs.get('user_name')}
+            return res_error(user_name, "Error: Missing file name")
 
         log.debug("Обработка code_file: file_name=%s, content_length=%d", file_name, len(block_code))
-        project_manager = globals.project_manager
-        project_id = project_manager.project_id if project_manager and hasattr(project_manager, 'project_id') else None
+        proj_man = globals.project_manager
+        project_id = proj_man.project_id if proj_man and hasattr(proj_man, 'project_id') else None
         if project_id is None:
             log.error("Нет активного проекта для обработки code_file")
-            return {"status": "error", "message": "Error: No active project selected"}
+            return res_error(user_name, "Error: No active project selected")
+        # Добавляем префикс project_name, если file_name не содержит '/'
+        project_name = proj_man.project_name
+
+        if '/' not in file_name:
+            file_name = f"{project_name}/{file_name}"
+            log.debug("Добавлен префикс project_name к file_name: %s", file_name)
 
         try:
-            safe_path = (Path('/app/projects') / file_name).resolve()
+            safe_path = (proj_man.projects_dir / file_name).resolve()
             if not str(safe_path).startswith('/app/projects'):
                 log.error("Недопустимый путь файла: %s", file_name)
-                return {"status": "error", "message": "Error: File path outside /app/projects"}
+                return res_error(user_name, "Error: File path outside /app/projects")
         except Exception as e:
             log.excpt("Ошибка проверки пути файла %s: %s", file_name, str(e),
                       exc_info=(type(e), e, e.__traceback__))
-            return {"status": "error", "message": "Error: Invalid file path"}
+            return res_error(user_name, "Error: Invalid file path")
 
         file_manager = globals.file_manager
-        content_bytes = block_code.encode('utf-8')
-        file_id = file_manager.exists(file_name, project_id)
+        file_id = file_manager.find(file_name, project_id)
         action = "сохранён" if file_id else "создан"
         if file_id:
             try:
                 file_manager.update_file(
                     file_id=file_id,
-                    content=content_bytes,
+                    content=block_code,
                     file_name=file_name,
                     timestamp=int(time.time()),
                     project_id=project_id
@@ -131,45 +141,40 @@ class FileEditProcessor(BlockProcessor):
             except Exception as e:
                 log.excpt("Ошибка обновления файла file_id=%d: %s", file_id, str(e),
                           exc_info=(type(e), e, e.__traceback__))
-                return {"status": "error", "message": f"Error: Failed to update file {file_name}"}
+                return res_error(user_name, f"Error: Failed to update file {file_name}")
         else:
             file_id = file_manager.add_file(
-                content=content_bytes,
+                content=block_code,
                 file_name=file_name,
                 timestamp=int(time.time()),
                 project_id=project_id
             )
-        return {
-            "status": "success",
-            "processed_message": f"@attach#{file_id}",
-            "message": f"Файл {file_id} успешно {action}",
-            "user_name": attrs.get('user_name')
-        }
-
+        return res_success(user_name, f"Файл @attach#{file_id} успешно {action}", "@attach#%d" % file_id)
 
 class FilePatchProcessor(BlockProcessor):
     def __init__(self):
         super().__init__('code_patch')
+        self.replace = False
 
     def handle_block(self, attrs, block_code):
         file_id = attrs.get('file_id')
+        user_name = attrs.get('user_name', 'Unknown')
         if not file_id:
             log.error("Отсутствует атрибут file_id в code_patch")
-            return {"status": "error", "message": "Error: Missing file_id", "user_name": attrs.get('user_name')}
+            return res_error(user_name, "Error: Missing file_id")
 
         try:
             file_id = int(file_id)
         except ValueError:
             log.error("Неверный формат file_id: %s", file_id)
-            return {"status": "error", "message": "Error: Invalid file_id format", "user_name": attrs.get('user_name')}
+            return res_error(user_name, "Error: Invalid file_id format")
 
         if isinstance(block_code, bytes):
             block_code = block_code.decode('utf-8', errors='replace')
             log.warn("patch_content был байтовым, декодирован: %s", block_code[:50])
         elif not isinstance(block_code, str):
             log.error("Неверный тип patch_content для file_id=%d: %s", file_id, type(block_code))
-            return {"status": "error", "message": "Error: Invalid patch content type",
-                    "user_name": attrs.get('user_name')}
+            return res_error(user_name, "Error: Invalid patch content type")
 
         log.debug("Обработка code_patch: file_id=%d, patch_content=~C95%s~C00, type=%s",
                   file_id, block_code[:50], type(block_code))
@@ -177,49 +182,62 @@ class FilePatchProcessor(BlockProcessor):
         project_id = project_manager.project_id if project_manager and hasattr(project_manager, 'project_id') else None
         if project_id is None:
             log.error("Нет активного проекта для обработки code_patch")
-            return {"status": "error", "message": "Error: No active project selected",
-                    "user_name": attrs.get('user_name')}
+            return res_error(user_name, "Error: No active project selected")
 
         file_manager = globals.file_manager
         file_data = file_manager.get_file(file_id)
         if not file_data:
             log.error("Файл file_id=%d не найден", file_id)
-            return {"status": "error", "message": f"Error: File {file_id} not found",
-                    "user_name": attrs.get('user_name')}
+            return res_error(user_name, f"Error: File {file_id} not found")
 
         file_name = file_data['file_name']
         log.debug("Данные файла: ~C95%s~C00", str(file_data))
-        current_content = file_data['content']
-        if isinstance(current_content, bytes):
-            if not current_content:
-                log.warn("Файл file_id=%d не содержит контента, попытка загрузки с диска", file_id)
-                current_content = project_manager.read_project_file(file_name)
-                if not current_content:
-                    log.error("Не удалось загрузить файл %s с диска", file_name)
-                    return {"status": "error", "message": f"Error: Failed to read file {file_name}",
-                            "user_name": attrs.get('user_name')}
-            current_content = current_content.decode('utf-8', errors='replace')
+        source = file_data['content']
+        if source is None:
+            log.error("Файл file_id=%d не считывается", file_id)
+            return res_error(user_name, f"Error: File @attach#{file_id} has no contents")
+
+        if isinstance(source, bytes):
+            source = source.decode('utf-8', errors='replace')
 
         try:
-            current_lines = current_content.splitlines(keepends=True)
+            current_lines = source.splitlines(keepends=True)
             patch_lines = block_code.splitlines(keepends=True)
         except Exception as e:
             log.excpt("Ошибка разбиения строк для file_id=%d: %s", file_id, str(e),
                       exc_info=(type(e), e, e.__traceback__))
-            return {"status": "error", "message": "Error: Failed to process patch content",
-                    "user_name": attrs.get('user_name')}
+            return res_error(user_name, "PatchError: Failed to process patch content")
 
         if not any(line.startswith('@@') for line in patch_lines):
             log.error("Невалидный формат патча для file_id=%d", file_id)
-            return {"status": "error", "message": "Error: Invalid patch format", "user_name": attrs.get('user_name')}
+            return res_error(user_name, "PatchError: Invalid patch format, no single @@ was found")
 
-        old_lines = [line[1:] for line in patch_lines if line.startswith('-') and not line.startswith('---')]
-        old_text = ''.join(old_lines)
-        if old_text and old_text not in ''.join(current_lines):
-            log.error("Патч не соответствует содержимому файла file_id=%d: удаляемые строки=~C95%s~C00",
-                      file_id, old_text)
-            return {"status": "error", "message": "Error: Patch does not match file content",
-                    "user_name": attrs.get('user_name')}
+        # Построчный анализ удаляемых строк
+        mismatches = []
+        current_line_idx = 0
+        for patch_line in patch_lines:
+            if patch_line.startswith('@@'):
+                # Парсим начальную строку из @@ -start,count +start,count @@
+                match = re.match(r'@@ -(\d+),(\d+) \+(\d+),(\d+) @@', patch_line)
+                if match:
+                    current_line_idx = int(match.group(1)) - 1  # Индекс строки в файле (0-based)
+                continue
+            if patch_line.startswith('-') and not patch_line.startswith('---'):
+                remove_sample = patch_line[1:]
+                if current_line_idx < len(current_lines):
+                    real_text = current_lines[current_line_idx]
+                    if remove_sample != real_text:
+                        mismatches.append(f"{current_line_idx + 1}:{remove_sample.rstrip()}:{real_text.rstrip()}\n")
+                else:
+                    mismatches.append(f"{current_line_idx + 1}:{remove_sample.rstrip()}:[EOF]\n")
+                current_line_idx += 1
+            elif not patch_line.startswith('+'):
+                current_line_idx += 1  # Пропускаем неизменённые строки
+
+        if mismatches:
+            mismatch_text = "".join(mismatches)
+            log.error("Патч не соответствует содержимому файла file_id=%d:\n%s", file_id, mismatch_text)
+            return res_error(user_name, f"PatchError: Removed lines do not match file content.\n<mismatch>{mismatch_text}</mismatch>")
 
         try:
             diff = ['--- {}\n'.format(file_name), '+++ {}\n'.format(file_name)] + patch_lines
@@ -234,54 +252,53 @@ class FilePatchProcessor(BlockProcessor):
                 else:
                     result.append(line)
             new_content = ''.join(result)
-            if new_content == current_content:
+            if new_content == source:
                 log.debug("Патч для file_id=%d не вносит изменений", file_id)
-                return {"status": "success", "message": f"Файл {file_id} не изменён",
-                        "user_name": attrs.get('user_name')}
+                return res_success(user_name, f"Файл {file_id} не изменён")
 
-            content_bytes = new_content.encode('utf-8')
-            file_manager.update_file(
+            res = file_manager.update_file(
                 file_id=file_id,
-                content=content_bytes,
+                content=new_content,
                 file_name=file_name,
                 timestamp=int(time.time()),
                 project_id=project_id
             )
-            log.debug("Применён патч для file_id=%d, file_name=%s, project_id=%s",
-                      file_id, file_name, str(project_id) if project_id is not None else "None")
-            return {"status": "success", "message": f"Файл {file_id} успешно сохранён",
-                    "user_name": attrs.get('user_name')}
+            content_bytes = new_content.encode('utf-8')
+            md5 = hashlib.md5(content_bytes).hexdigest()
+            if res > 0:
+                log.debug("Применён патч для file_id=%d, file_name=%s, project_id=%s",
+                          file_id, file_name, str(project_id) if project_id is not None else "None")
+                return res_success(user_name, f"Файл @attach#{file_id} успешно модифицирован, MD5:{md5}")
+            else:
+                log.error("Ошибка записи обновленного контента в %s, функция вернула %d", file_name, res)
+                return res_error(user_name, f"Error: Failed store @attach#{file_id}, returned code {res}")
         except Exception as e:
             log.excpt("Ошибка применения патча для file_id=%d: %s", file_id, str(e),
                       exc_info=(type(e), e, e.__traceback__))
-            return {"status": "error", "message": f"Error: Failed to apply patch to {file_name}",
-                    "user_name": attrs.get('user_name')}
-
+            return res_error(user_name, f"Error: Failed to apply patch to {file_name}: {e}")
 
 class ShellCodeProcessor(BlockProcessor):
     def __init__(self):
         super().__init__('shell_code')
+        self.replace = False
 
     def handle_block(self, attrs, block_code):
         shell_command = block_code.strip()
+        user_name = attrs.get('user_name', 'Unknown')
         log.debug("Обработка shell_code: command=%s", shell_command[:50])
 
         if not shell_command:
             log.error("Пустая команда в shell_code")
-            return {"status": "error", "message": "<stdout>Error: Empty shell command</stdout>",
-                    "user_name": attrs.get('user_name')}
+            return res_error(user_name, "<stdout>Error: Empty shell command</stdout>")
 
         timeout = int(attrs.get('timeout', 300))
         mcp = attrs.get('mcp', 'true').lower() == 'true'
-        user_name = attrs.get('user_name', 'Unknown')
         project_manager = globals.project_manager
-        project_name = project_manager.project_name if project_manager and hasattr(project_manager,
-                                                                                   'project_name') else None
+        project_name = project_manager.project_name if project_manager and hasattr(project_manager, 'project_name') else None
 
         if mcp and not project_name:
             log.error("Отсутствует project_name для MCP команды")
-            return {"status": "error", "message": "<stdout>Error: No project selected for MCP command</stdout>",
-                    "user_name": user_name}
+            return res_error(user_name, "<stdout>Error: No project selected for MCP command</stdout>")
         project_name = project_name or 'default'
 
         user_inputs = []
@@ -306,16 +323,14 @@ class ShellCodeProcessor(BlockProcessor):
                 response = resp.text if resp.status_code == 200 else f"<stdout>Ошибка: {resp.status_code}</stdout>"
                 log.info("Команда выполнена через MCP: %s, статус=%d, вывод=%s",
                          shell_command, resp.status_code, response[:50])
-                return {"status": "success" if resp.status_code == 200 else "error",
-                        "message": response, "user_name": user_name}
+                return res_success(user_name, response) if resp.status_code == 200 else res_error(user_name, response)
             except requests.RequestException as e:
                 log.excpt("Ошибка вызова MCP API для команды %s: %s", shell_command, str(e),
                           exc_info=(type(e), e, e.__traceback__))
-                return {"status": "error", "message": f"<stdout>Error: MCP API call failed: {str(e)}</stdout>",
-                        "user_name": user_name}
+                return res_error(user_name, f"<stdout>Error: MCP API call failed: {str(e)}</stdout>")
         else:
-            return execute(shell_command, user_inputs, user_name, timeout=timeout)
-
+            result = execute(shell_command, user_inputs, user_name, timeout=timeout)
+            return res_success(user_name, result["message"]) if result["status"] == "success" else res_error(user_name, result["message"])
 
 def process_message(text, timestamp, user_name, rql=None):
     log.debug("Обработка сообщения: text=%s, timestamp=%d, user_name=%s, rql=%s", text[:50], timestamp,
@@ -365,24 +380,6 @@ def process_message(text, timestamp, user_name, rql=None):
                           processor.tag, result["handled_cmds"], result["failed_cmds"])
     else:
         log.debug("Нет тегов согласно паттерну для %s", command_text)
-
-    if agent_requested and command_text.split():
-        first_word = command_text.split()[0].lower()
-        command_result = CommandProcessor().process(f"<command user_name=\"{user_name}\">{first_word}</command>")
-        processed_msg = command_text[len(first_word):].strip()
-        agent_reply.extend(command_result["agent_messages"])
-        handled_cmds += command_result["handled_cmds"]
-        failed_cmds += command_result["failed_cmds"]
-        if command_result["handled_cmds"] or command_result["failed_cmds"]:
-            log.debug("Процессор command обработал %d команд, неуспешно %d",
-                      command_result["handled_cmds"], command_result["failed_cmds"])
-        if handled_cmds == 0 and failed_cmds == 0:
-            agent_reply.append(f"@{user_name or 'Unknown'} <stdout>Уточните команду</stdout>")
-            log.warn("Ни одна команда не обработана для сообщения: %s", text[:50])
-            failed_cmds += 1
-    else:
-        log.debug("Агент не запрошен в сообщении")
-
 
     agent_reply_text = "\n".join(agent_reply) if agent_reply else None
     return {"handled_cmds": handled_cmds, "failed_cmds": failed_cmds, "processed_msg": processed_msg,

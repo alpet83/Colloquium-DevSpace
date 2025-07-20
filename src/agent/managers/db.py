@@ -166,7 +166,8 @@ class DataTable:
             log.excpt("Не удалось удалить из %s: %s", self.table_name, str(e), exc_info=(type(e), e, e.__traceback__))
             raise
 
-    def select_from(self, conditions: dict = None, order_by: str = None, limit: int = None, joins: list = None, columns: list = None):
+    def select_from(self, columns: list = None, conditions: dict = None,
+                    order_by: str = None, limit: int = None, joins: list = None, fetch_all: bool = True):
         """Выбирает записи из таблицы с условиями и поддержкой JOIN."""
         try:
             columns_str = ", ".join(columns) if columns else '*'
@@ -184,9 +185,16 @@ class DataTable:
                 query += f" ORDER BY {order_by}"
             if limit:
                 query += f" LIMIT {limit}"
-            result = self.db.fetch_all(query, params)
-            log.debug("Выбрано %d строк из %s: query=%s", len(result), self.table_name, query)
+            db = self.db
+            if fetch_all:
+                result = db.fetch_all(query, params)
+            else:
+                result = db.fetch_one(query, params)
             return result
         except Exception as e:
             log.excpt("Не удалось выполнить выборку %s: %s", query, str(e), exc_info=(type(e), e, e.__traceback__))
             raise
+
+    def select_row(self,  columns: list = None, conditions: dict = None,
+                   order_by: str = None, joins: list = None):
+        return self.select_from(columns, conditions, order_by, limit=1, joins=joins, fetch_all=False)

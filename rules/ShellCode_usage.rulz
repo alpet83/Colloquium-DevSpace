@@ -1,7 +1,7 @@
 # ShellCode Usage Rules for LLM
 
 ## Overview
-This document outlines the rules for LLMs to execute Linux commands using the `<shell_code>` tag in the Colloquium-DevSpace project, running on two containers: `colloquium-core` (local execution) and `mcp-sandbox` (REST API execution). Commands are processed by `/app/agent/lib/execute_commands.py` and displayed in the frontend via `ChatContainer.vue`. The rules ensure safe, consistent command execution with proper logging and output formatting.
+This document outlines the rules for LLMs to execute Linux commands using the `<shell_code>` tag in the Colloquium-DevSpace project, running on two containers: `colloquium-core` (local execution) and `mcp-sandbox` (REST API execution). Commands are processed by MCP-agent and responses provided to chat as reply. The rules ensure safe, consistent command execution with proper logging and output formatting.
 
 ## `<shell_code>` Tag Structure
 The `<shell_code>` tag encapsulates Linux commands with optional attributes and sub-tags for interactive input. It is processed by `llm_hands.py` and executed via `execute_commands.py`.
@@ -13,13 +13,13 @@ The `<shell_code>` tag encapsulates Linux commands with optional attributes and 
 - **mcp** (optional, default: true):
   - Boolean (`true`/`false`) indicating execution via `mcp-sandbox` (`true`) or locally on `colloquium-core` (`false`).
   - Example: `mcp="true"` uses REST API `/exec_commands` on `mcp-sandbox`.
-- **user_name** (optional, default: "Unknown"):
-  - Username for logging and response formatting.
-  - Example: `user_name="alice"` associates the command with user "alice".
+- **user_name** (optional, default: "{your name}"):
+  - Initiator username for logging and response formatting.
+  - Example: `user_name="grok"` associates the command with user "grok".
 - **project_name** (optional, default: "default"):
   - Specifies the project context for `mcp-sandbox` execution.
   - Required if `mcp="true"`, ignored for local execution.
-  - Example: `project_name="trade_report"`.
+  - Example: `project_name="hello_world"`.
 
 ### Sub-tags
 - **`<user_input>`** (optional):
@@ -31,7 +31,7 @@ The `<shell_code>` tag encapsulates Linux commands with optional attributes and 
 
 ### Syntax Example
 ```xml
-@agent <shell_code timeout="10" user_name="alice" project_name="trade_report">
+@agent <shell_code timeout="10" project_name="trade_report">
 ls -l /
 <user_input rqs="password" ack="1234"/>
 </shell_code>
@@ -99,7 +99,6 @@ ls -l /
    </shell_code>
    ```
    - Result: `<stdout>total 64\nbin dev home ... </stdout>`
-   - Logs: `/app/logs/exec.stdout` contains full `ls -l /` output.
 
 2. **Command with Large Output**:
    ```xml
@@ -117,13 +116,13 @@ ls -l /
    </shell_code>
    ```
    - Result: `<stdout><apt_update_output></stdout><stderr>[sudo] password for agent:</stderr>`
-   - Logs: `/app/logs/exec.stdout`, `/app/logs/exec.stderr` contain respective outputs.
+   - Full Logs: `/app/logs/exec.stdout`, `/app/logs/exec.stderr` contain respective outputs.
 
 ## Constraints
-- Commands run as `agent` user in `/app/projects`.
-- Output limited to 100 lines or 4KB.
+- Commands run as `agent` user in project dir `/app/projects/{project_name}` (CWD) under bash script. For example it allows build Rust code with just "cargo build".
+- Output limited to 100 lines or 4KB. So you may need grep for warnings/errors from typical huge stdout/stderr output. 
 - Timeout must be positive integer (default: 300 seconds).
-- `mcp="true"` requires `project_name` or defaults to `"default"`.
-- Logs are written to `/app/logs/exec.stdout`, `/app/logs/exec.stderr`, `/app/logs/llm_hands/`, `/app/logs/mcp_errors.log`.
-- `NO_LOG!` rule prohibits debug logs for `/chat/get` endpoint.
+- `mcp="true"` by default, in most cases not need to be applied
+
+
 

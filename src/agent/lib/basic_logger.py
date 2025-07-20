@@ -258,6 +258,9 @@ class BasicLogger:
     def error(self, fmt, *args):
         self.log_msg(f"~C91#ERROR:~C00 {fmt}", *args, echo=logging.error)
 
-    def excpt(self, fmt, *args, exc_info=None):
+    def excpt(self, fmt, *args, e=None, exc_info=None):
+        if e:
+            exc_info = (type(e), e, e.__traceback__)
         backtrace = "".join(traceback.format_exception(*exc_info)) if exc_info else self._format_backtrace()
-        self.log_msg(f"~C91#EXCEPTION:~C00 {fmt}\n{backtrace}", *args, echo=logging.error)
+        self.log_msg(f"~C91#EXCEPTION:~C00 {fmt}", *args, echo=logging.error)
+        self.log_msg("~C31#TRACEBACK:~C00\n %s", backtrace)

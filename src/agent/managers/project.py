@@ -1,4 +1,4 @@
-# /agent/managers/project.py, updated 2025-07-18 14:28 EEST
+# /agent/managers/project.py, updated 2025-07-20 12:14 EEST
 import os
 from pathlib import Path
 from .db import Database, DataTable
@@ -54,6 +54,48 @@ class ProjectManager:
         self.scan_project_files()
         log.debug("Загружен проект id=%d, project_name=%s", self.project_id, self.project_name)
 
+    def locate_file(self, file_name, project_id=None):
+        """Возвращает Path для файла, используя project_name из БД, если project_id отличается."""
+        base = Path(self.projects_dir)
+        project_name = 'default'
+        default = Path(base / project_name)
+
+        file_name = file_name.lstrip('@')
+        if project_id is None or project_id == self.project_id:
+            if self.project_name is None:
+                log.warn("project_name не установлен для project_id=%s", str(self.project_id))
+                return default / file_name
+            project_name = self.project_name
+        else:
+            if project_id <= 0:
+                log.error("Недопустимый project_id=%d", project_id)
+                return default / file_name
+            row = self.projects_table.select_row(
+                columns=['project_name'],
+                conditions={'id': project_id}
+            )
+            if not row:
+                log.warn("Проект id=%d не найден", project_id)
+                return default / file_name
+            project_name = row[0]
+
+        if file_name.startswith(project_name):
+            file_path = base / file_name
+        else:
+            file_path = base / project_name / file_name
+        try:
+            file_path = file_path.resolve()
+            if not str(file_path).startswith(str(base)):
+                log.error("Недопустимый путь файла: %s", str(file_path))
+                return base / file_name
+            log.debug("Получен путь файла: file_name=%s, project_id=%s, path=%s",
+                      file_name, str(project_id), str(file_path))
+            return file_path
+        except Exception as e:
+            log.excpt("Ошибка получения пути файла %s: %s", file_name, str(e),
+                      exc_info=(type(e), e, e.__traceback__))
+            return default / file_name
+
     def update(self, project_name, description=None, local_git=None, public_git=None, dependencies=None):
         try:
             self.projects_table.update(
@@ -73,7 +115,8 @@ class ProjectManager:
             self.dependencies = dependencies
             log.debug("Обновлён проект id=%d, project_name=%s", self.project_id, project_name)
         except Exception as e:
-            log.excpt("Ошибка обновления проекта project_id=%d: %s", self.project_id, str(e), exc_info=(type(e), e, e.__traceback__))
+            log.excpt("Ошибка обновления проекта project_id=%d: %s", self.project_id, str(e),
+                      exc_info=(type(e), e, e.__traceback__))
             raise
 
     @staticmethod
@@ -119,7 +162,8 @@ class ProjectManager:
             log.info("Создан проект id=%d, project_name=%s", project_id, project_name)
             return project_id
         except Exception as e:
-            log.excpt("Ошибка создания проекта project_name=%s: %s", project_name, str(e), exc_info=(type(e), e, e.__traceback__))
+            log.excpt("Ошибка создания проекта project_name=%s: %s", project_name, str(e),
+                      exc_info=(type(e), e, e.__traceback__))
             raise
 
     def list_projects(self):
@@ -171,30 +215,7 @@ class ProjectManager:
             log.debug("Найдено %d поддерживаемых файлов в проекте %s", len(files), project_name)
             return files
         except Exception as e:
-            log.excpt("Ошибка сканирования файлов проекта %s: %s", project_name, str(e), exc_info=(type(e), e, e.__traceback__))
+            log.excpt("Ошибка сканирования файлов проекта %s: %s", project_name, str(e),
+                      exc_info=(type(e), e, e.__traceback__))
             raise
 
-    def read_project_file(self, file_name):
-        try:
-            file_path = self.projects_dir / file_name
-            if not file_path.exists():
-                log.warn("Файл %s не существует", str(file_path))
-                return None
-            with file_path.open('rb') as f:
-                content = f.read()
-            log.debug("Прочитан файл %s, размер=%d байт", file_name, len(content))
-            return content
-        except Exception as e:
-            log.excpt("Ошибка чтения файла %s: %s", file_name, str(e), exc_info=(type(e), e, e.__traceback__))
-            return None
-
-    def write_file(self, file_name, content):
-        try:
-            file_path = self.projects_dir / file_name
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            with file_path.open('w', encoding='utf-8') as f:
-                f.write(content)
-            log.debug("Записан файл %s, размер=%d", file_name, len(content))
-        except Exception as e:
-            log.excpt("Ошибка записи файла %s: %s", file_name, str(e), exc_info=(type(e), e, e.__traceback__))
-            raise

@@ -1,4 +1,4 @@
-# /app/agent/managers/replication.py, updated 2025-07-19 23:00 EEST
+# /app/agent/managers/replication.py, updated 2025-07-20 23:59 EEST
 import re
 import datetime
 from pathlib import Path
@@ -10,18 +10,15 @@ import globals
 
 log = globals.get_logger("replication")
 
-
 class ReplicationManager(LLMInteractor):
     def __init__(self, debug_mode: bool = False):
         super().__init__()
         self.debug_mode = debug_mode
-        self.last_sent_tokens = 0
-        self.last_num_sources_used = 0
         self.actors = self._load_actors()
         self.active_replications = set()
-        self.processing_state = "free"  # Состояние: "free" или "busy"
-        self.processing_actor = None  # Имя текущего актёра
-        self.processing_start = None  # Время начала обработки
+        self.processing_state = "free"
+        self.processing_actor = None
+        self.processing_start = None
         if debug_mode:
             log.debug("Режим отладки репликации включён")
         else:
@@ -96,17 +93,14 @@ class ReplicationManager(LLMInteractor):
             log.info("Статистика контекста записана в %s для chat_id=%d, блоков=%d",
                      str(stats_file), chat_id, len(stats))
         except Exception as e:
-            log.excpt("Не удалось записать статистику контекста в %s: %s",
-                      str(stats_file), str(e), exc_info=(type(e), e, e.__traceback__))
-            globals.post_manager.add_message(chat_id, 2, "Не удалось записать статистику контекста для %s: %s",
-                                             llm_name, str(e))
+            globals.handle_exception(f"Не удалось записать статистику контекста в {stats_file}", e)
+            globals.post_manager.add_message(chat_id, 2, f"Не удалось записать статистику контекста для {llm_name}: {str(e)}")
 
     async def _recursive_replicate(self, content_blocks: list, users: list, chat_id: int, actor: ChatActor,
-                                   exclude_source_id=None, rql: int = 1, max_rql: int = 5):
+                                  exclude_source_id=None, rql: int = 1, max_rql: int = 5):
         """Рекурсивно обрабатывает ответы LLM, добавляя посты и вызывая репликацию для других участников."""
         if rql > max_rql:
-            log.info("Достигнут предел рекурсивного диалога %d для actor_id=%d, chat_id=%d", max_rql, actor.user_id,
-                     chat_id)
+            log.info("Достигнут предел рекурсивного диалога %d для actor_id=%d, chat_id=%d", max_rql, actor.user_id, chat_id)
             return
 
         self.processing_state = "busy"
@@ -117,7 +111,6 @@ class ReplicationManager(LLMInteractor):
         try:
             response = await self.interact(content_blocks, users, chat_id, actor, self.debug_mode, rql)
             if response:
-                self.last_num_sources_used = response.get('usage', {}).get('num_sources_used', 0)
                 original_response = response.get('text', '')
 
                 # Вырезаем всё до @agent, если присутствует
@@ -135,6 +128,51 @@ class ReplicationManager(LLMInteractor):
                 log.debug("Исходный ответ: %s, Обработанный ответ: %s",
                           original_response[:50], str(processed_response)[:50])
 
+                # Определяем rql для ответа
+                new_rql = None
+                if actor.user_id == 1:  # @admin
+                    new_rql = 0
+                    log.debug("Установлен rql=0 для ответа от admin, actor_id=%d, chat_id=%d", actor.user_id, chat_id)
+                else:
+                    # Проверяем цитирование @post#{post_id} или @post#{timestamp}
+                    cite_match = re.search(r'@post#(\d+)', original_response)
+                    if cite_match:
+                        cited_id_or_timestamp = int(cite_match.group(1))
+                        # Проверяем, является ли это post_id (небольшое значение, например, < 1_000_000)
+                        if cited_id_or_timestamp < 1_000_000:
+                            cited_post = self.db.fetch_one(
+                                'SELECT rql FROM posts WHERE chat_id = :chat_id AND id = :post_id',
+                                {'chat_id': chat_id, 'post_id': cited_id_or_timestamp}
+                            )
+                            if cited_post and cited_post[0] is not None:
+                                new_rql = cited_post[0] + 1
+                                log.debug("Найдено цитирование @post#%d (post_id), установлен rql=%d", cited_id_or_timestamp, new_rql)
+                            else:
+                                log.warn("Цитируемый пост @post#%d (post_id) не найден, fallback к последнему rql", cited_id_or_timestamp)
+                        else:
+                            # Предполагаем, что это timestamp
+                            cited_post = self.db.fetch_one(
+                                'SELECT rql FROM posts WHERE chat_id = :chat_id AND timestamp = :timestamp',
+                                {'chat_id': chat_id, 'timestamp': cited_id_or_timestamp}
+                            )
+                            if cited_post and cited_post[0] is not None:
+                                new_rql = cited_post[0] + 1
+                                log.debug("Найдено цитирование @post#%d (timestamp), установлен rql=%d", cited_id_or_timestamp, new_rql)
+                            else:
+                                log.warn("Цитируемый пост @post#%d (timestamp) не найден, fallback к последнему rql", cited_id_or_timestamp)
+                    if new_rql is None:
+                        last_post = self.db.fetch_one(
+                            'SELECT rql FROM posts WHERE chat_id = :chat_id ORDER BY id DESC LIMIT 1',
+                            {'chat_id': chat_id}
+                        )
+                        last_rql = last_post[0] if last_post and last_post[0] is not None else 0
+                        new_rql = last_rql + 1
+                        log.debug("Установлен rql=%d на основе последнего поста (last_rql=%d)", new_rql, last_rql)
+
+                if new_rql > max_rql:
+                    log.info("Превышен предел rql=%d для actor_id=%d, chat_id=%d, ответ пропущен", new_rql, actor.user_id, chat_id)
+                    return
+
                 if isinstance(processed_response, dict):
                     # Пристыковываем префикс к processed_msg
                     processed_msg = processed_response.get("processed_msg", "")
@@ -150,43 +188,36 @@ class ReplicationManager(LLMInteractor):
                             original_response=original_response,
                             processed_response=processed_response["processed_msg"],
                             triggered_by=actor.user_id,
-                            rql=rql if rql >= 2 else None
+                            rql=new_rql
                         )
                         if processed_response["agent_reply"]:
                             globals.post_manager.add_message(
                                 chat_id, 2, f"@{actor.user_name} " + processed_response["agent_reply"],
-                                rql=rql if rql >= 2 else None
+                                rql=new_rql
                             )
-                        if rql < max_rql:
+                        if new_rql < max_rql:
                             latest_post = self.db.fetch_one(
                                 'SELECT user_id, message FROM posts WHERE chat_id = :chat_id ORDER BY id DESC LIMIT 1',
                                 {'chat_id': chat_id}
                             )
                             if latest_post and '@all' in latest_post[1]:
-                                # Выбрать другого актёра (user_id > 1, не текущий actor.user_id)
+                                # Выбрать всех доступных других LLM-актёров
                                 for next_actor in self.actors:
                                     if (next_actor.user_id > 1 and next_actor.user_id != actor.user_id and
-                                            next_actor.llm_connection):
+                                        next_actor.llm_connection):
                                         file_ids = set()
                                         file_map = {}
-                                        new_content_blocks = self.assemble_posts(chat_id, exclude_source_id, file_ids,
-                                                                                 file_map)
+                                        new_content_blocks = self.assemble_posts(chat_id, exclude_source_id, file_ids, file_map)
                                         new_content_blocks.extend(self.assemble_files(file_ids, file_map))
                                         log.debug("Начался рекурсивный диалог между %s и %s для rql=%d",
-                                                  actor.user_name, next_actor.user_name, rql + 1)
+                                                  actor.user_name, next_actor.user_name, new_rql + 1)
                                         await self._recursive_replicate(
-                                            new_content_blocks, users, chat_id, next_actor, exclude_source_id, rql + 1,
-                                            max_rql
+                                            new_content_blocks, users, chat_id, next_actor, exclude_source_id, new_rql + 1, max_rql
                                         )
-                                        break  # Обрабатываем только одного следующего актёра
-                                else:
-                                    log.debug("Нет доступных других актёров для диалога, chat_id=%d, rql=%d", chat_id,
-                                              rql)
                     else:
                         log.warn("Обработанный ответ не содержит processed_msg или команд: %s", processed_response)
                 else:
                     log.warn("Обработанный ответ не является словарем: %s", type(processed_response))
-                    # Пристыковываем префикс к processed_response, если он не словарь
                     processed_response = prefix + str(processed_response) if prefix else processed_response
                     self._store_response(
                         actor_id=actor.user_id,
@@ -194,12 +225,12 @@ class ReplicationManager(LLMInteractor):
                         original_response=original_response,
                         processed_response=processed_response,
                         triggered_by=actor.user_id,
-                        rql=rql if rql >= 2 else None
+                        rql=new_rql
                     )
             else:
                 log.warn("Ответ от LLM не получен для user_id=%d, rql=%d", actor.user_id, rql)
                 globals.post_manager.add_message(
-                    chat_id, 2, f"Нет ответа от LLM для {actor.user_name}", rql=rql if rql >= 2 else None
+                    chat_id, 2, f"Нет ответа от LLM для {actor.user_name}", rql=rql
                 )
         finally:
             self.processing_state = "free"
@@ -280,8 +311,7 @@ class ReplicationManager(LLMInteractor):
                     log.debug("Обновлён llm_context для actor_id=%d, chat_id=%d, last_post_id=%d",
                               actor.user_id, chat_id, max_post_id)
                 except Exception as e:
-                    log.excpt("Не удалось обновить llm_context для actor_id=%d, chat_id=%d: %s",
-                              actor.user_id, chat_id, str(e), exc_info=(type(e), e, e.__traceback__))
+                    globals.handle_exception(f"Не удалось обновить llm_context для actor_id={actor.user_id}, chat_id={chat_id}", e)
 
     async def replicate_to_llm(self, chat_id, exclude_source_id=None, debug_mode: bool = None):
         debug_mode = self.debug_mode if debug_mode is None else debug_mode
@@ -345,7 +375,7 @@ class ReplicationManager(LLMInteractor):
             log.debug("Добавлен обработанный ответ в posts для chat_id=%d, actor_id=%d: %s",
                       chat_id, actor_id, processed_msg[:50])
         else:
-            log.debug("Игнорирование ответа для chat_id=%d, agent_id=%d, length=%d, triggered_by=%d",
+            log.debug("Игнорирование ответа для chat_id=%d, actor_id=%d, length=%d, triggered_by=%d",
                       chat_id, actor_id, len(processed_msg), triggered_by)
         self.llm_responses_table.insert_into(
             {

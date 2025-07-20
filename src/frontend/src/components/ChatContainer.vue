@@ -1,4 +1,4 @@
-<!-- /frontend/rtm/src/components/ChatContainer.vue, updated 2025-07-19 21:15 EEST -->
+<!-- /frontend/rtm/src/components/ChatContainer.vue, updated 2025-07-20 23:59 EEST -->
 <template>
   <div class="chat-container">
     <div class="tabs">
@@ -32,12 +32,17 @@
       <button @click="editPost">Сохранить</button>
       <button @click="closeEditPostModal">Отмена</button>
     </dialog>
+    <dialog ref="filePreviewModal" class="file-preview-modal">
+      <h3>Предпросмотр файла</h3>
+      <pre class="file-preview">{{ filePreviewContent }}</pre>
+      <button @click="closeFilePreviewModal">Закрыть</button>
+    </dialog>
     <p v-if="chatStore.chatError || fileStore.chatError || authStore.backendError" class="error">
       {{ chatStore.chatError || fileStore.chatError || authStore.backendError }}
     </p>
-    <div v-if="activeTab === 'chat'" class="messages" ref="messagesContainer">
+    <div v-if="activeTab === 'chat'" class="messages" ref="messagesContainer" @click="handleMessageClick">
       <div v-for="(msg, index) in chatStore.history" :key="msg.id" :class="['message', { 'admin-message': msg.user_id === 1, 'agent-message': msg.user_id === 2, 'deleted': msg.action === 'delete' }]">
-        <p v-if="msg.action !== 'delete'" v-html="formatMessage(msg.message, msg.file_names, msg.user_name, msg.timestamp)"></p>
+        <pre v-if="msg.action !== 'delete'" v-html="formatMessage(msg.message, msg.file_names, msg.user_name, msg.timestamp)"></pre>
         <p v-else class="deleted-post">
           <strong>{{ msg.user_name }}</strong> ({{ formatTimestamp(msg.timestamp) }}): [Post deleted]
         </p>
@@ -93,7 +98,8 @@ export default defineComponent({
       editMessageContent: '',
       pollInterval: null,
       activeTab: 'chat',
-      debugLogs: []
+      debugLogs: [],
+      filePreviewContent: ''
     }
   },
   setup() {
@@ -105,7 +111,6 @@ export default defineComponent({
   },
   mounted() {
     this.startPolling()
-    this.scrollToBottom()
     this.mitt.on('select-file', this.handleSelectFile)
     this.$nextTick(() => {
       this.autoResize({ target: this.$refs.messageInput }, 'messageInput')
@@ -119,11 +124,6 @@ export default defineComponent({
     this.mitt.off('select-file', this.handleSelectFile)
     if (this.backendLogInterval) {
       clearInterval(this.backendLogInterval)
-    }
-  },
-  updated() {
-    if (this.activeTab === 'chat') {
-      this.scrollToBottom()
     }
   },
   methods: {
@@ -193,12 +193,7 @@ export default defineComponent({
       }
     },
     scrollToBottom() {
-      this.$nextTick(() => {
-        const container = this.$refs.messagesContainer
-        if (container) {
-          container.scrollTop = container.scrollHeight
-        }
-      })
+      // Пустой метод, прокрутка теперь в chatStore
     },
     openFileConfirmModal(event) {
       this.pendingFile = event.target.files[0]
@@ -238,18 +233,70 @@ export default defineComponent({
         })
       }
     },
+    async showFilePreview(fileId) {
+      try {
+        const res = await fetch(`${this.chatStore.apiUrl}/chat/file_contents?file_id=${fileId}`, {
+          method: 'GET',
+          credentials: 'include'
+        })
+        console.log(`Fetching file contents for file_id: ${fileId}`)
+        if (res.ok) {
+          const data = await res.json()
+          if (data.content) {
+            this.filePreviewContent = data.content
+            this.$refs.filePreviewModal.showModal()
+            console.log('Opened file preview for file_id:', fileId)
+          } else {
+            console.error('No content found for file_id:', fileId)
+            this.debugLogs.push({
+              type: 'error',
+              message: `No content found for file_id: ${fileId}`,
+              timestamp: new Date().toLocaleString('ru-RU')
+            })
+          }
+        } else {
+          const errorData = await res.json()
+          console.error('Error fetching file contents:', errorData)
+          this.debugLogs.push({
+            type: 'error',
+            message: `Failed to fetch file contents: ${errorData.error || 'Invalid response'}`,
+            timestamp: new Date().toLocaleString('ru-RU')
+          })
+        }
+      } catch (error) {
+        console.error('Error fetching file contents:', error)
+        this.debugLogs.push({
+          type: 'error',
+          message: `Failed to fetch file contents: ${error.message}`,
+          timestamp: new Date().toLocaleString('ru-RU')
+        })
+      }
+    },
+    closeFilePreviewModal() {
+      this.filePreviewContent = ''
+      this.$refs.filePreviewModal.close()
+    },
+    handleMessageClick(event) {
+      const target = event.target.closest('.file-link')
+      if (target) {
+        const fileId = target.getAttribute('data-file-id')
+        if (fileId) {
+          this.showFilePreview(Number(fileId))
+        }
+      }
+    },
     async sendMessage(event) {
       if (event.shiftKey) return
       if (!this.newMessage && !this.fileStore.pendingAttachment) return
       if (this.chatStore.status.status === 'busy') {
-        console.warn('Отправка заблокирована: идёт обработка запроса', this.chatStore.status);
-        this.chatStore.chatError = 'Отправка заблокирована: идёт обработка запроса';
+        console.warn('Отправка заблокирована: идёт обработка запроса', this.chatStore.status)
+        this.chatStore.chatError = 'Отправка заблокирована: идёт обработка запроса'
         this.debugLogs.push({
           type: 'warn',
           message: `Отправка заблокирована: идёт обработка запроса ${this.chatStore.status.actor} (${this.chatStore.status.elapsed} секунд)`,
           timestamp: new Date().toLocaleString('ru-RU')
-        });
-        return;
+        })
+        return
       }
       let finalMessage = this.newMessage.trim()
       if (this.fileStore.pendingAttachment) {
@@ -312,14 +359,15 @@ export default defineComponent({
       if (fileId) {
         this.newMessage += ` @attach#${fileId}`
         this.fileStore.pendingAttachment = this.fileStore.files.find(file => file.id === fileId) || null
+        this.showFilePreview(fileId)
       } else {
-        console.error('Invalid fileId received:', fileId);
-        this.fileStore.chatError = 'Invalid file selection';
+        console.error('Invalid fileId received:', fileId)
+        this.fileStore.chatError = 'Invalid file selection'
         this.debugLogs.push({
           type: 'error',
           message: 'Invalid file selection',
           timestamp: new Date().toLocaleString('ru-RU')
-        });
+        })
       }
       this.$refs.messageInput?.focus()
       this.$nextTick(() => {
@@ -334,8 +382,8 @@ export default defineComponent({
       console.log(`Auto-resized ${refName} to height: ${textarea.style.height}`)
     },
     formatMessage(message, fileNames, userName, timestamp) {
-      let formatted = message ? message.replace(/</g, '<').replace(/>/g, '>') : '[Post deleted]'
-      // Обработка @attached_file
+      let formatted = message || '[Post deleted]'
+      // Обработка @attach# и @attached_file#
       if (fileNames && fileNames.length) {
         fileNames.forEach(file => {
           const date = new Date(file.ts * 1000).toLocaleString('ru-RU', {
@@ -346,10 +394,21 @@ export default defineComponent({
             minute: '2-digit',
             second: '2-digit'
           })
-          const regex = new RegExp(`@attach#${file.file_id}\\b`, 'g')
-          formatted = formatted.replace(regex, `<a href="#" @click.prevent="$emit('select-file', ${file.file_id})">File: ${file.file_name} (@attached_file#${file.file_id}, ${date})</a>`)
+          const regex = new RegExp(`@(attach|attached_file)#${file.file_id}\\b`, 'g')
+          formatted = formatted.replace(regex, `<span class="file-link" data-file-id="${file.file_id}">File: ${file.file_name} (@attached_file#${file.file_id}, ${date})</span>`)
         })
       }
+      // Обработка ненайденных file_id
+      const fileIds = [...(message?.match(/@(attach|attached_file)#(\d+)\b/g) || [])]
+      fileIds.forEach(tag => {
+        const fileId = tag.match(/\d+/)[0]
+        if (!fileNames || !fileNames.some(file => file.file_id === Number(fileId))) {
+          formatted = formatted.replace(
+            new RegExp(`@(attach|attached_file)#${fileId}\\b`, 'g'),
+            `<span class="file-unavailable">Файл ${fileId} удалён или недоступен</span>`
+          )
+        }
+      })
       // Обработка <code_patch>
       formatted = formatted.replace(
         /<code_patch file_id="(\d+)">([\s\S]*?)<\/code_patch>/g,
@@ -365,6 +424,11 @@ export default defineComponent({
           }).join('\n')
           return `<pre class="code-patch">${lines}</pre>`
         }
+      )
+      // Обработка <mismatch>
+      formatted = formatted.replace(
+        /<mismatch>([\s\S]*?)<\/mismatch>/g,
+        (match, content) => `<pre class="mismatch">${content}</pre>`
       )
       // Обработка <shell_code>, <stdout>, <stderr>
       formatted = formatted.replace(
@@ -406,22 +470,20 @@ export default defineComponent({
     },
     'chatStore.history': {
       async handler(newHistory, oldHistory) {
-        console.log('Deleted posts:', newHistory.filter(post => post.action === 'delete'))
-        this.scrollToBottom()
-        if (oldHistory) {
-          const hasAttach = newHistory.some(post => post.message && post.message.includes('@attach#'))
-          if (hasAttach) {
-            console.log('Post with @attach# detected in history, fetching files')
-            try {
-              await this.fileStore.fetchFiles()
-            } catch (error) {
-              console.error('Error fetching files:', error)
-              this.debugLogs.push({
-                type: 'error',
-                message: `Failed to fetch files: ${error.message}`,
-                timestamp: new Date().toLocaleString('ru-RU')
-              })
-            }
+        if (!oldHistory || newHistory.length === 0 || (newHistory.length === oldHistory.length && newHistory.every((post, i) => post.id === oldHistory[i]?.id && post.message === oldHistory[i]?.message))) {
+          return
+        }
+        if (newHistory.some(post => post.message && post.message.includes('@attach#'))) {
+          console.log('Post with @attach# detected in history, fetching files')
+          try {
+            await this.fileStore.fetchFiles()
+          } catch (error) {
+            console.error('Error fetching files:', error)
+            this.debugLogs.push({
+              type: 'error',
+              message: `Failed to fetch files: ${error.message}`,
+              timestamp: new Date().toLocaleString('ru-RU')
+            })
           }
         }
       },
@@ -523,13 +585,14 @@ export default defineComponent({
     margin-left: 20px;
   }
 }
-.message p {
+.message pre {
   margin: 0;
   flex-grow: 1;
   color: #eee;
+  white-space: pre-wrap;
 }
 @media (prefers-color-scheme: light) {
-  .message p {
+  .message pre {
     color: #333;
   }
 }
@@ -614,9 +677,31 @@ dialog {
   border: 1px solid #ccc;
   border-radius: 5px;
 }
-dialog input, dialog textarea {
+.file-preview-modal {
+  max-width: 90vw;
+  max-height: 80vh;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+dialog input, dialog textarea, dialog pre {
   width: 100%;
   margin-bottom: 10px;
+}
+.file-preview {
+  color: #d3d3d3;
+  background: #222;
+  padding: 10px;
+  border-radius: 5px;
+  max-height: 60vh;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  font-family: monospace;
+}
+@media (prefers-color-scheme: light) {
+  .file-preview {
+    color: #666;
+    background: #f5f5f5;
+  }
 }
 .error {
   color: red;
@@ -635,17 +720,55 @@ dialog input, dialog textarea {
   color: #888;
   font-style: italic;
 }
-.code-patch, .shell-code, .stdout, .stderr {
+.code-patch, .shell-code, .stdout, .stderr, .mismatch {
   background: #222;
   padding: 8px;
   border-radius: 5px;
   font-family: monospace;
   white-space: pre-wrap;
   border: 1px solid;
+  display: block;
+}
+.file-link {
+  background: #222;
+  padding: 2px 6px;
+  border-radius: 5px;
+  font-family: monospace;
+  border: 1px solid;
+  display: inline-block;
+  color: #1e90ff;
+  border-color: #1e90ff;
+  cursor: pointer;
+}
+.file-link:hover {
+  background: #1e90ff;
+  color: #fff;
+}
+.file-unavailable {
+  background: #222;
+  padding: 2px 6px;
+  border-radius: 5px;
+  font-family: monospace;
+  border: 1px solid;
+  display: inline-block;
+  color: #888;
+  border-color: #888;
 }
 @media (prefers-color-scheme: light) {
-  .code-patch, .shell-code, .stdout, .stderr {
+  .code-patch, .shell-code, .stdout, .stderr, .mismatch, .file-link, .file-unavailable {
     background: #f5f5f5;
+  }
+  .file-link {
+    color: #0056b3;
+    border-color: #0056b3;
+  }
+  .file-link:hover {
+    background: #0056b3;
+    color: #fff;
+  }
+  .file-unavailable {
+    color: #666;
+    border-color: #666;
   }
 }
 .code-patch {
@@ -677,6 +800,16 @@ dialog input, dialog textarea {
 }
 @media (prefers-color-scheme: light) {
   .stderr {
+    color: #cc0000;
+    border-color: #cc0000;
+  }
+}
+.mismatch {
+  color: #ff4444;
+  border-color: #ff4444;
+}
+@media (prefers-color-scheme: light) {
+  .mismatch {
     color: #cc0000;
     border-color: #cc0000;
   }

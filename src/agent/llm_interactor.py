@@ -1,17 +1,28 @@
-# /app/agent/managers/llm_interactor.py, updated 2025-07-19 17:49 EEST
-
+# /app/agent/managers/llm_interactor.py, updated 2025-07-20 23:59 EEST
 import datetime
 from pathlib import Path
 from lib.sandwich_pack import SandwichPack
 from context_assembler import ContextAssembler
+from managers.db import DataTable
 import globals
 
-log = globals.get_logger("llm_interactor")
+log = globals.get_logger("interactor")
 
 class LLMInteractor(ContextAssembler):
     def __init__(self):
         super().__init__()
         self.pre_prompt = self._load_pre_prompt()
+        self.llm_usage_table = DataTable(
+            table_name="llm_usage",
+            template=[
+                "ts INTEGER",
+                "model TEXT",
+                "sent_tokens INTEGER",
+                "used_tokens INTEGER",
+                "sources_used INTEGER",
+                "chat_id INTEGER"
+            ]
+        )
 
     def _load_pre_prompt(self):
         try:
@@ -20,7 +31,7 @@ class LLMInteractor(ContextAssembler):
             log.debug("Загружен пре-промпт из %s", globals.PRE_PROMPT_PATH)
             return pre_prompt
         except FileNotFoundError as e:
-            log.excpt("Файл пре-промпта %s не найден", globals.PRE_PROMPT_PATH, exc_info=(type(e), e, e.__traceback__))
+            globals.handle_exception("Файл пре-промпта %s не найден", globals.PRE_PROMPT_PATH, e)
             raise
 
     async def interact(self, content_blocks: list, users: list, chat_id: int, actor, debug_mode: bool = False, rql: int = 1) -> dict:
@@ -47,10 +58,9 @@ class LLMInteractor(ContextAssembler):
             sent_tokens = len(context) // 4
             log.debug("Контекст сгенерирован, длина=%d символов, оценено токенов=%d", len(context), sent_tokens)
             if sent_tokens > max_tokens:
-                raise ValueError("Контекст превышает лимит токенов: %d > %d", sent_tokens, max_tokens)
+                raise ValueError(f"Контекст превышает лимит токенов: {sent_tokens} > {max_tokens}")
         except Exception as e:
-            log.excpt("Не удалось упаковать блоки контента для chat_id=%d: %s",
-                      chat_id, str(e), exc_info=(type(e), e, e.__traceback__))
+            globals.handle_exception("Не удалось упаковать блоки контента для chat_id=%d", chat_id, e)
             raise
 
         context_file = Path(f"/app/logs/context-{actor.user_name}.log")
@@ -60,10 +70,9 @@ class LLMInteractor(ContextAssembler):
             log.info("Контекст сохранён в %s для user_id=%d, размер=%d символов",
                      str(context_file), actor.user_id, len(context))
         except Exception as e:
-            log.excpt("Не удалось сохранить контекст в %s: %s",
-                      str(context_file), str(e), exc_info=(type(e), e, e.__traceback__))
-            globals.post_manager.add_message(chat_id, 2, "Не удалось сохранить контекст для %s: %s",
-                                            actor.user_name, str(e), rql=rql if rql >= 2 else None)
+            globals.handle_exception("Не удалось сохранить контекст в %s", str(context_file), e)
+            globals.post_manager.add_message(chat_id, 2, f"Не удалось сохранить контекст для {actor.user_name}: {str(e)}",
+                                            rql=rql if rql >= 2 else None)
 
         if debug_mode:
             debug_file = Path(f"/app/logs/debug_{actor.user_name}_"
@@ -73,20 +82,35 @@ class LLMInteractor(ContextAssembler):
             log.info("Сохранён отладочный контекст в %s для user_id=%d", str(debug_file), actor.user_id)
             return {"text": "", "usage": {}}
         else:
+            conn = actor.llm_connection
             log.debug("Отправка в LLM для user_id=%d: %d символов, rql=%d", actor.user_id, len(context), rql)
-            search_parameters = actor.llm_connection.set_search_params(actor.user_id)
+            search_parameters = conn.set_search_params(actor.user_id)
             try:
                 if search_parameters.get("mode") == "off":
                     log.debug("Поиск отключён для user_id=%d", actor.user_id)
-                    response = await actor.llm_connection.call(context)
+                    response = await conn.call(context)
                 else:
-                    response = await actor.llm_connection.call(context, search_parameters=search_parameters)
-                log.debug("Получен LLM-ответ для user_id=%d, num_sources_used=%d, токенов=%d, rql=%d",
-                          actor.user_id, response.get('usage', {}).get('num_sources_used', 0), sent_tokens, rql)
-                return response
+                    response = await conn.call(context, search_parameters=search_parameters)
+                if response:
+                    usage = response.get('usage', {})
+                    used_tokens = usage.get('prompt_tokens', 0)
+                    sources = usage.get('num_sources_used', 0)
+                    self.llm_usage_table.insert_into({
+                        "ts": int(datetime.datetime.now(datetime.UTC).timestamp()),
+                        "model": conn.model,
+                        "sent_tokens": sent_tokens,
+                        "used_tokens": used_tokens,
+                        "chat_id": chat_id
+                    })
+                    log.debug("Сохранена статистика LLM для chat_id=%d, user_id=%d: model=%s, sent_tokens=%d, used_tokens=%d, num_sources_used=%d",
+                              chat_id, actor.user_id, conn.model, sent_tokens, used_tokens, sources)
+                    return response
+                else:
+                    log.error("llm_connection вернул %s", str(response))
+                    return {}
             except Exception as e:
                 error_msg = f"Ошибка LLM для {actor.user_name}: {str(e)}"
-                log.excpt(error_msg, exc_info=(type(e), e, e.__traceback__))
+                globals.handle_exception(error_msg, e)
                 globals.post_manager.add_message(
                     chat_id, 2, error_msg, rql=rql if rql >= 2 else None
                 )

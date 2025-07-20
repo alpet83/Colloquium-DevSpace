@@ -1,4 +1,4 @@
-/docs/technical_documentation.md, updated 2025-07-19 23:59 EEST
+/docs/technical_documentation.md, updated 2025-07-20 23:59 EEST
 Technical Documentation for Colloquium Chat Server
 Overview
 The Colloquium Chat Server is a multi-user chat application with file attachment support, implemented using FastAPI (Python) for the backend and Vue.js with Pinia for the frontend. It supports hierarchical chats, file uploads, project management, and integration with Large Language Model (LLM) services. The backend uses SQLite for data storage, managed via SQLAlchemy's Database class singleton. The system is designed for collaborative code analysis, with features like file indexing, chat replication to LLMs, and token usage statistics.
@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS users (
 Fields:
 
 user_id: Unique user identifier.
-user_name: User login name (e.g., admin, mcp).
+user_name: User login name (e.g., admin, mcp, grok3).
 llm_class: Optional LLM class for integration (e.g., super_grok, chatgpt).
 llm_token: Optional LLM API token.
 password_hash: SHA256 hash of password with salt.
@@ -89,6 +89,7 @@ Purpose: Stores user session data.Schema:
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
     user_id INTEGER,
+    active_chat INTEGER,
     FOREIGN KEY (user_id) REFERENCES users(user_id)
 )
 
@@ -96,6 +97,7 @@ Fields:
 
 session_id: Unique session identifier (UUID).
 user_id: ID of the authenticated user.
+active_chat: ID of the currently active chat for the session.
 
 Table: projects
 Purpose: Stores project metadata.Schema:
@@ -161,22 +163,40 @@ timestamp: Unix timestamp of response creation.
 triggered_by: ID of the post that triggered the response.
 rql: Recursion level for the response (optional).
 
+Table: llm_usage
+Purpose: Stores statistics of LLM interactions.Schema:
+CREATE TABLE IF NOT EXISTS llm_usage (
+    ts INTEGER,
+    model TEXT,
+    sent_tokens INTEGER,
+    used_tokens INTEGER,
+    chat_id INTEGER
+)
+
+Fields:
+
+ts: Unix timestamp of the LLM interaction.
+model: Name of the LLM model (e.g., grok3, chatgpt).
+sent_tokens: Number of tokens sent to the LLM.
+used_tokens: Number of tokens used in the response (from usage.prompt_tokens).
+chat_id: ID of the associated chat.
+
 Logging
 Initialization Logs
 
-Written to stderr during server startup, visible via docker logs colloquium-core.
+Written to: stderr during server startup, visible via docker logs colloquium-core.
 Format: [%Y-%m-%d %H:%M:%S]. #<tag>: <message> (e.g., [2025-07-17 19:00:00]. #INFO: Сервер Colloquium запускается...).
 
 Application Logs
 
-Written to /app/logs/colloquium_core.log.
+Written to: /app/logs/colloquium_core.log.
 Format: [%(asctime)s] #%(levelname)s: %(message)s (e.g., [2025-07-17 19:00:00] #INFO: Saved context to /app/logs/context-grok.log).
-Includes request logging, replication details, file operations, and errors.
+Includes: Request logging, replication details, file operations, errors.
 
 LLM Context Logs
 
-Saved to /app/logs/context-<username>.log for each LLM actor.
-Contains JSON index and sandwich content for debugging.
+Written to: /app/logs/context-<username>.log for each LLM actor.
+Content: JSON index and sandwich content for debugging.
 
 Access
 
@@ -189,9 +209,10 @@ Defined in /agent/globals.py:
 
 LOG_DIR = "/app/logs": Directory for log files.
 LOG_FILE = "/app/logs/colloquium_core.log": Path to application log file.
+LOG_SERV = "/app/logs/colloquium_serv.log": Path to server log file.
 CONFIG_FILE = "/app/data/colloquium_config.toml": Path to configuration file.
-DB_PATH = "/app/data/multichat.db": Path to SQLite database.
-Manager placeholders: user_manager, chat_manager, post_manager, file_manager, replication_manager, project_manager (initialized as None).
+PRE_PROMPT_PATH = "/app/prompt.txt": Path to LLM pre-prompt.
+Manager placeholders: user_manager, chat_manager, post_manager, file_manager, replication_manager, project_manager, post_processor, sessions_table (initialized as None).
 
 Backend Modules and Functions
 /agent/server.py
@@ -212,7 +233,16 @@ __init__(): Initializes SQLite connection (sqlite:////app/data/multichat.db).
 get_database(): Returns singleton instance of Database.
 execute(query, params): Executes a SQL query with optional parameters.
 fetch_all(query, params): Fetches all rows for a query.
-fetch_one(query, params): Fetches one row for a query.
+fetch_one(query, params): Fetches one row for a query.Class: DataTable
+__init__(table_name, template): Initializes table with schema, creates or updates it.
+create(): Creates table based on template.
+upgrade(): Adds missing columns to table.
+insert_into(values, ignore): Inserts a record, optionally ignoring duplicates.
+insert_or_replace(values): Inserts or replaces a record.
+update(values, conditions): Updates records based on conditions.
+delete_from(conditions): Deletes records based on conditions.
+select_from(columns, conditions, order_by, limit, joins, fetch_all): Selects records with optional JOINs.
+select_row(columns, conditions, order_by, joins): Selects a single row.
 
 /agent/managers/users.py
 Purpose: Manages user authentication and data.Class: UserManager
@@ -234,6 +264,7 @@ _create_tables(): Creates chats table.
 list_chats(user_id): Returns list of chats accessible to user_id (based on user_list).
 create_chat(description, user_id, parent_msg_id): Creates a new chat with optional parent message.
 delete_chat(chat_id, user_id): Deletes a chat if no sub-chats exist and user has permission.
+active_chat(user_id): Returns the active chat ID for the user from sessions table.
 get_chat_hierarchy(chat_id): Returns list of chat IDs in the hierarchy (parent and child chats).
 
 /agent/managers/posts.py
@@ -268,26 +299,25 @@ get_file(file_id): Retrieves file metadata and content, loading from disk for li
 /agent/managers/replication.py
 Purpose: Handles replication of chat context to LLM services.Class: ReplicationManager
 
-__init__(user_manager, chat_manager, post_manager, file_manager, debug_mode): Initializes with managers and debug mode.
-_init_tables(): Creates llm_context and llm_responses tables.
+__init__(debug_mode): Initializes with database and debug mode.
 _load_actors(): Loads users with LLM configurations as ChatActor instances.
-_resolve_file_id(match, file_ids, file_map): Resolves @attach#<file_id> and @attach_dir#<dir_name> to @attached_file#<file_id> or @attached_files#[<id1>,<id2>,...].
-_assemble_posts(chat_id, exclude_source_id, file_ids, file_map): Collects posts and resolves file references.
-_assemble_files(file_ids, file_map): Collects files for context.
-_pack_and_send(content_blocks, users, chat_id, exclude_source_id, debug_mode): Packs context using SandwichPack, sends to LLMs, and stores responses.
+_write_context_stats(content_blocks, llm_name, chat_id, index_json): Writes context statistics to /app/logs/<llm_name>_context.stats.
 _recursive_replicate(content_blocks, users, chat_id, actor, exclude_source_id, rql, max_rql): Recursively processes LLM responses, posts them, and triggers further replication for @all. For responses containing @agent, strips content before @agent, processes the command via post_processor, and prepends the stripped prefix to processed_msg.
 replicate_to_llm(chat_id, exclude_source_id, debug_mode): Orchestrates replication process with token limit (131072).
+_pack_and_send(content_blocks, users, chat_id, exclude_source_id, debug_mode): Packs context using SandwichPack, sends to LLMs, and stores responses.
 _store_response(actor_id, chat_id, original_response, processed_response, triggered_by, rql): Stores LLM responses and posts them if triggered by @<username>, @all, or #critics_allowed.
 get_processing_status(): Returns replication status (free or busy) with actor and elapsed time.
-last_sent_tokens: Stores token count of the last sent context.
-last_num_sources_used: Stores number of sources used in the last replication.Class: ChatActor
+
+/agent/chat_actor.py
+Purpose: Represents a user with an LLM connection.Class: ChatActor
+
 __init__(user_id, user_name, llm_class, llm_token, post_manager): Initializes actor with LLM connection (XAIConnection or OpenAIConnection).
 Supports grok and chatgpt models.
 
 /agent/lib/sandwich_pack.py
 Purpose: Packs chat posts and files into a context for LLM processing.Class: SandwichPack
 
-__init__(max_size, system_prompt): Initializes with maximum context size (80,000 bytes) and optional system prompt.
+__init__(max_size, system_prompt): Initializes with maximum context size (1,000,000 bytes) and optional system prompt.
 register_block_class(block_class): Registers custom block classes for parsing.
 load_block_classes(): Loads block classes from *_block.py files.
 supported_type(content_type): Checks if content type (e.g., .rs, .vue) is supported.
@@ -315,13 +345,12 @@ run_test: Sends request to MCP_URL/run_test.
 commit: Sends request to MCP_URL/commit.
 
 
-FileEditProcessor: Processes <code_file name="..."> tags, saves files to disk via ProjectManager.write_file, adds/updates links in attached_files with empty content and @file_name.
+FileEditProcessor: Processes <code_file name="..."> tags, saves files to disk via ProjectManager.edit_file, adds/updates links in attached_files with empty content and @file_name.
 FilePatchProcessor: Processes <code_patch file_id="..."> tags, applies patches to files using FileManager.update_file.
 ShellCodeProcessor: Processes <shell_code> tags.
 If mcp=true (default), sends command to http://mcp-sandbox:8084/exec_commands (MCP container).
 If mcp=false, executes command locally via execute (local container).
-Supports <user_input rqs="..." ack="..."/> for interactive commands.
-Logs execution details to /app/logs/colloquium_core.log.Functions:
+Supports <user_input rqs="..." ack="..."/> for interactive commands.Functions:
 
 
 process_message(text, timestamp, user_name, rql): Processes messages starting with @agent or containing tags (<command>, <code_file>, <code_patch>, <shell_code>). Dynamically generates tag pattern from processor tags, allowing easy extension with new processors.
@@ -340,11 +369,11 @@ GET /chat/list: Lists chats accessible to the user.
 POST /chat/create: Creates a new chat with optional parent_msg_id.
 POST /chat/delete: Deletes a chat if user has permission.
 GET /chat/get: Retrieves chat history in format {"posts": [...], "status": {...}}, where status indicates replication state (free or busy with actor and elapsed time). Supports wait_changes with dynamic timeout (20s for busy, 150s for free).
-POST /chat/notify_switch: Notifies about chat switching.
+POST /chat/notify_switch: Notifies about chat switching, updates active_chat in sessions table.
 POST /chat/post: Adds a new message, triggers replication.
 POST /chat/edit_post: Edits a message if user has permission.
 POST /chat/delete_post: Deletes a message if user has permission.
-GET /chat/get_stats: Returns chat statistics (chat_id, tokens from ReplicationManager.last_sent_tokens, num_sources_used).
+GET /chat/get_stats: Returns chat statistics (chat_id, tokens, num_sources_used) from llm_usage table.
 GET /chat/get_parent_msg: Returns parent message details for a given post_id.
 GET /chat/logs: Returns last 100 log entries (ERROR or WARNING) from /app/logs/colloquium_core.log.
 
@@ -355,7 +384,7 @@ POST /chat/upload_file: Uploads a file, stores in attached_files as a stored fil
 POST /chat/update_file: Updates a file’s content and name.
 POST /chat/delete_file: Deletes a file (via unlink) if not referenced and user is admin.
 GET /chat/list_files: Lists files, optionally filtered by project_id.
-GET /chat/get_sandwiches_index: Returns file index from sandwiches_index.json (if available).
+GET /chat/file_contents: Retrieves file content by file_id using FileManager.get_file.
 
 /agent/routes/project_routes.py
 Purpose: Manages project operations.Routes:
@@ -392,6 +421,7 @@ setChatId(chatId): Sets the selected chat ID, notifies /api/chat/notify_switch.
 openCreateChatModal(parentMessageId): Opens the create chat modal.
 closeCreateChatModal(): Closes the create chat modal.
 buildChatTree(chats): Builds a hierarchical chat tree based on parent_msg_id.
+fetchChatStats(): Fetches chat statistics via /api/chat/get_stats.
 
 
 
@@ -430,8 +460,15 @@ Shows message history (chatStore.history) with formatted timestamps and file ref
 Supports sending messages with @attach#<file_id> and @attach_dir#<dir_name>.
 Blocks message sending when chatStore.status.status is busy, displaying error "Отправка заблокирована: идёт обработка запроса", while allowing text editing in the input field.
 Messages with newlines (\n) and no special tags (<code_patch>, <shell_code>, <stdout>, <stderr>) are wrapped in <pre class="plain-pre"> with minimal styling (font-family: monospace, white-space: pre-wrap).
+Displays <dialog> for file preview on clicking @attach#<file_id> or @attached_file#<file_id>, fetching content via /chat/file_contents.
 Modals for creating chats, uploading files, and editing posts.
 Polls /api/chat/get every 15 seconds for updates when a chat is selected.
+Formats messages with:
+@attach#<file_id> and @attached_file#<file_id> as clickable links (<span class="file-link">) to open file preview.
+Unresolved @attach#<file_id> as <span class="file-unavailable">Файл <file_id> удалён или недоступен</span>.
+<code_patch>, <shell_code>, <stdout>, <stderr>, <mismatch> in styled <pre> blocks.
+
+
 
 /frontend/rtm/src/components/RightPanel.vue
 Purpose: Manages project selection and file tree display.Features:
@@ -505,7 +542,7 @@ LLM Integration:
 Supports grok (via XAIConnection) and chatgpt (via OpenAIConnection).
 Triggered by @<username>, @all, or #critics_allowed in messages.
 Context limited to 131072 tokens, packed into sandwiches with JSON index.
-LLM responses containing @agent have content before @agent stripped, processed as a command, and the prefix prepended to the processed message for user visibility.
+LLM responses containing @agent have content before @agent stripped, processed as a command, and the prefix prepended to the processed_msg for user visibility.
 
 
 Shell Code Execution:
@@ -519,11 +556,56 @@ Chat Enhancements:
 GET /chat/get returns {"posts": [...], "status": {...}}, where status indicates replication state (free or busy with actor and elapsed time). Dynamic timeout for wait_changes (20s for busy, 150s for free) improves responsiveness.
 Frontend blocks message sending during busy state, enhancing user experience by preventing queue overload.
 Messages with newlines (\n) are displayed in a monospaced font with preserved formatting, improving readability.
+File preview available via clicking @attach#<file_id> or @attached_file#<file_id>, fetching content from /chat/file_contents.
+
+
+
+Recent Changes (2025-07-20)
+
+File Preview:
+
+Added support for viewing file contents in the frontend by clicking @attach#<file_id> or @attached_file#<file_id> in ChatContainer.vue.
+Implemented GET /chat/file_contents in file_routes.py to retrieve file content via FileManager.get_file(file_id)['content'].
+Added <dialog ref="filePreviewModal"> in ChatContainer.vue to display file content in <pre class="file-preview"> with light gray font and vertical scrolling.
+Fixed horizontal scrollbar issue in file preview by setting max-width: 90vw and overflow-x: hidden for .file-preview-modal.
+Removed excessive logging of unresolved @attach#<file_id> in formatMessage, replacing with <span class="file-unavailable">Файл <file_id> удалён или недоступен</span>.
+
+
+LLM Statistics:
+
+Fixed token counting in llm_interactor.py by using usage.prompt_tokens instead of usage.tokens, resolving discrepancy (e.g., 4191 vs. 3870 tokens).
+Introduced llm_usage table in llm_interactor.py via DataTable with fields ts, model, sent_tokens, used_tokens, chat_id for persistent LLM usage tracking.
+Updated /chat/get_stats in chat_routes.py to fetch statistics from llm_usage using select_row for consistency, replacing chat_stats dictionary.
+Moved statistics collection from ReplicationManager to LLMInteractor to reduce module overload.
+
+
+Recursive Dialogue:
+
+Fixed issue where recursive dialogue stopped after one LLM actor by removing break in _recursive_replicate in replication.py, allowing all LLM actors (e.g., grok3, grok4) to respond to @all.
+Verified via logs: successful dialogue between grok3 and grok4 for chat_id=1 at rql=1 and rql=2.
+
+
+Code Optimization:
+
+Removed redundant llm_usage table creation in db.py, as DataTable in llm_interactor.py handles table creation and updates.
+Renamed handle_exception to log_and_raise and moved it to basic_logger.py as a method of BasicLogger for better specificity and integration with logging.
+Updated chat_routes.py, file_routes.py, llm_interactor.py, and replication.py to use log.logger.log_and_raise for consistent exception handling.
 
 
 
 Testing
 
-API: curl -H "Cookie: session_id=<your_session_id>" "http://vps.vpn:8008/api/chat/get_stats?chat_id=1".
-Database: sqlite3 /app/data/multichat.db "SELECT * FROM projects;".
-Unit tests: docker exec colloquium-core python -m unittest tests.test_replication -v.
+API:
+curl -H "Cookie: session_id=<your_session_id>" "http://vps.vpn:8008/api/chat/get_stats?chat_id=1".
+curl -H "Cookie: session_id=<your_session_id>" "http://vps.vpn:8008/api/chat/file_contents?file_id=1".
+
+
+Database:
+sqlite3 /app/data/multichat.db "SELECT * FROM llm_usage WHERE chat_id=1 ORDER BY ts DESC LIMIT 1".
+sqlite3 /app/data/multichat.db "SELECT * FROM posts WHERE chat_id=1".
+
+
+Unit tests:
+docker exec colloquium-core python -m unittest tests.test_replication -v.
+
+

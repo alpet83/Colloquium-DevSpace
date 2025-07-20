@@ -1,4 +1,4 @@
-# /app/agent/managers/posts.py, updated 2025-07-19 17:45 EEST
+# /app/agent/managers/posts.py, updated 2025-07-20 14:30 EEST
 import time
 import re
 import asyncio
@@ -26,6 +26,15 @@ class PostManager:
                 "FOREIGN KEY (user_id) REFERENCES users(id)"
             ]
         )
+        self.users_table = DataTable(
+            table_name="users",
+            template=[
+                "user_id INTEGER PRIMARY KEY",
+                "user_name TEXT NOT NULL UNIQUE",
+                "llm_class TEXT",
+                "llm_token TEXT"
+            ]
+        )
 
     def add_change(self, chat_id, post_id, action):
         """Добавляет post_id в changes_history. Для удалений использует -post_id."""
@@ -51,8 +60,10 @@ class PostManager:
     def add_message(self, chat_id, user_id, message, rql=None):
         try:
             timestamp = int(time.time())
-            user_row = self.db.fetch_one('SELECT llm_class, user_name FROM users WHERE user_id = :user_id',
-                                         {'user_id': user_id})
+            user_row = self.users_table.select_row(
+                conditions={'user_id': user_id},
+                columns=['llm_class', 'user_name']
+            )
             is_llm = user_row and user_row[0] is not None
             user_name = user_row[1] if user_row else 'unknown'
             result = None
@@ -86,7 +97,12 @@ class PostManager:
                 'timestamp': timestamp,
                 'rql': rql
             })
-            post_id = self.db.fetch_one('SELECT last_insert_rowid()')[0]
+            post_id_row = self.posts_table.select_row(
+                columns=['last_insert_rowid()']
+            )
+            post_id = post_id_row[0] if post_id_row else None
+            if post_id is None:
+                raise ValueError("Failed to retrieve last_insert_rowid()")
             self.add_change(chat_id, post_id, "add")
             log.debug("Добавлено сообщение post_id=%d, chat_id=%d, user_id=%d, rql=%s, message=%s",
                       post_id, chat_id, user_id, str(rql), processed_message[:50])
@@ -99,7 +115,12 @@ class PostManager:
                     'timestamp': timestamp + 1,
                     'rql': rql
                 })
-                agent_post_id = self.db.fetch_one('SELECT last_insert_rowid()')[0]
+                agent_post_id_row = self.posts_table.select_row(
+                    columns=['last_insert_rowid()']
+                )
+                agent_post_id = agent_post_id_row[0] if agent_post_id_row else None
+                if agent_post_id is None:
+                    raise ValueError("Failed to retrieve last_insert_rowid() for agent message")
                 self.add_change(chat_id, agent_post_id, "add")
                 log.debug("Добавлен ответ агента post_id=%d, chat_id=%d, rql=%s, message=%s",
                           agent_post_id, chat_id, str(rql), agent_message[:50])
@@ -121,7 +142,13 @@ class PostManager:
                         'timestamp': int(time.time()),
                         'rql': rql
                     })
-                    self.add_change(chat_id, self.db.fetch_one('SELECT last_insert_rowid()')[0], "add")
+                    error_post_id_row = self.posts_table.select_row(
+                        columns=['last_insert_rowid()']
+                    )
+                    error_post_id = error_post_id_row[0] if error_post_id_row else None
+                    if error_post_id is None:
+                        raise ValueError("Failed to retrieve last_insert_rowid() for error message")
+                    self.add_change(chat_id, error_post_id, "add")
                     log.debug("Added error message to chat_id=%d for user_id=2", chat_id)
             else:
                 log.debug("Skipping replication for post_id=%d, chat_id=%d, user_id=%d, is_llm=%s, starts_with_@agent=%s",
@@ -140,7 +167,10 @@ class PostManager:
         except Exception as e:
             log.excpt("Ошибка репликации для chat_id=%d, post_id=%d: %s",
                       chat_id, post_id, str(e), exc_info=(type(e), e, e.__traceback__))
-            user_row = self.db.fetch_one('SELECT user_name FROM users WHERE user_id = :user_id', {'user_id': 2})
+            user_row = self.users_table.select_row(
+                conditions={'user_id': 2},
+                columns=['user_name']
+            )
             user_name = user_row[0] if user_row else 'agent'
             self.posts_table.insert_into({
                 'chat_id': chat_id,
@@ -149,7 +179,13 @@ class PostManager:
                 'timestamp': int(time.time()),
                 'rql': None
             })
-            self.add_change(chat_id, self.db.fetch_one('SELECT last_insert_rowid()')[0], "add")
+            error_post_id_row = self.posts_table.select_row(
+                columns=['last_insert_rowid()']
+            )
+            error_post_id = error_post_id_row[0] if error_post_id_row else None
+            if error_post_id is None:
+                raise ValueError("Failed to retrieve last_insert_rowid() for replication error")
+            self.add_change(chat_id, error_post_id, "add")
             log.debug("Added replication error message to chat_id=%d for user_id=2", chat_id)
 
     def get_history(self, chat_id, only_changes=False):
@@ -214,7 +250,7 @@ class PostManager:
                         "rql": post[6],
                         "file_names": file_names,
                         "user_name": post[5],
-                        "action": action
+                        "action": "add"
                     })
             if history and only_changes:
                 self.clear_changes(chat_id)
@@ -229,8 +265,7 @@ class PostManager:
     def get_post(self, post_id):
         row = self.posts_table.select_from(
             conditions={'id': post_id},
-            columns=['id', 'chat_id', 'user_id', 'message', 'timestamp', 'rql'],
-            limit=1
+            columns=['id', 'chat_id', 'user_id', 'message', 'timestamp', 'rql']
         )
         return {
             'id': row[0][0],
@@ -244,9 +279,8 @@ class PostManager:
     def edit_post(self, post_id, message, user_id):
         try:
             post = self.posts_table.select_from(
-                conditions={'id': post_id},
                 columns=['user_id', 'chat_id', 'rql'],
-                limit=1
+                conditions={'id': post_id}
             )
             if not post:
                 log.info("Сообщение post_id=%d не найдено", post_id)
@@ -261,7 +295,13 @@ class PostManager:
                     'timestamp': int(time.time()),
                     'rql': rql
                 })
-                self.add_change(chat_id, self.db.fetch_one('SELECT last_insert_rowid()')[0], "add")
+                error_post_id_row = self.posts_table.select_row(
+                    columns=['last_insert_rowid()']
+                )
+                error_post_id = error_post_id_row[0] if error_post_id_row else None
+                if error_post_id is None:
+                    raise ValueError("Failed to retrieve last_insert_rowid() for permission error")
+                self.add_change(chat_id, error_post_id, "add")
                 log.debug("Added permission error message to chat_id=%d for user_id=2", chat_id)
                 return {"error": "Permission denied"}
             self.posts_table.update(
@@ -279,9 +319,8 @@ class PostManager:
     def delete_post(self, post_id, user_id):
         try:
             post = self.posts_table.select_from(
-                conditions={'id': post_id},
                 columns=['user_id', 'chat_id', 'rql'],
-                limit=1
+                conditions={'id': post_id}
             )
             if not post:
                 log.info("Сообщение post_id=%d не найдено", post_id)
