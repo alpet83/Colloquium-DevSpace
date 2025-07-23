@@ -1,4 +1,4 @@
-# /app/agent/managers/posts.py, updated 2025-07-20 14:30 EEST
+# /app/agent/managers/posts.py, updated 2025-07-22 11:24 EEST
 import time
 import re
 import asyncio
@@ -57,6 +57,40 @@ class PostManager:
             log.debug("Cleared changes for chat_id=%d", chat_id)
             self.changes_history[chat_id] = []
 
+    def get_quotes(self, history):
+        """Извлекает все quote_id из history и возвращает словарь цитат из quotes_table."""
+        try:
+            quote_ids = set()
+            for post in history:
+                if post["message"]:
+                    matches = re.findall(r'@quote#(\d+)', post["message"])
+                    quote_ids.update(int(qid) for qid in matches)
+            quotes = {}
+            for quote_id in quote_ids:
+                row = globals.post_processor.quotes_table.select_from(
+                    columns=['quote_id', 'chat_id', 'user_id', 'content', 'timestamp'],
+                    conditions={'quote_id': quote_id}
+                )
+                if row:
+                    user_row = self.users_table.select_row(
+                        conditions={'user_id': row[0][2]},
+                        columns=['user_name']
+                    )
+                    user_name = user_row[0] if user_row else 'unknown'
+                    quotes[quote_id] = {
+                        "id": row[0][0],
+                        "chat_id": row[0][1],
+                        "user_id": row[0][2],
+                        "message": row[0][3],  # Используем content как message
+                        "timestamp": row[0][4],
+                        "user_name": user_name
+                    }
+            log.debug("Extracted quotes for chat_id=%d: %s", history[0]["chat_id"] if history else 0, str(quotes))
+            return quotes
+        except Exception as e:
+            log.excpt("Ошибка извлечения цитат: %s", str(e), exc_info=(type(e), e, e.__traceback__))
+            return {}
+
     def add_message(self, chat_id, user_id, message, rql=None):
         try:
             timestamp = int(time.time())
@@ -68,6 +102,7 @@ class PostManager:
             user_name = user_row[1] if user_row else 'unknown'
             result = None
             agent_message = None
+            has_code_file = False
             message = message.strip()
             if not is_llm:
                 try:
@@ -209,7 +244,6 @@ class PostManager:
                         "message": None,
                         "timestamp": int(time.time()),
                         "rql": None,
-                        "file_names": [],
                         "user_name": None,
                         "action": "delete"
                     })
@@ -231,16 +265,6 @@ class PostManager:
                 for post in posts:
                     action = "delete" if post[0] in deleted_ids else "add"
                     message = None if action == "delete" else post[3]
-                    file_ids = re.findall(r'@attached_file#(\d+)', message or "")
-                    file_names = []
-                    for file_id in file_ids:
-                        file_data = self.db.fetch_one(
-                            'SELECT file_name, ts FROM attached_files WHERE id = :file_id',
-                            {'file_id': int(file_id)}
-                        )
-                        if file_data:
-                            file_names.append({"file_id": int(file_id), "file_name": file_data[0].lstrip('@'),
-                                               "ts": file_data[1]})
                     history.append({
                         "id": post[0],
                         "chat_id": post[1],
@@ -248,9 +272,8 @@ class PostManager:
                         "message": message,
                         "timestamp": post[4],
                         "rql": post[6],
-                        "file_names": file_names,
                         "user_name": post[5],
-                        "action": "add"
+                        "action": action
                     })
             if history and only_changes:
                 self.clear_changes(chat_id)

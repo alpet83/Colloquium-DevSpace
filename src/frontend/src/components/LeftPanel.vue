@@ -1,3 +1,4 @@
+<!-- /frontend/rtm/src/components/LeftPanel.vue, updated 2025-07-22 17:30 EEST -->
 <template>
   <div class="left-panel" :class="{ collapsed: isCollapsed }">
     <button class="toggle-btn" @click="toggleCollapse">
@@ -25,6 +26,7 @@
 <script>
 import { defineComponent, ref, watch } from 'vue'
 import { useChatStore } from '../stores/chat'
+import { log_msg } from '../utils/debugging'
 import ChatTree from './ChatTree.vue'
 
 export default defineComponent({
@@ -36,25 +38,25 @@ export default defineComponent({
     return { chatStore, isCollapsed }
   },
   mounted() {
-    console.log('LeftPanel mounted, chats:', JSON.stringify(this.chatStore.chats, null, 2))
+    log_msg('UI', 'LeftPanel mounted, chats:', JSON.stringify(this.chatStore.chats, null, 2))
     this.chatStore.fetchChats()
     this.chatStore.startPolling()
   },
   beforeUnmount() {
     this.chatStore.stopPolling()
-    console.log('LeftPanel unmounted, stopped polling')
+    log_msg('UI', 'LeftPanel unmounted, stopped polling')
   },
   watch: {
     'chatStore.chats': {
       handler(newChats) {
-        console.log('Chats updated in LeftPanel:', JSON.stringify(newChats, null, 2))
+        log_msg('CHAT', 'Chats updated in LeftPanel:', JSON.stringify(newChats, null, 2))
       },
       immediate: true,
       deep: true
     },
     'chatStore.selectedChatId': {
       handler(newChatId) {
-        console.log('LeftPanel selectedChatId updated:', newChatId)
+        log_msg('CHAT', 'LeftPanel selectedChatId updated:', newChatId)
         if (newChatId) {
           this.chatStore.fetchChatStats()
         }
@@ -64,23 +66,26 @@ export default defineComponent({
   },
   methods: {
     selectChat(chatId) {
-      console.log('Selecting chat:', chatId)
+      log_msg('ACTION', 'Selecting chat:', chatId)
       this.chatStore.setChatId(chatId)
     },
     async createChat() {
       if (this.chatStore.newChatDescription.trim()) {
+        log_msg('ACTION', 'Creating chat with description:', this.chatStore.newChatDescription)
         await this.chatStore.createChat(this.chatStore.newChatDescription)
       }
     },
     async deleteChat() {
+      log_msg('ACTION', 'Deleting chat:', this.chatStore.selectedChatId)
       await this.chatStore.deleteChat()
     },
     openCreateChatModal() {
+      log_msg('ACTION', 'Opening create chat modal')
       this.chatStore.openCreateChatModal(null)
     },
     toggleCollapse() {
       this.isCollapsed = !this.isCollapsed
-      console.log('Left panel collapsed:', this.isCollapsed)
+      log_msg('UI', 'Left panel collapsed:', this.isCollapsed)
     }
   }
 })

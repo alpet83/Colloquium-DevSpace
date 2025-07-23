@@ -55,7 +55,6 @@ def check_session(request: Request) -> int:
         log.info(f"Неверный session_id для IP={request.client.host}")
         raise HTTPException(status_code=401, detail="Invalid session")
     uid = row[0]
-    log.debug('Session %s: user_id %s', session_id, str(uid))
     return uid
 
 
@@ -70,3 +69,8 @@ def handle_exception(message: str, e: Exception, _raise: bool = True):
         log.excpt(f"Ошибка сервера: {message}: {str(e)}", e=e)
         if _raise:
             raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+
+def unitext(content):
+    if isinstance(content, bytes):
+        return content.decode('utf-8', errors='replace')
+    return content

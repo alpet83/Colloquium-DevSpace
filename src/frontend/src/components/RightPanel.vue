@@ -1,4 +1,4 @@
-<!-- /frontend/rtm/src/components/RightPanel.vue, updated 2025-07-17 22:35 EEST -->
+<!-- /frontend/rtm/src/components/RightPanel.vue, updated 2025-07-22 17:30 EEST -->
 <template>
   <div class="right-panel" :class="{ collapsed: isCollapsed }">
     <button class="toggle-btn" @click="toggleCollapse">
@@ -65,6 +65,7 @@
 import { defineComponent, inject, computed, ref } from 'vue'
 import { useFileStore } from '../stores/files'
 import { useAuthStore } from '../stores/auth'
+import { log_msg, log_error } from '../utils/debugging'
 import FileManager from './FileManager.vue'
 
 export default defineComponent({
@@ -105,7 +106,7 @@ export default defineComponent({
   },
   computed: {
     filteredFiles() {
-      console.log('Computing filteredFiles, fileStore.files:', JSON.stringify(this.fileStore.files, null, 2), 'selectedProject:', this.selectedProject)
+      log_msg('FILE', 'Computing filteredFiles, fileStore.files:', JSON.stringify(this.fileStore.files, null, 2), 'selectedProject:', this.selectedProject)
       if (!this.selectedProject) {
         return this.fileStore.files.map(file => ({
           ...file,
@@ -129,18 +130,19 @@ export default defineComponent({
   methods: {
     async fetchProjects() {
       try {
+        log_msg('FILE', 'Fetching projects:', this.fileStore.apiUrl + '/project/list')
         const res = await fetch(this.fileStore.apiUrl + '/project/list', {
           method: 'GET',
           credentials: 'include'
         })
         if (res.ok) {
           this.projects = await res.json()
-          console.log('Fetched projects:', JSON.stringify(this.projects, null, 2))
+          log_msg('FILE', 'Fetched projects:', JSON.stringify(this.projects, null, 2))
         } else {
-          console.error('Error fetching projects:', await res.json())
+          log_error(this, new Error('Failed to fetch projects'), 'fetch projects')
         }
       } catch (e) {
-        console.error('Error fetching projects:', e)
+        log_error(this, e, 'fetch projects')
       }
     },
     async loadProjectFiles() {
@@ -148,25 +150,25 @@ export default defineComponent({
         const url = this.selectedProject
           ? `${this.fileStore.apiUrl}/chat/list_files?project_id=${this.selectedProject}`
           : `${this.fileStore.apiUrl}/chat/list_files`
-        console.log('Loading files from:', url)
+        log_msg('FILE', 'Loading files from:', url)
         const res = await fetch(url, {
           method: 'GET',
           credentials: 'include'
         })
         if (res.ok) {
           this.fileStore.files = await res.json()
-          console.log('Loaded files:', JSON.stringify(this.fileStore.files, null, 2))
+          log_msg('FILE', 'Loaded files:', JSON.stringify(this.fileStore.files, null, 2))
         } else {
-          console.error('Error loading files:', await res.json())
+          log_error(this, new Error('Failed to load files'), 'load files')
         }
       } catch (e) {
-        console.error('Error loading files:', e)
+        log_error(this, e, 'load files')
       }
     },
     async selectProject() {
       try {
         const project_id = this.selectedProject ? parseInt(this.selectedProject) : null
-        console.log('Selecting project:', this.fileStore.apiUrl + '/project/select', 'ProjectId:', project_id)
+        log_msg('ACTION', 'Selecting project:', this.fileStore.apiUrl + '/project/select', 'ProjectId:', project_id)
         await fetch(this.fileStore.apiUrl + '/project/select', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -175,11 +177,12 @@ export default defineComponent({
         })
         await this.loadProjectFiles()
       } catch (e) {
-        console.error('Error selecting project:', e)
+        log_error(this, e, 'select project')
       }
     },
     async loadSearchSettings() {
       try {
+        log_msg('UI', 'Loading search settings:', this.fileStore.apiUrl + '/user/settings')
         const res = await fetch(this.fileStore.apiUrl + '/user/settings', {
           method: 'GET',
           credentials: 'include'
@@ -191,18 +194,19 @@ export default defineComponent({
             sources: Array.isArray(settings.sources) ? settings.sources : ['web', 'x', 'news'],
             max_search_results: settings.max_search_results || 20
           }
-          console.log('Loaded search settings:', this.searchSettings)
+          log_msg('UI', 'Loaded search settings:', this.searchSettings)
         } else {
-          console.error('Error loading search settings:', await res.json())
+          log_error(this, new Error('Failed to load search settings'), 'load search settings')
           this.searchSettings = { mode: 'off', sources: ['web', 'x', 'news'], max_search_results: 20 }
         }
       } catch (e) {
-        console.error('Error loading search settings:', e)
+        log_error(this, e, 'load search settings')
         this.searchSettings = { mode: 'off', sources: ['web', 'x', 'news'], max_search_results: 20 }
       }
     },
     async saveSearchSettings() {
       try {
+        log_msg('ACTION', 'Saving search settings:', this.searchSettings)
         const res = await fetch(this.fileStore.apiUrl + '/user/settings', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -210,23 +214,26 @@ export default defineComponent({
           credentials: 'include'
         })
         if (res.ok) {
-          console.log('Saved search settings:', this.searchSettings)
+          log_msg('UI', 'Saved search settings:', this.searchSettings)
         } else {
-          console.error('Error saving search settings:', await res.json())
+          log_error(this, new Error('Failed to save search settings'), 'save search settings')
         }
       } catch (e) {
-        console.error('Error saving search settings:', e)
+        log_error(this, e, 'save search settings')
       }
     },
     openCreateProjectModal() {
       this.newProject = { project_name: '', description: '', local_git: '', public_git: '', dependencies: '' }
+      log_msg('ACTION', 'Opening create project modal')
       this.$refs.createProjectModal.showModal()
     },
     closeCreateProjectModal() {
+      log_msg('ACTION', 'Closing create project modal')
       this.$refs.createProjectModal.close()
     },
     async createProject() {
       try {
+        log_msg('ACTION', 'Creating project:', this.newProject)
         const res = await fetch(this.fileStore.apiUrl + '/project/create', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -239,25 +246,29 @@ export default defineComponent({
           await this.fetchProjects()
           await this.loadProjectFiles()
           this.closeCreateProjectModal()
+          log_msg('UI', 'Created project:', data)
         } else {
-          console.error('Error creating project:', await res.json())
+          log_error(this, new Error('Failed to create project'), 'create project')
         }
       } catch (e) {
-        console.error('Error creating project:', e)
+        log_error(this, e, 'create project')
       }
     },
     openEditProjectModal() {
       const project = this.projects.find(p => p.id === parseInt(this.selectedProject))
       if (project) {
         this.editProject = { ...project }
+        log_msg('ACTION', 'Opening edit project modal')
         this.$refs.editProjectModal.showModal()
       }
     },
     closeEditProjectModal() {
+      log_msg('ACTION', 'Closing edit project modal')
       this.$refs.editProjectModal.close()
     },
     async updateProject() {
       try {
+        log_msg('ACTION', 'Updating project:', this.editProject)
         const res = await fetch(this.fileStore.apiUrl + '/project/update', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -268,16 +279,17 @@ export default defineComponent({
           await this.fetchProjects()
           await this.loadProjectFiles()
           this.closeEditProjectModal()
+          log_msg('UI', 'Updated project:', this.editProject)
         } else {
-          console.error('Error updating project:', await res.json())
+          log_error(this, new Error('Failed to update project'), 'update project')
         }
       } catch (e) {
-        console.error('Error updating project:', e)
+        log_error(this, e, 'update project')
       }
     },
     toggleCollapse() {
       this.isCollapsed = !this.isCollapsed
-      console.log('Right panel collapsed:', this.isCollapsed)
+      log_msg('UI', 'Right panel collapsed:', this.isCollapsed)
     }
   }
 })
@@ -382,7 +394,7 @@ export default defineComponent({
 .search-settings label {
   display: block;
   margin-top: 10px;
-  color: #ccccaa; /* Нежный жёлтый для тёмной темы */
+  color: #ccccaa;
 }
 @media (prefers-color-scheme: light) {
   .search-settings h3, .search-settings label {
@@ -395,22 +407,22 @@ export default defineComponent({
 }
 .search-settings .sources {
   width: 100%;
-  color: #cccc01; /* Нежный жёлтый для тёмной темы */
+  color: #cccc01;
 }
 .search-settings .sources td {
-  width: 33.33%; /* Равномерное распределение столбцов */
-  text-align: center; /* Центрирование содержимого */
+  width: 33.33%;
+  text-align: center;
   padding: 5px;
 }
 .search-settings .sources input[type="checkbox"] {
   margin: 0 5px 0 0;
-  width: auto; /* Отменяем calc(100% - 30px) для чекбоксов */
+  width: auto;
   vertical-align: middle;
 }
 .search-settings .sources label {
   margin: 0;
-  color: #cccccc; /* Цвет меток в тёмной теме */
-  display: inline; /* Для корректного выравнивания с чекбоксом */
+  color: #cccccc;
+  display: inline;
 }
 @media (prefers-color-scheme: light) {
   .search-settings .sources {

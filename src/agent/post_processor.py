@@ -33,7 +33,7 @@ class PostProcessor:
 
         # Декодируем response, если он байтовый
         if isinstance(response, bytes):
-            response = response.decode('utf-8', errors='replace')
+            response = globals.unitext(response)
             log.warn("Response был байтовым, декодирован в строку: %s", response[:50])
         elif not isinstance(response, str):
             log.error("Неверный тип ответа: %s", type(response))
@@ -94,7 +94,7 @@ class PostProcessor:
                 limit=1
             )
             if quote:
-                return "[@quote#%d](%s...)" % (quote_id, quote[0][3][:50])
+                return "@quote#%d" % quote_id
             return match.group(0)
 
         processed_response = re.sub(r'@quote#(\d+)', replace_quote_ref, processed_response)

@@ -5,7 +5,6 @@ from pathlib import Path
 from llm_interactor import LLMInteractor
 from managers.db import Database, DataTable
 from chat_actor import ChatActor
-from lib.sandwich_pack import SandwichPack
 import globals
 
 log = globals.get_logger("replication")
@@ -23,7 +22,6 @@ class ReplicationManager(LLMInteractor):
             log.debug("Режим отладки репликации включён")
         else:
             log.debug("Репликация активирована")
-        SandwichPack.load_block_classes()
 
     def _load_actors(self):
         actors = []
@@ -35,66 +33,6 @@ class ReplicationManager(LLMInteractor):
             actors.append(actor)
         return actors
 
-    def _write_context_stats(self, content_blocks: list, llm_name: str, chat_id: int, index_json: str):
-        """Записывает статистику по блокам сэндвича в файл /app/logs/{$llm_name}_context.stats."""
-        stats_file = Path(f"/app/logs/{llm_name}_context.stats")
-        stats = []
-
-        pre_prompt_tokens = len(self.pre_prompt) // 4 if self.pre_prompt else 0
-        stats.append({
-            "block_type": ":pre_prompt",
-            "block_id": "N/A",
-            "file_name": globals.PRE_PROMPT_PATH,
-            "tokens": pre_prompt_tokens
-        })
-
-        index_tokens = len(index_json) // 4 if index_json else 0
-        stats.append({
-            "block_type": ":index",
-            "block_id": "N/A",
-            "file_name": "JSON index",
-            "tokens": index_tokens
-        })
-
-        unique_file_names = set()
-        for block in content_blocks:
-            block_text = block.to_sandwich_block()
-            token_count = len(block_text) // 4 if block_text else 0
-            block_id = block.post_id or block.file_id or getattr(block, 'quote_id', None) or "N/A"
-            file_name = block.file_name or "N/A"
-            if file_name != "N/A" and file_name in unique_file_names:
-                log.debug("Пропущен дубликат файла в статистике: file_name=%s, block_id=%s", file_name, block_id)
-                continue
-            unique_file_names.add(file_name)
-            stats.append({
-                "block_type": block.content_type,
-                "block_id": block_id,
-                "file_name": file_name,
-                "tokens": token_count
-            })
-
-        stats.sort(key=lambda x: x["tokens"], reverse=True)
-
-        accumulated_tokens = 0
-        for stat in stats:
-            accumulated_tokens += stat["tokens"]
-            stat["accumulated"] = accumulated_tokens
-
-        header = f"{'Block Type':<15} {'Block ID':<10} {'File Name':<50} {'Tokens':<10} {'Accumulated':<10}\n"
-        separator = "-" * 95 + "\n"
-        rows = [
-            f"{s['block_type']:<15} {s['block_id']:<10} {s['file_name']:<50} {s['tokens']:<10} {s['accumulated']:<10}\n"
-            for s in stats]
-        try:
-            with open(stats_file, "w", encoding="utf-8") as f:
-                f.write(header)
-                f.write(separator)
-                f.writelines(rows)
-            log.info("Статистика контекста записана в %s для chat_id=%d, блоков=%d",
-                     str(stats_file), chat_id, len(stats))
-        except Exception as e:
-            globals.handle_exception(f"Не удалось записать статистику контекста в {stats_file}", e)
-            globals.post_manager.add_message(chat_id, 2, f"Не удалось записать статистику контекста для {llm_name}: {str(e)}")
 
     async def _recursive_replicate(self, content_blocks: list, users: list, chat_id: int, actor: ChatActor,
                                   exclude_source_id=None, rql: int = 1, max_rql: int = 5):
@@ -109,10 +47,8 @@ class ReplicationManager(LLMInteractor):
         log.debug("Начался рекурсивный диалог для actor_id=%d (%s), chat_id=%d, rql=%d",
                   actor.user_id, actor.user_name, chat_id, rql)
         try:
-            response = await self.interact(content_blocks, users, chat_id, actor, self.debug_mode, rql)
-            if response:
-                original_response = response.get('text', '')
-
+            original_response = await self.interact(content_blocks, users, chat_id, actor, self.debug_mode, rql)
+            if original_response:
                 # Вырезаем всё до @agent, если присутствует
                 prefix = ''
                 agent_command = original_response
@@ -246,7 +182,7 @@ class ReplicationManager(LLMInteractor):
             {'chat_id': chat_id}
         )
         if latest_post and latest_post[0] == 2 and "Permission denied" in latest_post[1]:
-            if not (re.search(r'@grok|@all', latest_post[1], re.IGNORECASE)):
+            if not (re.search(r'@grok\S*|@all', latest_post[1], re.IGNORECASE)):
                 log.debug("Пропуск диалога для chat_id=%d из-за ошибки агента без @grok или @all: %s",
                           chat_id, latest_post[1][:50])
                 return
@@ -286,7 +222,6 @@ class ReplicationManager(LLMInteractor):
                           actor.user_name, chat_id)
                 await self._recursive_replicate(new_content_blocks, users, chat_id, actor, exclude_source_id, 1)
                 processed_actors.add(actor.user_id)
-                self._write_context_stats(new_content_blocks, actor.user_name, chat_id, "")
             else:
                 log.debug("Пропуск actor_id=%d: нет триггера для ответа", actor.user_id)
 

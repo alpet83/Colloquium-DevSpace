@@ -1,3 +1,4 @@
+<!-- /frontend/rtm/src/components/ChatTree.vue, updated 2025-07-22 17:30 EEST -->
 <template>
   <ul>
     <li v-for="chat in chats" :key="chat.chat_id" :style="{ 'margin-left': `${level * 20}px` }" :class="{ 'selected': chat.chat_id === selectedChatId }">
@@ -12,6 +13,7 @@
 <script>
 import { defineComponent } from 'vue'
 import { useChatStore } from '@/stores/chat'
+import { log_msg } from '@/utils/debugging'
 
 export default defineComponent({
   name: 'ChatTree',
@@ -34,16 +36,16 @@ export default defineComponent({
     return { chatStore }
   },
   mounted() {
-    console.log('ChatTree mounted, chats:', JSON.stringify(this.chats, null, 2), 'level:', this.level, 'selectedChatId:', this.selectedChatId)
+    log_msg('UI', 'ChatTree mounted, chats:', JSON.stringify(this.chats, null, 2), 'level:', this.level, 'selectedChatId:', this.selectedChatId)
   },
   watch: {
     selectedChatId(newId) {
-      console.log('ChatTree selectedChatId updated:', newId)
+      log_msg('CHAT', 'ChatTree selectedChatId updated:', newId)
     }
   },
   methods: {
     selectChat(chatId) {
-      console.log('ChatTree selectChat:', chatId)
+      log_msg('ACTION', 'ChatTree selectChat:', chatId)
       this.chatStore.setChatId(chatId)
       this.$emit('select-chat', chatId)
     }

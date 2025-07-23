@@ -1,4 +1,4 @@
-# /agent/routes/chat_routes.py, updated 2025-07-20 23:59 EEST
+# /app/agent/routes/chat_routes.py, updated 2025-07-22 10:35 EEST
 from fastapi import APIRouter, Request, HTTPException
 import asyncio
 import time
@@ -70,16 +70,18 @@ async def get_chat(request: Request, chat_id: int, wait_changes: int = 0):
                 active = g.chat_manager.active_chat(user_id)
                 history = g.post_manager.get_history(chat_id, wait_changes == 1)
                 if history != {"chat_history": "no changes"}:
-                    return {"posts": history, "status": status}
+                    quotes = g.post_manager.get_quotes(history)
+                    return {"posts": history, "chat_id": chat_id, "quotes": quotes, "status": status}
                 if active != chat_id:
-                    log.debug(f"Chat switch detected for user_id=%d, chat_id=%d, active=%d", user_id, chat_id, active)
-                    return {"posts": [{"chat_history": "chat switch"}], "status": status}
+                    log.debug("Chat switch detected for user_id=%d, chat_id=%d, active=%d", user_id, chat_id, active)
+                    return {"chat_id": active, "posts": [{"chat_history": "chat switch"}], "status": status}
                 await asyncio.sleep(0.1)
-            return {"posts": [{"chat_history": "no changes"}], "status": status}
+            return {"chat_id": chat_id, "posts": [{"chat_history": "no changes"}], "quotes": {}, "status": status}
         else:
-            log.debug(f"Статус обработки для user_id={user_id}, chat_id={chat_id}: {status}")
+            log.debug("Статус обработки для user_id=%d, chat_id=%d: %s", user_id, chat_id, status)
             history = g.post_manager.get_history(chat_id, only_changes=False)
-            return {"posts": history, "status": status}
+            quotes = g.post_manager.get_quotes(history)
+            return {"chat_id": chat_id, "posts": history, "quotes": quotes, "status": status}
     except Exception as e:
         handle_exception("Ошибка в GET /chat/get", e)
         raise
@@ -121,7 +123,7 @@ async def post_message(request: Request):
             log.info("Неверные параметры chat_id=%s или message для IP=%s", str(chat_id) if chat_id is not None else "None", request.client.host)
             raise HTTPException(status_code=400, detail="Missing chat_id or message")
         result = g.post_manager.add_message(chat_id, user_id, message)
-        log.debug("Добавлено сообщение для chat_id=%d, user_id=%d", chat_id, user_id)
+        log.debug("Добавлено сообщение для chat_id=%d, user_id=%d: %s", chat_id, user_id, str(result))
         return result
     except Exception as e:
         handle_exception("Ошибка в POST /chat/post", e)
@@ -175,7 +177,7 @@ async def get_chat_stats(request: Request, chat_id: int):
             log.info("Чат chat_id=%d не найден для user_id=%d", chat_id, user_id)
             raise HTTPException(status_code=404, detail="Chat not found")
         stats_row = g.replication_manager.llm_usage_table.select_row(
-            columns=['sent_tokens', 'sources_used'],
+            columns=['used_tokens', 'sources_used'],
             conditions={'chat_id': chat_id},
             order_by='ts DESC'
         )
@@ -198,7 +200,7 @@ async def get_parent_msg(request: Request, post_id: int):
         ps_tab = g.post_manager.posts_table
         msg = ps_tab.select_row(
             columns=['id', 'chat_id', 'user_id', 'message', 'timestamp'],
-            conditions = {'id': post_id}
+            conditions={'id': post_id}
         )
         if not msg:
             log.info("Сообщение post_id=%d не найден для user_id=%d", post_id, user_id)

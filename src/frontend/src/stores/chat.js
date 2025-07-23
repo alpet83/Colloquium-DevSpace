@@ -1,11 +1,13 @@
-// /frontend/rtm/src/stores/chat.js, updated 2025-07-20 22:30 EEST
+// /frontend/rtm/src/stores/chat.js, updated 2025-07-22 17:15 EEST
 import { defineStore } from 'pinia'
+import { log_msg, log_error } from '../utils/debugging'
 
 export const useChatStore = defineStore('chat', {
   state: () => ({
     chats: [],
     selectedChatId: null,
-    history: [],
+    history: {},
+    quotes: {},
     newChatDescription: '',
     newChatParentMessageId: null,
     chatError: '',
@@ -14,42 +16,43 @@ export const useChatStore = defineStore('chat', {
     waitChanges: false,
     need_full_history: false,
     stats: { tokens: null, num_sources_used: null },
-    status: { status: 'free' },
+    status: { status: 'free', actor: null, elapsed: 0 },
     pollingInterval: null,
-    isPolling: false
+    isPolling: false,
+    awaited_to_del: []
   }),
   actions: {
     async fetchChats() {
       try {
-        console.log('Fetching chats:', this.apiUrl + '/chat/list', 'Cookies:', document.cookie)
+        log_msg('CHAT', 'Fetching chats:', this.apiUrl + '/chat/list')
         const res = await fetch(this.apiUrl + '/chat/list', {
           method: 'GET',
           credentials: 'include'
         })
         if (res.status === 500 || res.status === 502) {
-          console.error('Server error:', res.status)
+          log_error(null, new Error(`Server error: ${res.status}`), 'fetch chats')
           this.backendError = true
           return
         }
         const data = await res.json()
         if (res.ok && !data.error) {
           this.chats = await this.buildChatTree(data)
-          console.log('Fetched chats:', JSON.stringify(this.chats, null, 2))
+          log_msg('CHAT', 'Fetched chats:', JSON.stringify(this.chats, null, 2))
           const activeChat = this.chats.find(chat => chat.active)
           if (activeChat && this.selectedChatId !== activeChat.chat_id) {
             this.selectedChatId = activeChat.chat_id
             this.need_full_history = true
-            console.log('Selected active chat:', activeChat.chat_id)
+            log_msg('CHAT', 'Selected active chat:', activeChat.chat_id)
             await this.fetchHistory()
           }
           this.backendError = false
           this.chatError = ''
         } else {
-          console.error('Error fetching chats:', data)
+          log_error(null, new Error(data.error || 'Failed to fetch chats'), 'fetch chats')
           this.chatError = data.error || 'Failed to fetch chats'
         }
       } catch (e) {
-        console.error('Error fetching chats:', e)
+        log_error(null, e, 'fetch chats')
         this.chatError = 'Failed to fetch chats'
       }
     },
@@ -59,14 +62,15 @@ export const useChatStore = defineStore('chat', {
       const controller = new AbortController()
       const timeoutId = setTimeout(() => {
         controller.abort()
-        console.warn('Fetch history timeout after 25s for chat_id:', this.selectedChatId)
+        log_error(null, new Error('Fetch history timeout after 25s'), 'fetch history')
         this.chatError = 'Fetch history timeout'
       }, 25000)
       try {
         const url = this.need_full_history
           ? `${this.apiUrl}/chat/get?chat_id=${this.selectedChatId}`
           : `${this.apiUrl}/chat/get?chat_id=${this.selectedChatId}&wait_changes=1`
-        console.log('Fetching history:', url, 'Cookies:', document.cookie)
+        log_msg('CHAT', 'Polling with wait_changes:', !this.need_full_history)
+        log_msg('CHAT', 'Fetching history:', url)
         const res = await fetch(url, {
           method: 'GET',
           credentials: 'include',
@@ -74,59 +78,73 @@ export const useChatStore = defineStore('chat', {
         })
         clearTimeout(timeoutId)
         if (res.status === 500 || res.status === 502) {
-          console.error('Server error:', res.status)
+          log_error(null, new Error(`Server error: ${res.status}`), 'fetch history')
           this.backendError = true
           return
         }
         const data = await res.json()
         if (res.ok && !data.error) {
+          if (data.chat_id !== this.selectedChatId) {
+            log_msg('CHAT', 'Ignoring history response for outdated chat_id:', data.chat_id, 'Current:', this.selectedChatId)
+            return
+          }
           if (data.posts && data.posts.length === 1 && data.posts[0].chat_history === 'chat switch') {
-            console.log('Chat switch detected, fetching full history')
+            log_msg('CHAT', 'Chat switch detected, fetching full history')
             this.waitChanges = false
             this.need_full_history = true
             this.status = data.status
             await this.fetchHistory()
           } else if (data.posts && data.posts.length === 1 && data.posts[0].chat_history === 'no changes') {
-            this.status = data.status
-            console.log('No changes in chat history, status:', this.status)
-          } else {
-            const existingIds = new Set(this.history.map(post => post.id))
-            this.history = this.history.filter(post => !data.posts.some(newPost => newPost.id === post.id && newPost.action === 'delete'))
-            data.posts.forEach(newPost => {
-              if (newPost.action === 'delete') {
-                this.history = this.history.filter(post => post.id !== newPost.id)
-              } else if (!existingIds.has(newPost.id)) {
-                this.history.push(newPost)
-              } else {
-                const index = this.history.findIndex(post => post.id === post.id)
-                if (index !== -1) {
-                  this.history[index] = newPost
-                }
-              }
-            })
-            this.history.sort((a, b) => a.id - b.id)
-            this.status = data.status
-            console.log('Deleted posts:', this.history.filter(post => post.action === 'delete'))
-            console.log('Fetch history params:', { chat_id: this.selectedChatId, wait_changes: this.waitChanges, need_full_history: this.need_full_history })
-            console.log('History response:', JSON.stringify(data.posts, null, 2))
-            if (!this.waitChanges) {
+            if (this.awaited_to_del.length > 0) {
+              log_msg('CHAT', 'No changes received, but posts awaiting deletion:', this.awaited_to_del)
+              this.chatError = 'Posts awaiting deletion not confirmed, fetching full history'
+            } else {
               this.need_full_history = false
-              console.log('Reset need_full_history after full history fetch')
             }
+            this.status = data.status
+            log_msg('CHAT', 'No changes in chat history, status:', this.status)
+          } else {
+            const newHistory = {}
+            const deletedIds = new Set(data.posts.filter(post => post.action === 'delete').map(post => post.id))
+            const newPosts = data.posts.filter(post => post.action !== 'delete')
+            newPosts.forEach(post => {
+              newHistory[post.id] = post
+              log_msg('CHAT', `Have changes, added post ${post.id}, refreshing UI`)
+            })
+            for (const postId of deletedIds) {
+              if (newHistory[postId]) {
+                delete newHistory[postId]
+              }
+            }
+            this.$patch({
+              history: Object.assign({}, newHistory),
+              quotes: data.quotes || {}
+            })
+            log_msg('CHAT', 'Fetched quotes:', JSON.stringify(data.quotes || {}, null, 2))
+            this.awaited_to_del = this.awaited_to_del.filter(postId => !deletedIds.has(postId))
+            if (this.awaited_to_del.length > 0) {
+              log_msg('CHAT', 'Posts not deleted:', this.awaited_to_del)
+            } else if (deletedIds.size > 0) {
+              log_msg('CHAT', 'Deleted posts processed:', Array.from(deletedIds))
+              this.awaited_to_del = []
+            }
+            this.need_full_history = false
+            this.status.status = 'free'
+            log_msg('CHAT', 'Reset status to free after fetchHistory')
             await this.scrollToBottom()
           }
           this.backendError = false
           this.chatError = ''
         } else {
-          console.error('Error fetching history:', data)
+          log_error(null, new Error(data.error || 'Failed to fetch chat history'), 'fetch history')
           this.chatError = data.error || 'Failed to fetch chat history'
         }
       } catch (e) {
         if (e.name === 'AbortError') {
-          console.warn('Fetch history aborted due to timeout for chat_id:', this.selectedChatId)
+          log_error(null, e, 'fetch history aborted due to timeout')
           this.chatError = 'Fetch history timeout'
         } else {
-          console.error('Error fetching history:', e)
+          log_error(null, e, 'fetch history')
           this.chatError = 'Failed to fetch chat history'
         }
       } finally {
@@ -135,17 +153,17 @@ export const useChatStore = defineStore('chat', {
       }
     },
     async scrollToBottom() {
-      console.trace('scrollToBottom called')
       await new Promise(resolve => setTimeout(resolve, 0))
       const container = document.querySelector('.messages')
       if (container) {
         container.scrollTop = container.scrollHeight
-        console.log('Scrolled to bottom')
+        log_msg('UI', 'Scrolled to bottom')
       }
     },
     async fetchChatStats() {
       if (this.selectedChatId === null) return
       try {
+        log_msg('CHAT', 'Fetching chat stats:', this.apiUrl + '/chat/get_stats?chat_id=' + this.selectedChatId)
         const res = await fetch(`${this.apiUrl}/chat/get_stats?chat_id=${this.selectedChatId}`, {
           method: 'GET',
           credentials: 'include'
@@ -156,18 +174,25 @@ export const useChatStore = defineStore('chat', {
             tokens: data.tokens,
             num_sources_used: data.num_sources_used
           }
-          console.log('Fetched chat stats:', this.stats)
+          log_msg('CHAT', 'Fetched chat stats:', this.stats)
         } else {
-          console.error('Error fetching chat stats:', await res.json())
+          log_error(null, new Error('Failed to fetch chat stats'), 'fetch chat stats')
+          this.chatError = 'Failed to fetch chat stats'
         }
       } catch (e) {
-        console.error('Error fetching chat stats:', e)
+        log_error(null, e, 'fetch chat stats')
+        this.chatError = 'Failed to fetch chat stats'
       }
     },
     async sendMessage(message) {
       if (this.selectedChatId === null) return
+      if (!message) {
+        log_error(null, new Error('No message provided'), 'send message')
+        this.chatError = 'No message provided'
+        return
+      }
       try {
-        console.log('Sending message:', { chat_id: this.selectedChatId, message }, 'URL:', this.apiUrl + '/chat/post', 'Cookies:', document.cookie)
+        log_msg('CHAT', 'Sending message to backend:', { chat_id: this.selectedChatId, message })
         const res = await fetch(this.apiUrl + '/chat/post', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -175,7 +200,7 @@ export const useChatStore = defineStore('chat', {
           credentials: 'include'
         })
         if (res.status === 500 || res.status === 502) {
-          console.error('Server error:', res.status)
+          log_error(null, new Error(`Server error: ${res.status}`), 'send message')
           this.backendError = true
           return
         }
@@ -186,17 +211,22 @@ export const useChatStore = defineStore('chat', {
           this.backendError = false
           this.chatError = ''
         } else {
-          console.error('Error sending message:', data)
+          log_error(null, new Error(data.error || 'Failed to send message'), 'send message')
           this.chatError = data.error || 'Failed to send message'
         }
       } catch (e) {
-        console.error('Error sending message:', e)
+        log_error(null, e, 'send message')
         this.chatError = 'Failed to send message'
       }
     },
     async editPost(postId, message) {
+      if (!postId || !message) {
+        log_error(null, new Error('No postId or message provided'), 'edit post')
+        this.chatError = 'No postId or message provided'
+        return
+      }
       try {
-        console.log('Editing post:', this.apiUrl + '/chat/edit_post', 'PostId:', postId, 'Message:', message, 'Cookies:', document.cookie)
+        log_msg('CHAT', 'Editing post on backend:', this.apiUrl + '/chat/edit_post', 'PostId:', postId, 'Message:', message)
         const res = await fetch(this.apiUrl + '/chat/edit_post', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -204,7 +234,7 @@ export const useChatStore = defineStore('chat', {
           credentials: 'include'
         })
         if (res.status === 500 || res.status === 502) {
-          console.error('Server error:', res.status)
+          log_error(null, new Error(`Server error: ${res.status}`), 'edit post')
           this.backendError = true
           return
         }
@@ -215,21 +245,24 @@ export const useChatStore = defineStore('chat', {
           this.backendError = false
           this.chatError = ''
         } else {
-          console.error('Error editing post:', data)
+          log_error(null, new Error(data.error || 'Failed to edit post'), 'edit post')
           this.chatError = data.error || 'Failed to edit post'
         }
       } catch (e) {
-        console.error('Error editing post:', e)
+        log_error(null, e, 'edit post')
         this.chatError = 'Failed to edit post'
       }
     },
     async deletePost(postId, postUserId, userId, userRole) {
       if (userRole !== 'admin' && postUserId !== userId) {
+        log_error(null, new Error('Only admins can delete posts by other users'), 'delete post')
         this.chatError = 'Only admins can delete posts by other users'
         return
       }
       try {
-        console.log('Deleting post:', this.apiUrl + '/chat/delete_post', 'PostId:', postId, 'Cookies:', document.cookie)
+        log_msg('CHAT', 'Deleting post:', this.apiUrl + '/chat/delete_post', 'PostId:', postId)
+        this.awaited_to_del.push(postId)
+        log_msg('CHAT', 'Added post_id to awaited_to_del:', postId, 'Current awaited_to_del:', this.awaited_to_del)
         const res = await fetch(this.apiUrl + '/chat/delete_post', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -237,28 +270,38 @@ export const useChatStore = defineStore('chat', {
           credentials: 'include'
         })
         if (res.status === 500 || res.status === 502) {
-          console.error('Server error:', res.status)
+          log_error(null, new Error(`Server error: ${res.status}`), 'delete post')
           this.backendError = true
           return
         }
         const data = await res.json()
         if (res.ok && !data.error) {
+          log_msg('CHAT', 'Post deletion requested, fetching updated history')
+          const postElement = document.getElementById(`post_${postId}`)
+          if (postElement) {
+            postElement.remove()
+            log_msg('UI', `Removed post_${postId} from DOM`)
+          }
           await this.fetchHistory()
           await this.fetchChatStats()
           this.backendError = false
           this.chatError = ''
         } else {
-          console.error('Error deleting post:', data)
+          log_error(null, new Error(data.error || 'Failed to delete post'), 'delete post')
           this.chatError = data.error || 'Failed to delete post'
+          this.awaited_to_del = this.awaited_to_del.filter(id => id !== postId)
+          log_msg('CHAT', 'Removed post_id from awaited_to_del due to error:', postId, 'Current awaited_to_del:', this.awaited_to_del)
         }
       } catch (e) {
-        console.error('Error deleting post:', e)
+        log_error(null, e, 'delete post')
         this.chatError = 'Failed to delete post'
+        this.awaited_to_del = this.awaited_to_del.filter(id => id !== postId)
+        log_msg('CHAT', 'Removed post_id from awaited_to_del due to exception:', postId, 'Current awaited_to_del:', this.awaited_to_del)
       }
     },
     async createChat(description) {
       try {
-        console.log('Creating chat:', this.apiUrl + '/chat/create', 'Description:', description, 'ParentMessageId:', this.newChatParentMessageId, 'Cookies:', document.cookie)
+        log_msg('CHAT', 'Creating chat:', this.apiUrl + '/chat/create', 'Description:', description, 'ParentMessageId:', this.newChatParentMessageId)
         const res = await fetch(this.apiUrl + '/chat/create', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -266,7 +309,7 @@ export const useChatStore = defineStore('chat', {
           credentials: 'include'
         })
         if (res.status === 500 || res.status === 502) {
-          console.error('Server error:', res.status)
+          log_error(null, new Error(`Server error: ${res.status}`), 'create chat')
           this.backendError = true
           return
         }
@@ -279,18 +322,18 @@ export const useChatStore = defineStore('chat', {
           this.backendError = false
           this.chatError = ''
         } else {
-          console.error('Error creating chat:', data)
+          log_error(null, new Error(data.error || 'Failed to create chat'), 'create chat')
           this.chatError = data.error || 'Failed to create chat'
         }
       } catch (e) {
-        console.error('Error creating chat:', e)
+        log_error(null, e, 'create chat')
         this.chatError = 'Failed to create chat'
       }
     },
     async setChatId(chatId) {
       if (this.selectedChatId === chatId) return
       try {
-        console.log('Notifying chat switch:', this.apiUrl + '/chat/notify_switch', 'ChatId:', chatId, 'Cookies:', document.cookie)
+        log_msg('CHAT', 'Notifying chat switch:', this.apiUrl + '/chat/notify_switch', 'ChatId:', chatId)
         await fetch(this.apiUrl + '/chat/notify_switch', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -298,26 +341,27 @@ export const useChatStore = defineStore('chat', {
           credentials: 'include'
         })
       } catch (e) {
-        console.error('Error notifying chat switch:', e)
+        log_error(null, e, 'notify chat switch')
       }
       this.selectedChatId = chatId
-      this.history = []
+      this.history = {}
+      this.quotes = {}
       this.waitChanges = false
       this.need_full_history = true
-      console.log('Selected chat ID:', chatId)
+      log_msg('CHAT', 'Selected chat ID:', chatId)
       await this.fetchHistory()
       await this.fetchChatStats()
     },
     openCreateChatModal(parentMessageId) {
-      console.log('openCreateChatModal called with parentMessageId:', parentMessageId)
+      log_msg('ACTION', 'openCreateChatModal called with parentMessageId:', parentMessageId)
       this.newChatDescription = ''
       this.newChatParentMessageId = parentMessageId
       const modal = document.getElementById('createChatModal')
       if (modal) {
-        console.log('Found modal:', modal)
+        log_msg('UI', 'Found modal:', modal)
         modal.showModal()
       } else {
-        console.error('Create chat modal not found')
+        log_error(null, new Error('Create chat modal not found'), 'open create chat modal')
         this.chatError = 'Failed to open create chat modal'
       }
     },
@@ -332,7 +376,7 @@ export const useChatStore = defineStore('chat', {
     startPolling() {
       if (this.pollingInterval) {
         clearInterval(this.pollingInterval)
-        console.log('Cleared previous polling interval')
+        log_msg('CHAT', 'Cleared previous polling interval')
       }
       this.pollingInterval = setInterval(() => {
         if (this.selectedChatId && !this.isPolling) {
@@ -340,56 +384,56 @@ export const useChatStore = defineStore('chat', {
           this.fetchHistory()
         }
       }, 1000)
-      console.log('Started polling with interval ID:', this.pollingInterval)
+      log_msg('CHAT', 'Started polling with interval ID:', this.pollingInterval)
     },
     stopPolling() {
       if (this.pollingInterval) {
         clearInterval(this.pollingInterval)
-        console.log('Stopped polling with interval ID:', this.pollingInterval)
+        log_msg('CHAT', 'Stopped polling with interval ID:', this.pollingInterval)
         this.pollingInterval = null
       }
     },
     async buildChatTree(chats) {
-      console.log('Building chat tree with:', JSON.stringify(chats, null, 2))
+      log_msg('CHAT', 'Building chat tree with:', JSON.stringify(chats, null, 2))
       const map = new Map()
       chats.forEach(chat => {
         map.set(chat.chat_id, { ...chat, children: [] })
-        console.log(`Initialized chat ${chat.chat_id} with description: ${chat.description}`)
+        log_msg('CHAT', `Initialized chat ${chat.chat_id} with description: ${chat.description}`)
       })
       for (const chat of chats) {
         if (chat.parent_msg_id === null) {
-          console.log(`Root chat: ${chat.chat_id} (${chat.description})`)
+          log_msg('CHAT', `Root chat: ${chat.chat_id} (${chat.description})`)
           continue
         }
         const parentMsg = await this.dbFetchParentMsg(chat.parent_msg_id)
         if (parentMsg && map.has(parentMsg.chat_id)) {
-          console.log(`Adding chat_id: ${chat.chat_id} (${chat.description}) to parent chat_id: ${parentMsg.chat_id}`)
+          log_msg('CHAT', `Adding chat_id: ${chat.chat_id} (${chat.description}) to parent chat_id: ${parentMsg.chat_id}`)
           map.get(parentMsg.chat_id).children.push(map.get(chat.chat_id))
         } else {
-          console.warn(`No parent message found for chat_id: ${chat.chat_id}, parent_msg_id: ${chat.parent_msg_id}, setting as root`)
+          log_msg('CHAT', `No parent message found for chat_id: ${chat.chat_id}, parent_msg_id: ${chat.parent_msg_id}, setting as root`)
           map.get(chat.chat_id).parent_msg_id = null
         }
       }
       const tree = Array.from(map.values()).filter(chat => chat.parent_msg_id === null)
-      console.log('Chat tree built:', JSON.stringify(tree, null, 2))
+      log_msg('CHAT', 'Chat tree built:', JSON.stringify(tree, null, 2))
       return tree
     },
     async dbFetchParentMsg(parent_msg_id) {
       try {
-        console.log(`Fetching parent message for post_id: ${parent_msg_id}`)
+        log_msg('CHAT', `Fetching parent message for post_id: ${parent_msg_id}`)
         const res = await fetch(this.apiUrl + `/chat/get_parent_msg?post_id=${parent_msg_id}`, {
           method: 'GET',
           credentials: 'include'
         })
         if (res.status === 404 || !res.ok) {
-          console.warn('Parent message not found for post_id:', parent_msg_id)
+          log_msg('CHAT', 'Parent message not found for post_id:', parent_msg_id)
           return null
         }
         const data = await res.json()
-        console.log('Fetched parent message:', JSON.stringify(data, null, 2))
+        log_msg('CHAT', 'Fetched parent message:', JSON.stringify(data, null, 2))
         return data
       } catch (e) {
-        console.error('Error fetching parent message:', e)
+        log_error(null, e, 'fetch parent message')
         return null
       }
     }

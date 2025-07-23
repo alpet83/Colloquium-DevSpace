@@ -14,6 +14,7 @@ class ContextAssembler:
         self.chat_manager = globals.chat_manager
         self.file_manager = globals.file_manager
         self._init_tables()
+        SandwichPack.load_block_classes()
 
     def _init_tables(self):
         self.llm_context_table = DataTable(
@@ -100,7 +101,7 @@ class ContextAssembler:
                 params['parent_timestamp'] = parent_msg_timestamp
             query += ' ORDER BY id'
             history = self.db.fetch_all(query, params)
-            for row in history:
+            for row in reversed(history):
                 message = re.sub(r'@attach_dir#([\w\d/]+)|@attach#(\d+)',
                                  lambda m: self._resolve_file_id(m, file_ids, file_map), row[3])
                 content_blocks.append(ContentBlock(
@@ -138,7 +139,7 @@ class ContextAssembler:
                     log.warn("Неподдерживаемое расширение файла '%s' для file_id=%d, пропуск", extension, file_id)
                     continue
                 try:
-                    content_text = file_data['content'].decode('utf-8', errors='replace')
+                    content_text = file_data['content']
                     content_block = SandwichPack.create_block(
                         content_text=content_text,
                         content_type=extension,
@@ -176,9 +177,10 @@ class ContextAssembler:
             for row in rows:
                 file_ids.add(row[0])
                 file_map[row[0]] = row[1]
-                log.debug("Добавлен файл директории file_id=%d, file_name=%s из @attach_dir#%s",
-                          row[0], row[1], dir_name)
-            return f"@attached_files#[{','.join(file_id_list)}]"
+
+            result = f"@attached_files#[{','.join(file_id_list)}]"
+            log.debug("\tНайденные файлы: %s", result)
+            return result
         elif match.group(2):  # @attach#file_id
             file_id = int(match.group(2))
             file_data = self.file_manager.get_file(file_id)

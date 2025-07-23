@@ -1,4 +1,4 @@
-# /frontend/rtm/src/components/FileManager.vue, updated 2025-07-16 12:55 EEST
+<!-- /frontend/rtm/src/components/FileManager.vue, updated 2025-07-16 12:55 EEST -->
 <template>
   <div class="file-manager">
     <h3>Файлы проекта</h3>
@@ -13,6 +13,7 @@
 
 <script>
 import { defineComponent, inject } from 'vue'
+import { log_msg, log_error, set_show_logs } from '../utils/debugging'
 import FileTree from './FileTree.vue'
 
 export default defineComponent({
@@ -27,8 +28,7 @@ export default defineComponent({
     return { mitt }
   },
   computed: {
-    fileTree() {
-      console.log('Building fileTree from files:', JSON.stringify(this.files, null, 2))
+    fileTree() {      
       const tree = {}
       this.files.forEach(file => {
         // Удаляем ведущий слэш и нормализуем путь
@@ -45,14 +45,13 @@ export default defineComponent({
             current = current[part].children
           }
         })
-      })
-      console.log('Built fileTree:', JSON.stringify(tree, null, 2))
+      })      
       return tree
     }
   },
   methods: {
     handleSelectFile(fileId) {
-      console.log('Emitting select-file:', fileId)
+      log_msg('FILE', 'Emitting select-file:', fileId)
       this.mitt.emit('select-file', fileId)
       this.$emit('select-file', fileId)
     }

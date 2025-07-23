@@ -52,7 +52,7 @@ class XAIConnection(LLMConnection):
                         log.error("Ошибка XAI API: status=%d, response=%s", response.status, await response.text())
                         return {}
                     result = await response.json()
-                    log.debug("Ответ XAI API: ~C95%s~C00", json.dumps(result, indent=2))
+                    log.debug("Ответ XAI API: ~C95%s~C00", json.dumps(result, indent=2, ensure_ascii=False))
                     return {
                         "text": result.get("choices", [{}])[0].get("message", {}).get("content", ""),
                         "usage": result.get("usage", {})

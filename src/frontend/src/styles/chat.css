@@ -1,0 +1,368 @@
+/* /frontend/rtm/src/styles/chat.css, created 2025-07-22 12:55 EEST */
+.chat-container {
+  flex-grow: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  min-width: 800px;
+  background: #333;
+}
+@media (prefers-color-scheme: light) {
+  .chat-container {
+    background: #f0f0f0;
+  }
+}
+.tabs {
+  display: flex;
+  margin: 10px;
+}
+.tabs button {
+  padding: 5px 10px;
+  margin-right: 5px;
+  border: none;
+  border-radius: 3px;
+  background: #444;
+  color: #eee;
+  cursor: pointer;
+}
+.tabs button.active {
+  background: #007bff;
+}
+@media (prefers-color-scheme: light) {
+  .tabs button {
+    background: #ccc;
+    color: #333;
+  }
+  .tabs button.active {
+    background: #0056b3;
+    color: #fff;
+  }
+}
+.messages {
+  max-height: 80vh;
+  overflow-y: auto;
+  margin: 0 10px 10px 10px;
+}
+.debug-logs {
+  max-height: 80vh;
+  overflow-y: auto;
+  margin: 0 10px 10px 10px;
+  background: #222;
+  padding: 10px;
+  border-radius: 5px;
+}
+@media (prefers-color-scheme: light) {
+  .debug-logs {
+    background: #e0e0e0;
+  }
+}
+.log-entry {
+  margin: 5px 0;
+}
+.log-entry.error {
+  color: red;
+}
+.log-entry.warn {
+  color: orange;
+}
+.message {
+  margin: 10px 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  padding: 8px;
+  background: #333;
+}
+.admin-message {
+  background: #555;
+}
+.agent-message {
+  margin-left: 20px;
+}
+@media (prefers-color-scheme: light) {
+  .message {
+    background: #f0f0f0;
+  }
+  .admin-message {
+    background: #e0e0e0;
+  }
+  .agent-message {
+    margin-left: 20px;
+  }
+}
+.message-header {
+  display: flex;
+  justify-content: flex-end;
+  width: 100%;
+}
+.message-content {
+  width: 100%;
+}
+.message pre {
+  margin: 0;
+  flex-grow: 1;
+  color: #eee;
+  white-space: pre-wrap;
+}
+@media (prefers-color-scheme: light) {
+  .message pre {
+    color: #333;
+  }
+}
+.message-actions {
+  display: flex;
+  gap: 5px;
+}
+.message-separator {
+  border: 0;
+  border-top: 1px solid #555;
+  margin: 5px 0;
+}
+@media (prefers-color-scheme: light) {
+  .message-separator {
+    border-top: 1px solid #ccc;
+  }
+}
+.edit-post, .delete-post {
+  padding: 2px 8px;
+  font-size: 12px;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.edit-post {
+  background: #007bff;
+  color: #fff;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.edit-post:hover {
+  background: #0056b3;
+}
+.delete-post {
+  background: #ff4444;
+  color: #fff;
+}
+.delete-post:hover {
+  background: #cc0000;
+}
+.attachment-preview {
+  margin: 10px;
+  display: flex;
+  align-items: center;
+}
+.attachment-preview p {
+  margin: 0;
+  flex-grow: 1;
+}
+.attachment-preview button {
+  padding: 2px 8px;
+  font-size: 12px;
+}
+input, textarea {
+  margin: 10px;
+  padding: 5px;
+  width: calc(100% - 30px);
+  border: 1px solid #ccc;
+  border-radius: 3px;
+  background: #444;
+  color: #eee;
+  font-family: inherit;
+}
+textarea {
+  min-height: 80px;
+  resize: vertical;
+  overflow-y: auto;
+}
+@media (prefers-color-scheme: light) {
+  input, textarea {
+    background: #fff;
+    color: #333;
+    border: 1px solid #999;
+  }
+}
+button {
+  margin: 5px;
+  padding: 5px 10px;
+}
+dialog {
+  padding: 20px;
+  border: 1px solid #ccc;
+  border-radius: 5px;
+}
+.file-preview-modal {
+  max-width: 90vw;
+  max-height: 80vh;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+dialog input, dialog textarea, dialog pre {
+  width: 100%;
+  margin-bottom: 10px;
+}
+.file-preview {
+  color: #d3d3d3;
+  background: #222;
+  padding: 10px;
+  border-radius: 5px;
+  max-height: 60vh;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  font-family: monospace;
+}
+@media (prefers-color-scheme: light) {
+  .file-preview {
+    color: #666;
+    background: #f5f5f5;
+  }
+}
+.error {
+  color: red;
+  margin: 10px;
+}
+.processing-status {
+  margin: 10px;
+  color: #ccccaa;
+}
+@media (prefers-color-scheme: light) {
+  .processing-status {
+    color: #666;
+  }
+}
+.deleted-post {
+  color: #888;
+  font-style: italic;
+}
+.code-patch, .shell-code, .stdout, .stderr, .mismatch, .quote {
+  background: #222;
+  padding: 8px;
+  border-radius: 5px;
+  font-family: monospace;
+  white-space: pre-wrap;
+  border: 1px solid;
+  display: block;
+}
+.stdout, .stderr {
+  max-height: 25em;
+  overflow-y: auto;
+}
+.quote {
+  background: #2a2a2a;
+  border-color: #1e90ff;
+  color: #d3d3d3;
+}
+@media (prefers-color-scheme: light) {
+  .code-patch, .shell-code, .stdout, .stderr, .mismatch, .quote {
+    background: #f5f5f5;
+  }
+  .quote {
+    background: #e8e8e8;
+    border-color: #0056b3;
+    color: #666;
+  }
+}
+.file-link {
+  background: #222;
+  padding: 2px 6px;
+  border-radius: 5px;
+  font-family: monospace;
+  border: 1px solid;
+  display: inline-block;
+  color: #1e90ff;
+  border-color: #1e90ff;
+  cursor: pointer;
+}
+.file-link:hover {
+  background: #1e90ff;
+  color: #fff;
+}
+.file-unavailable {
+  background: #222;
+  padding: 2px 6px;
+  border-radius: 5px;
+  font-family: monospace;
+  border: 1px solid;
+  display: inline-block;
+  color: #888;
+  border-color: #888;
+}
+@media (prefers-color-scheme: light) {
+  .file-link {
+    color: #0056b3;
+    border-color: #0056b3;
+  }
+  .file-link:hover {
+    background: #0056b3;
+    color: #fff;
+  }
+  .file-unavailable {
+    color: #666;
+    border-color: #666;
+  }
+}
+.code-patch {
+  border-color: #555;
+}
+
+.shell_code {
+  font-family: monospace;
+  white-space: pre-wrap;
+  background: #2d2d2d;
+  padding: 5px;
+  border-radius: 3px;
+  border-color: #ff8c00;
+  color: #10ff10;
+}
+@media (prefers-color-scheme: light) {
+  .shell-code {
+    color: #d2691e;
+    border-color: #d2691e;
+  }
+}
+.stdout {
+  color: #d3d3d3;
+  border-color: #d3d3d3;
+}
+@media (prefers-color-scheme: light) {
+  .stdout {
+    color: #666;
+    border-color: #666;
+  }
+}
+.stderr {
+  color: #ff4444;
+  border-color: #ff4444;
+}
+@media (prefers-color-scheme: light) {
+  .stderr {
+    color: #cc0000;
+    border-color: #cc0000;
+  }
+}
+.mismatch {
+  color: #ff4444;
+  border-color: #ff4444;
+}
+@media (prefers-color-scheme: light) {
+  .mismatch {
+    color: #cc0000;
+    border-color: #cc0000;
+  }
+}
+.patch-removed {
+  color: #ff4444;
+}
+.patch-added {
+  color: #00cc00;
+}
+.patch-unchanged {
+  color: #eee;
+}
+@media (prefers-color-scheme: light) {
+  .patch-unchanged {
+    color: #333;
+  }
+}

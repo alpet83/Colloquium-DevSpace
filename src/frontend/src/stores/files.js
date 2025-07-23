@@ -1,5 +1,6 @@
-// /frontend/rtm/src/stores/files.js, updated 2025-07-17 20:58 EEST
+// /frontend/rtm/src/stores/files.js, updated 2025-07-22 17:00 EEST
 import { defineStore } from 'pinia'
+import { log_msg, log_error } from '../utils/debugging'
 
 export const useFileStore = defineStore('files', {
   state: () => ({
@@ -12,33 +13,34 @@ export const useFileStore = defineStore('files', {
   actions: {
     async fetchFiles(project_id = null) {
       try {
-        console.log('Fetching files:', this.apiUrl + '/chat/list_files', 'Cookies:', document.cookie)
+        log_msg('FILE', 'Fetching files:', this.apiUrl + '/chat/list_files', 'Cookies:', document.cookie)
         const res = await fetch(this.apiUrl + '/chat/list_files', {
           method: 'GET',
           credentials: 'include'
         })
         if (res.status === 500 || res.status === 502) {
-          console.error('Server error:', res.status)
+          log_error(this, new Error(`Server error: ${res.status}`), 'fetch files')
           this.backendError = true
           return
         }
         const data = await res.json()
         if (res.ok && !data.error) {
           this.files = data
+          log_msg('FILE', 'Fetched files count:', this.files.length)
           this.backendError = false
           this.chatError = ''
         } else {
-          console.error('Error fetching files:', data)
+          log_error(this, new Error(data.error || 'Failed to fetch files'), 'fetch files')
           this.chatError = data.error || 'Failed to fetch files'
         }
       } catch (e) {
-        console.error('Error fetching files:', e)
+        log_error(this, e, 'fetch files')
         this.chatError = 'Failed to fetch files'
       }
     },
     async deleteFile(fileId) {
       try {
-        console.log('Deleting file:', this.apiUrl + '/chat/delete_file', 'FileId:', fileId, 'Cookies:', document.cookie)
+        log_msg('FILE', 'Deleting file:', this.apiUrl + '/chat/delete_file', 'FileId:', fileId, 'Cookies:', document.cookie)
         const res = await fetch(this.apiUrl + '/chat/delete_file', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -46,7 +48,7 @@ export const useFileStore = defineStore('files', {
           credentials: 'include'
         })
         if (res.status === 500 || res.status === 502) {
-          console.error('Server error:', res.status)
+          log_error(this, new Error(`Server error: ${res.status}`), 'delete file')
           this.backendError = true
           return
         }
@@ -56,11 +58,11 @@ export const useFileStore = defineStore('files', {
           this.backendError = false
           this.chatError = ''
         } else {
-          console.error('Error deleting file:', data)
+          log_error(this, new Error(data.error || 'Failed to delete file'), 'delete file')
           this.chatError = data.error || 'Failed to delete file'
         }
       } catch (e) {
-        console.error('Error deleting file:', e)
+        log_error(this, e, 'delete file')
         this.chatError = 'Failed to delete file'
       }
     },
@@ -72,14 +74,14 @@ export const useFileStore = defineStore('files', {
       formData.append('file_id', fileId)
       formData.append('file_name', file.name)
       try {
-        console.log('Updating file:', this.apiUrl + '/chat/update_file', 'FileId:', fileId, 'File:', file.name, 'Cookies:', document.cookie)
+        log_msg('FILE', 'Updating file:', this.apiUrl + '/chat/update_file', 'FileId:', fileId, 'File:', file.name, 'Cookies:', document.cookie)
         const res = await fetch(this.apiUrl + '/chat/update_file', {
           method: 'POST',
           body: formData,
           credentials: 'include'
         })
         if (res.status === 500 || res.status === 502) {
-          console.error('Server error:', res.status)
+          log_error(this, new Error(`Server error: ${res.status}`), 'update file')
           this.backendError = true
           return
         }
@@ -89,11 +91,11 @@ export const useFileStore = defineStore('files', {
           this.backendError = false
           this.chatError = ''
         } else {
-          console.error('Error updating file:', data)
+          log_error(this, new Error(data.error || 'Failed to update file'), 'update file')
           this.chatError = data.error || 'Failed to update file'
         }
       } catch (e) {
-        console.error('Error updating file:', e)
+        log_error(this, e, 'update file')
         this.chatError = 'Failed to update file'
       }
     },
@@ -103,14 +105,14 @@ export const useFileStore = defineStore('files', {
       formData.append('chat_id', chatId)
       formData.append('file_name', fileName)
       try {
-        console.log('Uploading file:', this.apiUrl + '/chat/upload_file', 'File:', fileName, 'ChatId:', chatId, 'Cookies:', document.cookie)
+        log_msg('FILE', 'Uploading file:', this.apiUrl + '/chat/upload_file', 'File:', fileName, 'ChatId:', chatId, 'Cookies:', document.cookie)
         const res = await fetch(this.apiUrl + '/chat/upload_file', {
           method: 'POST',
           body: formData,
           credentials: 'include'
         })
         if (res.status === 500 || res.status === 502) {
-          console.error('Server error:', res.status)
+          log_error(this, new Error(`Server error: ${res.status}`), 'upload file')
           this.backendError = true
           return
         }
@@ -120,20 +122,21 @@ export const useFileStore = defineStore('files', {
           await this.fetchFiles()
           this.backendError = false
           this.chatError = ''
-          return data // Возвращаем полный ответ с file_id
+          return data
         } else {
-          console.error('Error uploading file:', data)
+          log_error(this, new Error(data.error || 'Failed to upload file'), 'upload file')
           this.chatError = data.error || 'Failed to upload file'
           throw new Error(data.error || 'Failed to upload file')
         }
       } catch (e) {
-        console.error('Error uploading file:', e)
+        log_error(this, e, 'upload file')
         this.chatError = 'Failed to upload file'
         throw e
       }
     },
     clearAttachment() {
       this.pendingAttachment = null
+      log_msg('FILE', 'Cleared pending attachment')
     }
   }
 })
