@@ -151,4 +151,4 @@ export function handleSelectFile(component, fileId) {
     component.autoResize({ target: component.$refs.messageInput }, 'messageInput')
   })
   log_msg('ACTION', 'Action executed: handle select file')
-}
+} 

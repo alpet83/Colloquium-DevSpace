@@ -1,5 +1,6 @@
-# /app/agent/processors/block_processor.py, updated 2025-07-23 12:37 EEST
+# /app/agent/processors/block_processor.py, updated 2025-07-23 18:32 EEST
 import re
+import traceback
 import requests
 import globals
 import hashlib
@@ -20,6 +21,8 @@ class ProcessResult:
         self.message = message
         self.user_name = user_name
         self.processed_message = processed_message
+        self.call_stack = None
+        self.agent_messages = []
 
     def is_ok(self):
         return self.status == "success"
@@ -35,19 +38,24 @@ class ProcessResult:
     def failed_cmds(self):
         return 1 if self.is_error() else 0
 
-def res_success(user, msg, pmsg=None):
-    return ProcessResult("success", msg, user, pmsg)
+def res_success(user, msg, pmsg=None, agent_messages=None):
+    result = ProcessResult("success", msg, user, pmsg)
+    result.agent_messages = agent_messages or []
+    return result
 
-def res_error(user, msg, pmsg=None):
-    return ProcessResult("error", msg, user, pmsg)
+def res_error(user, msg, pmsg=None, agent_messages=None):
+    result = ProcessResult("error", msg, user, pmsg)
+    result.agent_messages = agent_messages or []
+    result.call_stack = "  ".join(traceback.format_stack(limit=5)).strip()
+    return result
 
 class BlockProcessor:
     def __init__(self, tag):
         self.tag = tag
         self.replace = True
 
-    def process(self, post_message):
-        pattern = fr'<{self.tag}(?:\s+([^>]+))?>\s*([\s\S]*?)\s*</{self.tag}>'
+    def process(self, post_message: str, user_name: str = '@self'):
+        pattern = fr'<{self.tag}(?:\s+([^>]+))?>\s*([\s\S\n\r]*?)\s*</{self.tag}>'
         matches = list(re.finditer(pattern, post_message, flags=re.DOTALL))
         count = len(matches)
         if 0 == count:
@@ -65,14 +73,21 @@ class BlockProcessor:
             attrs = self._parse_attrs(match.group(1) or '')
             block_code = match.group(2) or ''
             try:
+                if attrs.get('user_name', None) is None:
+                    attrs['user_name'] = user_name
                 result = self.handle_block(attrs, block_code)
             except ProcessorError as e:
                 failed_cmds += 1
-                agent_messages.append(f"@{e.user_name} {str(e)}")
+                exc_info = (type(e), e, e.__traceback__)
+                backtrace = "".join(traceback.format_exception(*exc_info))
+                agent_messages.append(f"@{e.user_name}: {str(e)}\n<traceback>{backtrace}</traceback>")
                 continue
             handled_cmds += result.handled_cmds
             failed_cmds += result.failed_cmds
             agent_messages.append(result.message)
+            agent_messages.extend(result.agent_messages)
+            if result.is_error() and result.call_stack:
+                agent_messages.append(f"<traceback>{result.call_stack}</traceback>")
             if result.processed_message and self.replace:
                 processed_message = processed_message.replace(match.group(0), result.processed_message)
         log.debug("Обработано %d команд, неуспешно %d для тега %s", handled_cmds, failed_cmds, self.tag)
@@ -128,7 +143,7 @@ class BlockProcessor:
 
     def save_file(self, file_id: int, file_name: str, new_content: str, project_id, user_name, timestamp=None):
         try:
-            assert(len(file_name) < 300, "Invalid file_name length")
+            assert(len(file_name) < 300), "Invalid file_name length"
             old_lines_count = len(new_content.splitlines())
             content_bytes = new_content.encode('utf-8')
             md5 = hashlib.md5(content_bytes).hexdigest()

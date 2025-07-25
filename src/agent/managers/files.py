@@ -208,7 +208,7 @@ class FileManager:
         log.debug("Обновлён файл id=%d, file_name=%s, project_id=%s", file_id, file_name, str(project_id))
         return file_id
 
-    def move_file(self, file_id: int, new_name: str, project_id=None):
+    def move_file(self, file_id: int, new_name: str, project_id=None, overwrite: bool = False):
         if not self.link_valid(file_id):
             log.error("Файл id=%d не найден для переименования", file_id)
             return -1
@@ -217,6 +217,16 @@ class FileManager:
         new_name = str(new_name).lstrip("@").lstrip("/")
         old_path = _qfn(old_file_name, project_id)
         new_path = _qfn(new_name, project_id)
+
+        log.debug("Checking if target file %s exists", new_name)
+        existing_file_id = self.find(new_name, project_id)
+        if existing_file_id and not overwrite:
+            log.error("Целевой файл %s уже существует, file_id=%d", new_name, existing_file_id)
+            return -2
+        elif existing_file_id:
+            log.debug("Target file %s exists, overwrite=%s, removing existing file_id=%d", new_name, overwrite,
+                      existing_file_id)
+            self.unlink(existing_file_id)
 
         backup_path = self.backup_file(file_id)
         if not backup_path:
@@ -243,7 +253,6 @@ class FileManager:
         )
         log.debug("Updated file record id=%d, new_name=%s, project_id=%s", file_id, new_name, str(project_id))
         return file_id
-
     def unlink(self, file_id: int):
         """Удаляет запись из attached_files, не затрагивая файл на диске."""
         self.files_table.delete_from(conditions={'id': file_id})

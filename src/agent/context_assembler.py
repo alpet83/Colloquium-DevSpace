@@ -14,7 +14,8 @@ class ContextAssembler:
         self.chat_manager = globals.chat_manager
         self.file_manager = globals.file_manager
         self._init_tables()
-        SandwichPack.load_block_classes()
+        res = SandwichPack.load_block_classes()
+        log.debug("Загружены следующие парсеры сэндвич-блоков: %s", str(res))
 
     def _init_tables(self):
         self.llm_context_table = DataTable(
@@ -150,7 +151,7 @@ class ContextAssembler:
                     )
                     content_blocks.append(content_block)
                     log.debug(
-                        "Добавлен file_id=%d, file_name=%s, block_class=%s, size=%d chars",
+                        "Добавлен в сэндвич file_id=%d, file_name=%s, block_class=%s, size=%d chars",
                         file_id, file_data['file_name'], content_block.__class__.__name__, len(content_text)
                     )
                     file_map[file_id] = file_data['file_name']

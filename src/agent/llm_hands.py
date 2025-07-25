@@ -3,13 +3,15 @@ import re
 import globals
 from processors.block_processor import CommandProcessor, ProcessResult
 from processors.shell_code import ShellCodeProcessor
-from processors.file_processors import FileEditProcessor, FileReplaceProcessor, FilePatchProcessor, FileUndoProcessor
+from processors.file_processors import FileEditProcessor, FileReplaceProcessor, \
+    FileMoveProcessor, FilePatchProcessor, FileUndoProcessor
 
 log = globals.get_logger("llm_hands")
 
-def process_message(text, timestamp, user_name, rql=None):
+
+def process_message(text, timestamp, user_name: str, rql=None):
     log.debug("Обработка сообщения: text=%s, timestamp=%d, user_name=%s, rql=%s", text[:50], timestamp,
-              user_name or "None", str(rql))
+              user_name or "@self", str(rql))
     if isinstance(text, bytes):
         text = text.decode('utf-8', errors='replace')
         log.warn("Входной текст был байтовым, декодирован: %s", text[:50])
@@ -22,6 +24,7 @@ def process_message(text, timestamp, user_name, rql=None):
         CommandProcessor(),
         FileEditProcessor(),
         FilePatchProcessor(),
+        FileMoveProcessor(),
         FileUndoProcessor(),
         FileReplaceProcessor(),
         ShellCodeProcessor()
@@ -36,12 +39,11 @@ def process_message(text, timestamp, user_name, rql=None):
     has_code_file = False
     handled_cmds = 0
     failed_cmds = 0
-    agent_requested = text.strip().startswith('@agent')
     command_text = text.replace('@agent', '', 1).strip()
     have_tag = re.search(tag_pattern, command_text, re.DOTALL)
     if have_tag:
         for processor in processors:
-            result = processor.process(command_text)
+            result = processor.process(command_text, user_name)
             processed_msg = result["processed_message"]
             if processed_msg:
                 command_text = processed_msg

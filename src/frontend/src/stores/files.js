@@ -1,4 +1,4 @@
-// /frontend/rtm/src/stores/files.js, updated 2025-07-22 17:00 EEST
+// /frontend/rtm/src/stores/files.js, updated 2025-07-25 20:45 EEST
 import { defineStore } from 'pinia'
 import { log_msg, log_error } from '../utils/debugging'
 
@@ -38,6 +38,11 @@ export const useFileStore = defineStore('files', {
         this.chatError = 'Failed to fetch files'
       }
     },
+    async fetchFilesAndNotify(project_id = null, activeFiles = []) {
+      await this.fetchFiles(project_id)
+      this.$mitt.emit('files-updated', activeFiles)
+      log_msg('FILE', `Emitted files-updated event for: ${activeFiles}`)
+    },
     async deleteFile(fileId) {
       try {
         log_msg('FILE', 'Deleting file:', this.apiUrl + '/chat/delete_file', 'FileId:', fileId, 'Cookies:', document.cookie)
@@ -54,7 +59,7 @@ export const useFileStore = defineStore('files', {
         }
         const data = await res.json()
         if (res.ok && !data.error) {
-          await this.fetchFiles()
+          await this.fetchFilesAndNotify(null, [])
           this.backendError = false
           this.chatError = ''
         } else {
@@ -87,7 +92,7 @@ export const useFileStore = defineStore('files', {
         }
         const data = await res.json()
         if (res.ok && !data.error) {
-          await this.fetchFiles()
+          await this.fetchFilesAndNotify(null, [])
           this.backendError = false
           this.chatError = ''
         } else {
@@ -119,7 +124,7 @@ export const useFileStore = defineStore('files', {
         const data = await res.json()
         if (res.ok && !data.error) {
           this.pendingAttachment = { file_id: data.file_id, file_name: fileName }
-          await this.fetchFiles()
+          await this.fetchFilesAndNotify(null, [data.file_id])
           this.backendError = false
           this.chatError = ''
           return data

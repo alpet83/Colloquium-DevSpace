@@ -1,10 +1,15 @@
-/docs/technical_documentation.md, updated 2025-07-20 23:59 EEST
-Technical Documentation for Colloquium Chat Server
-Overview
+/docs/technical_documentation.md, updated 2025-07-25 21:30 EEST
+# Technical Documentation for Colloquium Chat Server
+
+## Overview
 The Colloquium Chat Server is a multi-user chat application with file attachment support, implemented using FastAPI (Python) for the backend and Vue.js with Pinia for the frontend. It supports hierarchical chats, file uploads, project management, and integration with Large Language Model (LLM) services. The backend uses SQLite for data storage, managed via SQLAlchemy's Database class singleton. The system is designed for collaborative code analysis, with features like file indexing, chat replication to LLMs, and token usage statistics.
-Database Schema
-Table: users
-Purpose: Stores user information for authentication and LLM integration.Schema:
+
+## Database Schema
+
+### Table: users
+**Purpose**: Stores user information for authentication and LLM integration.
+**Schema**:
+```sql
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_name TEXT,
@@ -58,7 +63,7 @@ Fields:
 id: Unique message identifier.
 chat_id: ID of the chat.
 user_id: ID of the user who posted the message.
-message: Message content, may include @attach#<file_id> for file references or <code_file name="...">, <code_patch>, <shell_code> for code submissions and commands (replaced by @attach#<file_id> or processed output after processing).
+message: Message content, may include @attach# for file references or , ,  for code submissions and commands (replaced by @attach# or processed output after processing).
 timestamp: Unix timestamp of message creation.
 rql: Recursion level for LLM responses (optional).
 
@@ -76,12 +81,12 @@ CREATE TABLE IF NOT EXISTS attached_files (
 Fields:
 
 id: Unique file identifier.
-content: Binary file content (for stored files) or NULL/empty for links. Links are indicated by file_name starting with @ (e.g., @trade_report/example.rs) and represent files stored on disk at /app/projects/<project_name>/<relative_path>.
+content: Binary file content (for stored files) or NULL/empty for links. Links are indicated by file_name starting with @ (e.g., @trade_report/example.rs) and represent files stored on disk at /app/projects//.
 ts: Unix timestamp of file upload or update.
 file_name: File path (e.g., trade_report/example.rs for stored files, @trade_report/example.rs for links).
 project_id: ID of the associated project.Notes:
 Stored Files: Files uploaded via /chat/upload_file store their content in the content column as a BLOB. These are typically used for direct uploads and are not necessarily tied to the filesystem.
-Links: Files created via <code_file> tags in messages (processed by llm_hands.py) have empty content and a file_name prefixed with @. The actual file content is stored on disk at /app/projects/<project_name>/<relative_path>, and the FileManager.get_file method retrieves it from disk if content is empty.
+Links: Files created via  tags in messages (processed by llm_hands.py) have empty content and a file_name prefixed with @. The actual file content is stored on disk at /app/projects//, and the FileManager.get_file method retrieves it from disk if content is empty.
 Links are validated by FileManager.check at initialization, which converts stale links (files missing on disk) to stored files with content="file was removed?" and removes the @ prefix.
 
 Table: sessions
@@ -272,8 +277,8 @@ Purpose: Manages chat messages and triggers replication.Class: PostManager
 
 __init__(user_manager): Initializes with database and UserManager.
 _create_tables(): Creates posts table.
-add_message(chat_id, user_id, message): Adds a message, processes @agent commands via post_processor, saves processed message (e.g., @<user_name> Created file: ...), and posts agent response with @<user_name> if applicable. Triggers asynchronous replication for non-@agent messages.
-get_history(chat_id, only_changes): Retrieves message history, parsing @attach#<file_id> for file names. Returns {"chat_history": "no changes"} if only_changes=True and no changes are found.
+add_message(chat_id, user_id, message): Adds a message, processes @agent commands via post_processor, saves processed message (e.g., @ Created file: ...), and posts agent response with @ if applicable. Triggers asynchronous replication for non-@agent messages.
+get_history(chat_id, only_changes): Retrieves message history, parsing @attach# for file names. Returns {"chat_history": "no changes"} if only_changes=True and no changes are found.
 delete_post(post_id, user_id): Deletes a message if user is the author or admin.
 edit_post(post_id, user_id, message): Edits a message if user has permission.
 add_change(chat_id, post_id, action): Tracks post changes (add, edit, delete) for replication.
@@ -291,7 +296,7 @@ exists(file_name, project_id): Checks if a file exists as a link (@file_name) or
 add_file(content, file_name, timestamp, project_id): Adds a file or link to attached_files, uses exists to prevent duplicates.
 update_file(file_id, content, file_name, timestamp, project_id): Updates a file or link in attached_files.
 unlink(file_id): Removes a file or link record from attached_files without affecting the disk.
-backup_file(file_id): Creates a backup of a link file in /agent/projects/backups/<relative_path>.<timestamp>.
+backup_file(file_id): Creates a backup of a link file in /agent/projects/backups/..
 remove_file(file_id): Removes a link from attached_files and moves the file to backup.
 list_files(user_id, project_id): Lists files, optionally filtered by project_id, synchronizes with project files on disk.
 get_file(file_id): Retrieves file metadata and content, loading from disk for links (content empty).
@@ -301,11 +306,11 @@ Purpose: Handles replication of chat context to LLM services.Class: ReplicationM
 
 __init__(debug_mode): Initializes with database and debug mode.
 _load_actors(): Loads users with LLM configurations as ChatActor instances.
-_write_context_stats(content_blocks, llm_name, chat_id, index_json): Writes context statistics to /app/logs/<llm_name>_context.stats.
+_write_context_stats(content_blocks, llm_name, chat_id, index_json): Writes context statistics to /app/logs/_context.stats.
 _recursive_replicate(content_blocks, users, chat_id, actor, exclude_source_id, rql, max_rql): Recursively processes LLM responses, posts them, and triggers further replication for @all. For responses containing @agent, strips content before @agent, processes the command via post_processor, and prepends the stripped prefix to processed_msg.
 replicate_to_llm(chat_id, exclude_source_id, debug_mode): Orchestrates replication process with token limit (131072).
 _pack_and_send(content_blocks, users, chat_id, exclude_source_id, debug_mode): Packs context using SandwichPack, sends to LLMs, and stores responses.
-_store_response(actor_id, chat_id, original_response, processed_response, triggered_by, rql): Stores LLM responses and posts them if triggered by @<username>, @all, or #critics_allowed.
+_store_response(actor_id, chat_id, original_response, processed_response, triggered_by, rql): Stores LLM responses and posts them if triggered by @, @all, or #critics_allowed.
 get_processing_status(): Returns replication status (free or busy) with actor and elapsed time.
 
 /agent/chat_actor.py
@@ -332,28 +337,39 @@ Purpose: Base class for content blocks (posts and files).Class: ContentBlock
 __init__(content_text, content_type, file_name, timestamp, **kwargs): Initializes block with content and metadata.
 estimate_tokens(content): Estimates token count (length ÷ 4).
 parse_content(): Returns parsed entities and dependencies (default: empty).
-to_sandwich_block(): Formats block as <tag> (e.g., <post> or <document>) with attributes.
+to_sandwich_block(): Formats block as  (e.g.,  or ) with attributes.
 supported_types: Supports :post and :document.
 
 /agent/llm_hands.py
-Purpose: Processes @agent commands and tags (<command>, <code_file>, <code_patch>, <shell_code>) for file operations and command execution.Classes:
+Purpose: Processes @agent commands and tags (, , , , ) for file operations and command execution.Classes:
 
-BlockProcessor: Base class for processing tags (command, code_file, code_patch, shell_code).
+BlockProcessor: Base class for processing tags (command, code_file, code_patch, shell_code, move_file).
 CommandProcessor: Handles <command> tags (e.g., ping, run_test, commit).
-ping: Returns @<user_name> pong.
+ping: Returns @ pong.
 run_test: Sends request to MCP_URL/run_test.
 commit: Sends request to MCP_URL/commit.
 
 
 FileEditProcessor: Processes <code_file name="..."> tags, saves files to disk via ProjectManager.edit_file, adds/updates links in attached_files with empty content and @file_name.
 FilePatchProcessor: Processes <code_patch file_id="..."> tags, applies patches to files using FileManager.update_file.
+FileMoveProcessor: Processes <move_file file_id="..." new_name="..." overwrite="true|false"/> tags.
+Purpose: Renames or moves a file (link or stored) in the attached_files table and, for links (file_name starting with @), on the disk at /app/projects/<project_name>/<relative_path>. Validates the new path to ensure it remains within /app/projects. Creates a backup of the original file if it is a link.
+Tag Parameters:
+file_id: Required, integer, ID of the file in attached_files.
+new_name: Required, string, new file path or name (e.g., trade_report/new_example.rs). If no path is provided, prefixed with the project name (e.g., project_name/new_example.rs).
+overwrite: Optional, boolean (true or false), allows overwriting an existing file at the new path (default: false).
+
+
+Behavior: Updates file_name in attached_files. For links, moves the file on disk and creates a backup in /agent/projects/backups/<relative_path>.<timestamp>. Returns success message @<user_name> Файл @attach#<file_id> успешно перемещён в <new_name> or an error if the file is not found, the path is invalid, or the target exists and overwrite=false.
+
+
 ShellCodeProcessor: Processes <shell_code> tags.
 If mcp=true (default), sends command to http://mcp-sandbox:8084/exec_commands (MCP container).
 If mcp=false, executes command locally via execute (local container).
 Supports <user_input rqs="..." ack="..."/> for interactive commands.Functions:
 
 
-process_message(text, timestamp, user_name, rql): Processes messages starting with @agent or containing tags (<command>, <code_file>, <code_patch>, <shell_code>). Dynamically generates tag pattern from processor tags, allowing easy extension with new processors.
+process_message(text, timestamp, user_name, rql): Processes messages starting with @agent or containing tags (, , , , ). Dynamically generates tag pattern from processor tags, allowing easy extension with new processors.
 
 /agent/routes/auth_routes.py
 Purpose: Handles user authentication.Routes:
@@ -457,16 +473,16 @@ Collapsible to 30px using a toggle button (▶/◄).
 Purpose: Displays chat messages, input field, and modals for chat creation, file uploads, and post editing.Features:
 
 Shows message history (chatStore.history) with formatted timestamps and file references.
-Supports sending messages with @attach#<file_id> and @attach_dir#<dir_name>.
+Supports sending messages with @attach# and @attach_dir#.
 Blocks message sending when chatStore.status.status is busy, displaying error "Отправка заблокирована: идёт обработка запроса", while allowing text editing in the input field.
-Messages with newlines (\n) and no special tags (<code_patch>, <shell_code>, <stdout>, <stderr>) are wrapped in <pre class="plain-pre"> with minimal styling (font-family: monospace, white-space: pre-wrap).
-Displays <dialog> for file preview on clicking @attach#<file_id> or @attached_file#<file_id>, fetching content via /chat/file_contents.
+Messages with newlines (\n) and no special tags (, , , ) are wrapped in  with minimal styling (font-family: monospace, white-space: pre-wrap).
+Displays  for file preview on clicking @attach# or @attached_file#, fetching content via /chat/file_contents.
 Modals for creating chats, uploading files, and editing posts.
 Polls /api/chat/get every 15 seconds for updates when a chat is selected.
 Formats messages with:
-@attach#<file_id> and @attached_file#<file_id> as clickable links (<span class="file-link">) to open file preview.
-Unresolved @attach#<file_id> as <span class="file-unavailable">Файл <file_id> удалён или недоступен</span>.
-<code_patch>, <shell_code>, <stdout>, <stderr>, <mismatch> in styled <pre> blocks.
+@attach# and @attached_file# as clickable links () to open file preview.
+Unresolved @attach# as Файл  удалён или недоступен.
+, , , ,  in styled  blocks.
 
 
 
@@ -489,7 +505,7 @@ Emits select-chat event when a chat is clicked.
 Purpose: Renders hierarchical file tree.Features:
 
 Displays directories and files with expand/collapse (▼/▶).
-Emits select-file event to add @attach#<file_id> to messages.
+Emits select-file event to add @attach# to messages.
 
 /frontend/rtm/src/components/FileManager.vue
 Purpose: Manages file tree rendering and file operations.Features:
@@ -525,7 +541,7 @@ Proxies /api/* requests to /chat/*, /login, /logout, etc.
 Logs
 
 Frontend: /opt/docker/mcp-server/frontend/rtm/npm-debug.log.
-Backend: /app/logs/colloquium_core.log, /app/logs/context-<username>.log.
+Backend: /app/logs/colloquium_core.log, /app/logs/context-.log.
 
 Configuration
 
@@ -540,72 +556,25 @@ Notes
 Supported File Types: .rs (Rust), .vue (Vue.js), .js (JavaScript), .py (Python), .rulz (documentation).
 LLM Integration:
 Supports grok (via XAIConnection) and chatgpt (via OpenAIConnection).
-Triggered by @<username>, @all, or #critics_allowed in messages.
+Triggered by @, @all, or #critics_allowed in messages.
 Context limited to 131072 tokens, packed into sandwiches with JSON index.
 LLM responses containing @agent have content before @agent stripped, processed as a command, and the prefix prepended to the processed_msg for user visibility.
 
 
 Shell Code Execution:
-<shell_code> tags are processed by ShellCodeProcessor in llm_hands.py.
+ tags are processed by ShellCodeProcessor in llm_hands.py.
 If mcp=true (default), commands are sent to http://mcp-sandbox:8084/exec_commands (MCP container).
 If mcp=false, commands are executed locally via execute (local container).
-Supports <user_input rqs="..." ack="..."/> for interactive commands, enabling complex workflows.
+Supports  for interactive commands, enabling complex workflows.
 
 
 Chat Enhancements:
 GET /chat/get returns {"posts": [...], "status": {...}}, where status indicates replication state (free or busy with actor and elapsed time). Dynamic timeout for wait_changes (20s for busy, 150s for free) improves responsiveness.
 Frontend blocks message sending during busy state, enhancing user experience by preventing queue overload.
 Messages with newlines (\n) are displayed in a monospaced font with preserved formatting, improving readability.
-File preview available via clicking @attach#<file_id> or @attached_file#<file_id>, fetching content from /chat/file_contents.
+File preview available via clicking @attach# or @attached_file#, fetching content from /chat/file_contents.
 
 
 
-Recent Changes (2025-07-20)
-
-File Preview:
-
-Added support for viewing file contents in the frontend by clicking @attach#<file_id> or @attached_file#<file_id> in ChatContainer.vue.
-Implemented GET /chat/file_contents in file_routes.py to retrieve file content via FileManager.get_file(file_id)['content'].
-Added <dialog ref="filePreviewModal"> in ChatContainer.vue to display file content in <pre class="file-preview"> with light gray font and vertical scrolling.
-Fixed horizontal scrollbar issue in file preview by setting max-width: 90vw and overflow-x: hidden for .file-preview-modal.
-Removed excessive logging of unresolved @attach#<file_id> in formatMessage, replacing with <span class="file-unavailable">Файл <file_id> удалён или недоступен</span>.
-
-
-LLM Statistics:
-
-Fixed token counting in llm_interactor.py by using usage.prompt_tokens instead of usage.tokens, resolving discrepancy (e.g., 4191 vs. 3870 tokens).
-Introduced llm_usage table in llm_interactor.py via DataTable with fields ts, model, sent_tokens, used_tokens, chat_id for persistent LLM usage tracking.
-Updated /chat/get_stats in chat_routes.py to fetch statistics from llm_usage using select_row for consistency, replacing chat_stats dictionary.
-Moved statistics collection from ReplicationManager to LLMInteractor to reduce module overload.
-
-
-Recursive Dialogue:
-
-Fixed issue where recursive dialogue stopped after one LLM actor by removing break in _recursive_replicate in replication.py, allowing all LLM actors (e.g., grok3, grok4) to respond to @all.
-Verified via logs: successful dialogue between grok3 and grok4 for chat_id=1 at rql=1 and rql=2.
-
-
-Code Optimization:
-
-Removed redundant llm_usage table creation in db.py, as DataTable in llm_interactor.py handles table creation and updates.
-Renamed handle_exception to log_and_raise and moved it to basic_logger.py as a method of BasicLogger for better specificity and integration with logging.
-Updated chat_routes.py, file_routes.py, llm_interactor.py, and replication.py to use log.logger.log_and_raise for consistent exception handling.
-
-
-
-Testing
-
-API:
-curl -H "Cookie: session_id=<your_session_id>" "http://vps.vpn:8008/api/chat/get_stats?chat_id=1".
-curl -H "Cookie: session_id=<your_session_id>" "http://vps.vpn:8008/api/chat/file_contents?file_id=1".
-
-
-Database:
-sqlite3 /app/data/multichat.db "SELECT * FROM llm_usage WHERE chat_id=1 ORDER BY ts DESC LIMIT 1".
-sqlite3 /app/data/multichat.db "SELECT * FROM posts WHERE chat_id=1".
-
-
-Unit tests:
-docker exec colloquium-core python -m unittest tests.test_replication -v.
-
-
+Change Log
+See /docs/change_log.md for recent updates and changes.

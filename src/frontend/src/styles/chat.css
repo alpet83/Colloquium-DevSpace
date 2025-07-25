@@ -1,4 +1,4 @@
-/* /frontend/rtm/src/styles/chat.css, created 2025-07-22 12:55 EEST */
+/* /frontend/rtm/src/styles/chat.css, updated 2025-07-25 19:34 EEST */
 .chat-container {
   flex-grow: 1;
   display: flex;
@@ -236,7 +236,7 @@ dialog input, dialog textarea, dialog pre {
   color: #888;
   font-style: italic;
 }
-.code-patch, .shell-code, .stdout, .stderr, .mismatch, .quote {
+.code-patch, .shell_code, .stdout, .stderr, .mismatch, .quote, .traceback {
   background: #222;
   padding: 8px;
   border-radius: 5px;
@@ -245,39 +245,113 @@ dialog input, dialog textarea, dialog pre {
   border: 1px solid;
   display: block;
 }
-.stdout, .stderr {
-  max-height: 25em;
-  overflow-y: auto;
+.code-patch {
+  border-color: #555;
+}
+.shell_code {
+  background: #222;
+  border-color: #40fc40;
+  color: #10ff10;
+}
+.stdout {
+  color: #d3d3d3;
+  border-color: #d3d3d3;
+}
+.stderr {
+  color: #ff4444;
+  border-color: #ff4444;
+}
+.mismatch {
+  color: #ff4444;
+  border-color: #ff4444;
 }
 .quote {
   background: #2a2a2a;
   border-color: #1e90ff;
   color: #d3d3d3;
 }
+.traceback {
+  background: #ff8c00;
+  color: #000;
+  border-color: #ff4444;
+}
 @media (prefers-color-scheme: light) {
-  .code-patch, .shell-code, .stdout, .stderr, .mismatch, .quote {
+  .code-patch, .shell_code, .stdout, .stderr, .mismatch, .quote, .traceback {
     background: #f5f5f5;
+  }
+  .code-patch {
+    border-color: #555;
+  }
+  .shell_code {
+    color: #d2691e;
+    border-color: #d2691e;
+  }
+  .stdout {
+    color: #666;
+    border-color: #666;
+  }
+  .stderr {
+    color: #cc0000;
+    border-color: #cc0000;
+  }
+  .mismatch {
+    color: #cc0000;
+    border-color: #cc0000;
   }
   .quote {
     background: #e8e8e8;
     border-color: #0056b3;
     color: #666;
   }
+  .traceback {
+    background: #d2691e;
+    color: #000;
+    border-color: #cc0000;
+  }
 }
-.file-link {
-  background: #222;
+.file-link, .undo-file, .replace, .move-file, .post-link {
   padding: 2px 6px;
   border-radius: 5px;
   font-family: monospace;
   border: 1px solid;
   display: inline-block;
+  cursor: pointer;
+}
+.file-link {
+  background: #222;
   color: #1e90ff;
   border-color: #1e90ff;
-  cursor: pointer;
 }
 .file-link:hover {
   background: #1e90ff;
   color: #fff;
+}
+.post-link {
+  background: #222;
+  color: #1e90ff;
+  border-color: #1e90ff;
+}
+.post-link:hover {
+  background: #1e90ff;
+  color: #fff;
+}
+@media (prefers-color-scheme: light) {
+  .file-link {
+    color: #0056b3;
+    border-color: #0056b3;
+  }
+  .file-link:hover {
+    background: #0056b3;
+    color: #fff;
+  }
+  .post-link {
+    color: #0056b3;
+    border-color: #0056b3;
+  }
+  .post-link:hover {
+    background: #0056b3;
+    color: #fff;
+  }
 }
 .file-unavailable {
   background: #222;
@@ -290,66 +364,9 @@ dialog input, dialog textarea, dialog pre {
   border-color: #888;
 }
 @media (prefers-color-scheme: light) {
-  .file-link {
-    color: #0056b3;
-    border-color: #0056b3;
-  }
-  .file-link:hover {
-    background: #0056b3;
-    color: #fff;
-  }
   .file-unavailable {
     color: #666;
     border-color: #666;
-  }
-}
-.code-patch {
-  border-color: #555;
-}
-
-.shell_code {
-  font-family: monospace;
-  white-space: pre-wrap;
-  background: #2d2d2d;
-  padding: 5px;
-  border-radius: 3px;
-  border-color: #ff8c00;
-  color: #10ff10;
-}
-@media (prefers-color-scheme: light) {
-  .shell-code {
-    color: #d2691e;
-    border-color: #d2691e;
-  }
-}
-.stdout {
-  color: #d3d3d3;
-  border-color: #d3d3d3;
-}
-@media (prefers-color-scheme: light) {
-  .stdout {
-    color: #666;
-    border-color: #666;
-  }
-}
-.stderr {
-  color: #ff4444;
-  border-color: #ff4444;
-}
-@media (prefers-color-scheme: light) {
-  .stderr {
-    color: #cc0000;
-    border-color: #cc0000;
-  }
-}
-.mismatch {
-  color: #ff4444;
-  border-color: #ff4444;
-}
-@media (prefers-color-scheme: light) {
-  .mismatch {
-    color: #cc0000;
-    border-color: #cc0000;
   }
 }
 .patch-removed {
@@ -363,6 +380,22 @@ dialog input, dialog textarea, dialog pre {
 }
 @media (prefers-color-scheme: light) {
   .patch-unchanged {
+    color: #333;
+  }
+}
+
+.code-lines {
+  border-collapse: collapse;
+  border: 1px solid red;
+  font-family: monospace;
+}
+.code-lines th, .code-lines td {
+  border: 1px solid red;
+  padding: 4px;
+  color: #eee;
+}
+@media (prefers-color-scheme: light) {
+  .code-lines th, .code-lines td {
     color: #333;
   }
 }
