@@ -1,4 +1,4 @@
-# /agent/managers/project.py, updated 2025-07-20 12:14 EEST
+# /agent/managers/project.py, updated 2025-07-26 17:00 EEST
 import os
 from pathlib import Path
 from .db import Database, DataTable
@@ -7,6 +7,10 @@ from lib.basic_logger import BasicLogger
 import globals
 
 log = globals.get_logger("projectman")
+
+
+
+
 
 class ProjectManager:
     def __init__(self, project_id=None):
@@ -54,20 +58,27 @@ class ProjectManager:
         self.scan_project_files()
         log.debug("Загружен проект id=%d, project_name=%s", self.project_id, self.project_name)
 
+    def abs_file_name(self, file_name: str, project_name: str):
+        if file_name.startswith(project_name):
+            return self.projects_dir / file_name
+        else:
+            return self.projects_dir / project_name / file_name
+
     def locate_file(self, file_name, project_id=None):
         """Возвращает Path для файла, используя project_name из БД, если project_id отличается."""
-        base = Path(self.projects_dir)
-        project_name = 'default'
-        default = Path(base / project_name)
-
+        base = self.projects_dir
         file_name = file_name.lstrip('@')
+        default = self.abs_file_name(file_name, 'default')
+
         if project_id is None or project_id == self.project_id:
             if self.project_name is None:
                 log.warn("project_name не установлен для project_id=%s", str(self.project_id))
-                return default / file_name
+                return default
             project_name = self.project_name
+        elif project_id == 0:
+            project_name = '.chat-meta'
         else:
-            if project_id <= 0:
+            if project_id < 0:
                 log.error("Недопустимый project_id=%d", project_id)
                 return default / file_name
             row = self.projects_table.select_row(
@@ -76,24 +87,18 @@ class ProjectManager:
             )
             if not row:
                 log.warn("Проект id=%d не найден", project_id)
-                return default / file_name
+                return default
             project_name = row[0]
 
-        if file_name.startswith(project_name):
-            file_path = base / file_name
-        else:
-            file_path = base / project_name / file_name
+        file_path = self.abs_file_name(file_name, project_name)
         try:
             file_path = file_path.resolve()
             if not str(file_path).startswith(str(base)):
                 log.error("Недопустимый путь файла: %s", str(file_path))
-                return base / file_name
-            log.debug("Получен путь файла: file_name=%s, project_id=%s, path=%s",
-                      file_name, str(project_id), str(file_path))
+                return default / file_name
             return file_path
         except Exception as e:
-            log.excpt("Ошибка получения пути файла %s: %s", file_name, str(e),
-                      exc_info=(type(e), e, e.__traceback__))
+            log.excpt("Ошибка получения пути файла %s: %s", file_name, str(e))
             return default / file_name
 
     def update(self, project_name, description=None, local_git=None, public_git=None, dependencies=None):
@@ -115,8 +120,7 @@ class ProjectManager:
             self.dependencies = dependencies
             log.debug("Обновлён проект id=%d, project_name=%s", self.project_id, project_name)
         except Exception as e:
-            log.excpt("Ошибка обновления проекта project_id=%d: %s", self.project_id, str(e),
-                      exc_info=(type(e), e, e.__traceback__))
+            log.excpt("Ошибка обновления проекта project_id=%d: %s", self.project_id, str(e))
             raise
 
     @staticmethod
@@ -162,13 +166,13 @@ class ProjectManager:
             log.info("Создан проект id=%d, project_name=%s", project_id, project_name)
             return project_id
         except Exception as e:
-            log.excpt("Ошибка создания проекта project_name=%s: %s", project_name, str(e),
-                      exc_info=(type(e), e, e.__traceback__))
+            log.excpt("Ошибка создания проекта project_name=%s: %s", project_name, str(e))
             raise
 
     def list_projects(self):
         rows = self.projects_table.select_from(
-            columns=['id', 'project_name', 'description', 'local_git', 'public_git', 'dependencies']
+            columns=['id', 'project_name', 'description', 'local_git', 'public_git', 'dependencies'],
+            conditions="id > 0"
         )
         projects = [
             {
@@ -209,13 +213,11 @@ class ProjectManager:
                         'ts': int(file_path.stat().st_mtime)
                     })
                     file_mod = os.path.getmtime(file_path)
-                    reg_path = Path(project_name) / relative_path    # like project_name/src
-                    if self.project_name == project_name:   # регистрация файла в БД, как компонента проекта
-                        globals.file_manager.add_file(None, reg_path, file_mod, self.project_id)
+                    reg_path = Path(project_name) / relative_path
+                    if self.project_name == project_name:
+                        globals.file_manager.add_file(reg_path, None, file_mod, self.project_id)
             log.debug("Найдено %d поддерживаемых файлов в проекте %s", len(files), project_name)
             return files
         except Exception as e:
-            log.excpt("Ошибка сканирования файлов проекта %s: %s", project_name, str(e),
-                      exc_info=(type(e), e, e.__traceback__))
+            log.excpt("Ошибка сканирования файлов проекта %s: %s", project_name, str(e))
             raise
-

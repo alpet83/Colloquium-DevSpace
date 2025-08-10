@@ -1,6 +1,7 @@
-# /app/agent/lib/llm_api.py, updated 2025-07-19 17:31 EEST
+# /app/agent/lib/llm_api.py, updated 2025-07-26 21:15 EEST
 import aiohttp
 import json
+import re
 from typing import Dict, Optional
 from managers.db import Database
 import globals
@@ -36,7 +37,8 @@ class XAIConnection(LLMConnection):
                 payload = {
                     "model": self.model,
                     "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 4096
+                    "max_tokens": 4096,
+                    "temperature": 0.7  # Для большей предсказуемости
                 }
                 if search_parameters:
                     payload["search_parameters"] = search_parameters
@@ -53,12 +55,21 @@ class XAIConnection(LLMConnection):
                         return {}
                     result = await response.json()
                     log.debug("Ответ XAI API: ~C95%s~C00", json.dumps(result, indent=2, ensure_ascii=False))
+                    text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    # Постобработка: удаление нежелательного '?' в конце или после '. ?'
+                    last_15 = text[-15:] if len(text) >= 15 else text
+                    if '?' in last_15:
+                        original_text = text
+                        # Удаляем ' ?' или '?' перед тегами или в конце
+                        text = re.sub(r'\s*\?\s*(?=(@post#\d+)?$)', '', text)
+                        if text != original_text:
+                            log.debug("Удалён нежелательный '?' из ответа Grok3-mini: %s", original_text[-50:])
                     return {
-                        "text": result.get("choices", [{}])[0].get("message", {}).get("content", ""),
+                        "text": text,
                         "usage": result.get("usage", {})
                     }
         except Exception as e:
-            log.excpt("Ошибка XAIConnection: %s", str(e), exc_info=(type(e), e, e.__traceback__))
+            log.excpt("Ошибка XAIConnection: ", e=e)
             return {}
 
     def set_search_params(self, user_id: int) -> Dict:
@@ -141,5 +152,5 @@ class OpenAIConnection(LLMConnection):
                         "usage": result.get("usage", {})
                     }
         except Exception as e:
-            log.excpt("Ошибка OpenAIConnection: %s", str(e), exc_info=(type(e), e, e.__traceback__))
+            log.excpt("Ошибка OpenAIConnection: ", e=e)
             return {}

@@ -146,8 +146,7 @@ def execute(shell_command: str, user_inputs: list, user_name: str, cwd: str = '/
         return {"status": "error", "message": f"{msg}\nError: Command failed with code {errno}",
                 "user_name": user_name}
     except Exception as e:
-        log.excpt("Сбой выполнения команды %s: %s", shell_command, str(e),
-                  exc_info=(type(e), e, e.__traceback__))
+        log.excpt("Сбой выполнения команды %s: ", shell_command, e=e)
         if process:
             _in.close()
         if os.path.exists(script):

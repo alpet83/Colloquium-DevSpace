@@ -192,7 +192,6 @@ class BasicLogger:
         return time.time()
 
     def _format_backtrace(self):
-        import traceback
         return "".join(traceback.format_stack(limit=5)).strip()
 
     def log_msg(self, fmt, *args, echo=None):
@@ -261,6 +260,8 @@ class BasicLogger:
     def excpt(self, fmt, *args, e=None, exc_info=None):
         if isinstance(e, Exception):
             exc_info = (type(e), e, e.__traceback__)
+        else:
+            self.error("expt: не указан параметр объекта исключения: %s", str(e))
         backtrace = "".join(traceback.format_exception(*exc_info)) if exc_info else self._format_backtrace()
         self.log_msg(f"~C91#EXCEPTION:~C00 {fmt}", *args, echo=logging.error)
         self.log_msg("~C31#TRACEBACK:~C00\n %s", backtrace)

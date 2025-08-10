@@ -37,7 +37,7 @@ async def login(request: Request):
         log.error("HTTP ошибка в POST /login: %s", str(e))
         raise
     except Exception as e:
-        log.excpt("Ошибка сервера в POST /login: %s", str(e), exc_info=(type(e), e, e.__traceback__))
+        log.excpt("Ошибка сервера в POST /login: ", e=e)
         raise HTTPException(status_code=500, detail="Server error: %s" % str(e))
 
 @router.post("/logout")
@@ -61,7 +61,7 @@ async def logout(request: Request):
         log.error("HTTP ошибка в POST /logout: %s", str(e))
         raise
     except Exception as e:
-        log.excpt("Ошибка сервера в POST /logout: %s", str(e), exc_info=(type(e), e, e.__traceback__))
+        log.excpt("Ошибка сервера в POST /logout: ", e=e)
         raise HTTPException(status_code=500, detail="Server error: %s" % str(e))
 
 @router.get("/user/info")
@@ -91,7 +91,7 @@ async def get_user_info(request: Request):
         log.error("HTTP ошибка в GET /user/info: %s", str(e))
         raise
     except Exception as e:
-        log.excpt("Ошибка сервера в GET /user/info: %s", str(e), exc_info=(type(e), e, e.__traceback__))
+        log.excpt("Ошибка сервера в GET /user/info: ", e=e)
         raise HTTPException(status_code=500, detail="Server error: %s" % str(e))
 
 @router.get("/user/settings")
@@ -144,7 +144,7 @@ async def get_user_settings(request: Request):
         log.error("HTTP ошибка в GET /user/settings: %s", str(e))
         raise
     except Exception as e:
-        log.excpt("Ошибка сервера в GET /user/settings: %s", str(e), exc_info=(type(e), e, e.__traceback__))
+        log.excpt("Ошибка сервера в GET /user/settings: ", e=e)
         raise HTTPException(status_code=500, detail="Server error: %s" % str(e))
 
 @router.post("/user/settings")
@@ -187,5 +187,5 @@ async def save_user_settings(request: Request):
         log.error("HTTP ошибка в POST /user/settings: %s", str(e))
         raise
     except Exception as e:
-        log.excpt("Ошибка сервера в POST /user/settings: %s", str(e), exc_info=(type(e), e, e.__traceback__))
+        log.excpt("Ошибка сервера в POST /user/settings: ", e=e)
         raise HTTPException(status_code=500, detail="Server error: %s" % str(e))

@@ -1,4 +1,4 @@
-# /app/agent/routes/chat_routes.py, updated 2025-07-22 10:35 EEST
+# /app/agent/routes/chat_routes.py, updated 2025-07-26 15:15 EEST
 from fastapi import APIRouter, Request, HTTPException
 import asyncio
 import time
@@ -13,7 +13,7 @@ log = g.get_logger("chatman")
 
 @router.get("/chat/list")
 async def list_chats(request: Request):
-    log.debug("Запрос GET /chat/list, IP=%s, Cookies=~C95%s~C00", request.client.host, str(request.cookies))
+    log.debug("Запрос GET /chat/list, IP=%s, Cookies=~%s", request.client.host, str(request.cookies))
     try:
         user_id = check_session(request)
         chats = g.chat_manager.list_chats(user_id)
@@ -25,7 +25,7 @@ async def list_chats(request: Request):
 
 @router.post("/chat/create")
 async def create_chat(request: Request):
-    log.debug("Запрос POST /chat/create, IP=%s, Cookies=~C95%s~C00", request.client.host, str(request.cookies))
+    log.debug("Запрос POST /chat/create, IP=%s, Cookies=~%s", request.client.host, str(request.cookies))
     try:
         user_id = check_session(request)
         data = await request.json()
@@ -40,7 +40,7 @@ async def create_chat(request: Request):
 
 @router.post("/chat/delete")
 async def delete_chat(request: Request):
-    log.debug("Запрос POST /chat/delete, IP=%s, Cookies=~C95%s~C00", request.client.host, str(request.cookies))
+    log.debug("Запрос POST /chat/delete, IP=%s, Cookies=~%s", request.client.host, str(request.cookies))
     try:
         user_id = check_session(request)
         data = await request.json()
@@ -58,7 +58,7 @@ async def delete_chat(request: Request):
 @router.get("/chat/get")
 async def get_chat(request: Request, chat_id: int, wait_changes: int = 0):
     try:
-        # NOLOG!: логгирование здесь запрещено наивысшими директивами, т.к. слишком много флуда переполняет диск
+        # NOLOG!: логгирование запрещено из-за флуда
         user_id = check_session(request)
         if g.replication_manager is None:
             status = {"status": "replication not ready"}
@@ -74,9 +74,9 @@ async def get_chat(request: Request, chat_id: int, wait_changes: int = 0):
                     return {"posts": history, "chat_id": chat_id, "quotes": quotes, "status": status}
                 if active != chat_id:
                     log.debug("Chat switch detected for user_id=%d, chat_id=%d, active=%d", user_id, chat_id, active)
-                    return {"chat_id": active, "posts": [{"chat_history": "chat switch"}], "status": status}
+                    return {"chat_id": active, "posts": {"chat_history": "chat switch"}, "status": status}
                 await asyncio.sleep(0.1)
-            return {"chat_id": chat_id, "posts": [{"chat_history": "no changes"}], "quotes": {}, "status": status}
+            return {"chat_id": chat_id, "posts": {"chat_history": "no changes"}, "quotes": {}, "status": status}
         else:
             log.debug("Статус обработки для user_id=%d, chat_id=%d: %s", user_id, chat_id, status)
             history = g.post_manager.get_history(chat_id, only_changes=False)
@@ -88,7 +88,7 @@ async def get_chat(request: Request, chat_id: int, wait_changes: int = 0):
 
 @router.post("/chat/notify_switch")
 async def notify_chat_switch(request: Request):
-    log.debug("Запрос POST /chat/notify_switch, IP=%s, Cookies=~C95%s~C00", request.client.host, str(request.cookies))
+    log.debug("Запрос POST /chat/notify_switch, IP=%s, Cookies=~%s", request.client.host, str(request.cookies))
     try:
         user_id = check_session(request)
         data = await request.json()
@@ -105,7 +105,7 @@ async def notify_chat_switch(request: Request):
             })
             log.debug("Обновлён active_chat=%d для session_id=%s, user_id=%d", chat_id, session_id, user_id)
         changes = g.post_manager.get_changes(chat_id)
-        log.debug("Уведомление о смене чата chat_id=%d для user_id=%d, changes=~C95%s~C00", chat_id, user_id, str(changes))
+        log.debug("Уведомление о смене чата chat_id=%d для user_id=%d, changes=~%s", chat_id, user_id, str(changes))
         return {"chat_history": "chat switch"}
     except Exception as e:
         handle_exception("Ошибка в POST /chat/notify_switch", e)
@@ -113,7 +113,7 @@ async def notify_chat_switch(request: Request):
 
 @router.post("/chat/post")
 async def post_message(request: Request):
-    log.debug("Запрос POST /chat/post, IP=%s, Cookies=~C95%s~C00", request.client.host, str(request.cookies))
+    log.debug("Запрос POST /chat/post, IP=%s, Cookies=~%s", request.client.host, str(request.cookies))
     try:
         user_id = check_session(request)
         data = await request.json()
@@ -131,7 +131,7 @@ async def post_message(request: Request):
 
 @router.post("/chat/edit_post")
 async def edit_post(request: Request):
-    log.debug("Запрос POST /chat/edit_post, IP=%s, Cookies=~C95%s~C00", request.client.host, str(request.cookies))
+    log.debug("Запрос POST /chat/edit_post, IP=%s, Cookies=~%s", request.client.host, str(request.cookies))
     try:
         user_id = check_session(request)
         data = await request.json()
@@ -149,7 +149,7 @@ async def edit_post(request: Request):
 
 @router.post("/chat/delete_post")
 async def delete_post(request: Request):
-    log.debug("Запрос POST /chat/delete_post, IP=%s, Cookies=~C95%s~C00", request.client.host, str(request.cookies))
+    log.debug("Запрос POST /chat/delete_post, IP=%s, Cookies=~%s", request.client.host, str(request.cookies))
     try:
         user_id = check_session(request)
         data = await request.json()
@@ -170,7 +170,7 @@ async def get_chat_stats(request: Request, chat_id: int):
     try:
         user_id = check_session(request)
         chat = g.chat_manager.chats_table.select_row(
-            conditions={'chat_id': chat_id},
+            conditions=[('chat_id', '=', chat_id)],
             columns=['chat_id']
         )
         if not chat:
@@ -178,7 +178,7 @@ async def get_chat_stats(request: Request, chat_id: int):
             raise HTTPException(status_code=404, detail="Chat not found")
         stats_row = g.replication_manager.llm_usage_table.select_row(
             columns=['used_tokens', 'sources_used'],
-            conditions={'chat_id': chat_id},
+            conditions=[('chat_id', '=', chat_id)],
             order_by='ts DESC'
         )
         stats = {
@@ -193,29 +193,29 @@ async def get_chat_stats(request: Request, chat_id: int):
 
 @router.get("/chat/get_parent_msg")
 async def get_parent_msg(request: Request, post_id: int):
-    log.debug("Запрос GET /chat/get_parent_msg, post_id=%d, IP=%s, Cookies=~C95%s~C00", post_id, request.client.host, str(request.cookies))
+    log.debug("Запрос GET /chat/get_parent_msg, post_id=%d, IP=%s, Cookies=~%s", post_id, request.client.host, str(request.cookies))
     try:
         user_id = check_session(request)
         ch_tab = g.chat_manager.chats_table
         ps_tab = g.post_manager.posts_table
         msg = ps_tab.select_row(
             columns=['id', 'chat_id', 'user_id', 'message', 'timestamp'],
-            conditions={'id': post_id}
+            conditions=[('id', '=', post_id)]
         )
         if not msg:
             log.info("Сообщение post_id=%d не найден для user_id=%d", post_id, user_id)
             affected_chats = ch_tab.select_from(
-                conditions={'parent_msg_id': post_id},
+                conditions=[('parent_msg_id', '=', post_id)],
                 columns=['chat_id', 'parent_msg_id']
             )
             for chat_id, parent_msg_id in affected_chats:
                 chat = ch_tab.select_row(
-                    conditions={'chat_id': chat_id},
+                    conditions=[('chat_id', '=', chat_id)],
                     columns=['chat_id']
                 )
                 if chat:
                     new_parent_msg = ps_tab.select_row(
-                        conditions={'chat_id': chat[0], 'id': f"<{post_id}"},
+                        conditions=[('chat_id', '=', chat[0]), ('id', '<', post_id)],
                         columns=['id'],
                         order_by='id DESC'
                     )
@@ -234,7 +234,7 @@ async def get_parent_msg(request: Request, post_id: int):
             "message": msg[3],
             "timestamp": msg[4]
         }
-        log.debug("Возвращено сообщение post_id=%d: ~C95%s~C00", post_id, str(result))
+        log.debug("Возвращено сообщение post_id=%d: ~%s", post_id, str(result))
         return result
     except Exception as e:
         handle_exception("Ошибка в GET /chat/get_parent_msg", e)
@@ -252,11 +252,13 @@ async def get_logs(request: Request):
                 lines = f.readlines()[-100:]  # Последние 100 строк
                 for line in lines:
                     if "#ERROR" in line or "#WARNING" in line:
-                        match = re.match(r"(.+?) #(\w+): (.+)", line)
+                        match = re.match(r"[(.+?)] #(\w+): (.+)", line)
                         if match:
                             timestamp, level, message = match.groups()
+                            timestamp = timestamp.replace(',', '.')
+                            ts = time.strptime(timestamp, g.SQL_TIMESTAMP6)
                             logs.append({
-                                "timestamp": int(time.mktime(time.strptime(timestamp, "%Y-%m-%d %H:%M:%S,%f"))),
+                                "timestamp": int(time.mktime(ts)),
                                 "level": level,
                                 "message": message
                             })

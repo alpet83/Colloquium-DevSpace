@@ -41,5 +41,5 @@ async def watch_files(shutdown_event: asyncio.Event):
                     log.debug("Удалена запись о несуществующем файле %s", file_path)
             await asyncio.sleep(5)
         except Exception as e:
-            log.excpt("Ошибка в мониторинге файлов: %s", str(e), exc_info=(type(e), e, e.__traceback__))
+            log.excpt("Ошибка в мониторинге файлов: ", e=e)
             await asyncio.sleep(5)

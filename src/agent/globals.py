@@ -1,4 +1,4 @@
-# /agent/globals.py, updated 2025-07-17 15:45 EEST
+# /agent/globals.py, updated 2025-07-26 16:30 EEST
 from lib.basic_logger import BasicLogger
 from fastapi import Request, HTTPException
 
@@ -20,9 +20,11 @@ LOG_FORMAT = '[%(asctime)s]. #%(levelname)s(%(name)s): %(message)s'
 
 CONFIG_FILE = "/app/data/colloquium_config.toml"
 PRE_PROMPT_PATH = "/app/docs/llm_pre_prompt.md"
+CHAT_META_DIR = "/app/projects/.chat-meta"
 
-# /agent/globals.py, updated 2025-07-18 09:10 EEST
-
+# форматирование строк даты-времени
+SQL_TIMESTAMP = "%Y-%m-%d %H:%M:%S"
+SQL_TIMESTAMP6 = "%Y-%m-%d %H:%M:%S.%f"
 
 loggers = {}
 chat_switch_events = {}
@@ -35,12 +37,10 @@ user_manager = None
 
 sessions_table = None
 
-
 def get_logger(name, stdout=None):
     if name not in loggers:
         loggers[name] = BasicLogger(name, name, stdout)
     return loggers[name]
-
 
 def check_session(request: Request) -> int:
     """Проверяет сессию и возвращает user_id или вызывает HTTPException."""
@@ -57,7 +57,6 @@ def check_session(request: Request) -> int:
     uid = row[0]
     return uid
 
-
 def handle_exception(message: str, e: Exception, _raise: bool = True):
     """Общая функция для обработки исключений и логирования."""
     log = get_logger("exception")
@@ -66,7 +65,7 @@ def handle_exception(message: str, e: Exception, _raise: bool = True):
         if _raise:
             raise e
     else:
-        log.excpt(f"Ошибка сервера: {message}: {str(e)}", e=e)
+        log.excpt(f"Ошибка сервера: {message}: ", e=e)
         if _raise:
             raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 

@@ -1,17 +1,28 @@
-# /app/agent/llm_hands.py, updated 2025-07-23 12:37 EEST
+# /app/agent/llm_hands.py, updated 2025-07-27 15:30 EEST
 import re
 import globals
 from processors.block_processor import CommandProcessor, ProcessResult
 from processors.shell_code import ShellCodeProcessor
-from processors.file_processors import FileEditProcessor, FileReplaceProcessor, \
-    FileMoveProcessor, FilePatchProcessor, FileUndoProcessor
+from processors.file_processors import FileEditProcessor, FileReplaceProcessor, FileMoveProcessor, FileUndoProcessor
+from processors.entity_processor import EntityUpdateProcessor
+from processors.patch_processor import CodePatchProcessor
 
 log = globals.get_logger("llm_hands")
 
+def process_message(text, timestamp, user_name: str, rql: int = 0) -> dict:
+    """Обрабатывает сообщение, применяя процессоры для специальных тегов.
 
-def process_message(text, timestamp, user_name: str, rql=None):
-    log.debug("Обработка сообщения: text=%s, timestamp=%d, user_name=%s, rql=%s", text[:50], timestamp,
-              user_name or "@self", str(rql))
+    Args:
+        text (str or bytes): Текст сообщения.
+        timestamp (int): Временная метка сообщения.
+        user_name (str): Имя пользователя.
+        rql (int, optional): Уровень рекурсии диалога. Defaults to 0.
+
+    Returns:
+        dict: Результат обработки с ключами handled_cmds, failed_cmds, processed_msg, agent_reply, has_code_file.
+    """
+    log.debug("Обработка сообщения: text=%s, timestamp=%d, user_name=%s, rql=%d", text[:50], timestamp,
+              user_name or "@self", rql)
     if isinstance(text, bytes):
         text = text.decode('utf-8', errors='replace')
         log.warn("Входной текст был байтовым, декодирован: %s", text[:50])
@@ -23,11 +34,12 @@ def process_message(text, timestamp, user_name: str, rql=None):
     processors = [
         CommandProcessor(),
         FileEditProcessor(),
-        FilePatchProcessor(),
+        CodePatchProcessor(),
         FileMoveProcessor(),
         FileUndoProcessor(),
         FileReplaceProcessor(),
-        ShellCodeProcessor()
+        ShellCodeProcessor(),
+        EntityUpdateProcessor()
     ]
     log.info("Инициализировано %d процессоров для обработки сообщения", len(processors))
 

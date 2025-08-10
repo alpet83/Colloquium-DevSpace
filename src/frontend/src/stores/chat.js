@@ -1,4 +1,4 @@
-// /frontend/rtm/src/stores/chat.js, updated 2025-07-22 17:15 EEST
+// /frontend/rtm/src/stores/chat.js, updated 2025-07-26 15:15 EEST
 import { defineStore } from 'pinia'
 import { log_msg, log_error } from '../utils/debugging'
 
@@ -88,13 +88,13 @@ export const useChatStore = defineStore('chat', {
             log_msg('CHAT', 'Ignoring history response for outdated chat_id:', data.chat_id, 'Current:', this.selectedChatId)
             return
           }
-          if (data.posts && data.posts.length === 1 && data.posts[0].chat_history === 'chat switch') {
+          if (data.posts && data.posts.chat_history === 'chat switch') {
             log_msg('CHAT', 'Chat switch detected, fetching full history')
             this.waitChanges = false
             this.need_full_history = true
             this.status = data.status
             await this.fetchHistory()
-          } else if (data.posts && data.posts.length === 1 && data.posts[0].chat_history === 'no changes') {
+          } else if (data.posts && data.posts.chat_history === 'no changes') {
             if (this.awaited_to_del.length > 0) {
               log_msg('CHAT', 'No changes received, but posts awaiting deletion:', this.awaited_to_del)
               this.chatError = 'Posts awaiting deletion not confirmed, fetching full history'
@@ -105,19 +105,20 @@ export const useChatStore = defineStore('chat', {
             log_msg('CHAT', 'No changes in chat history, status:', this.status)
           } else {
             const newHistory = {}
-            const deletedIds = new Set(data.posts.filter(post => post.action === 'delete').map(post => post.id))
-            const newPosts = data.posts.filter(post => post.action !== 'delete')
-            newPosts.forEach(post => {
-              newHistory[post.id] = post
-              log_msg('CHAT', `Have changes, added post ${post.id}, refreshing UI`)
-            })
-            for (const postId of deletedIds) {
-              if (newHistory[postId]) {
-                delete newHistory[postId]
+            const deletedIds = new Set(Object.values(data.posts)
+                .filter(post => post.action === 'delete')
+                .map(post => post.id))
+            for (const [postId, post] of Object.entries(data.posts)) {
+              if (post.action !== 'delete') {
+                newHistory[postId] = post
+                log_msg('CHAT', `Have changes, added post ${postId}, refreshing UI`)
               }
             }
+            for (const postId of deletedIds) {
+              delete newHistory[postId]
+            }
             this.$patch({
-              history: Object.assign({}, newHistory),
+              history: newHistory,
               quotes: data.quotes || {}
             })
             log_msg('CHAT', 'Fetched quotes:', JSON.stringify(data.quotes || {}, null, 2))
@@ -131,7 +132,11 @@ export const useChatStore = defineStore('chat', {
             this.need_full_history = false
             this.status.status = 'free'
             log_msg('CHAT', 'Reset status to free after fetchHistory')
-            await this.scrollToBottom()
+            if (deletedIds.size === 0) {
+              await this.scrollToBottom()
+            } else {
+              log_msg('CHAT', 'Skipped scrollToBottom due to deleted posts:', Array.from(deletedIds))
+            }
           }
           this.backendError = false
           this.chatError = ''

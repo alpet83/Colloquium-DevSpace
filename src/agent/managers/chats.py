@@ -89,8 +89,7 @@ class ChatManager:
             log.debug("Создан чат chat_id=%d для user_id=%d", chat_id, user_id)
             return chat_id
         except Exception as e:
-            log.excpt("Ошибка создания чата для user_id=%d: %s", user_id, str(e),
-                      exc_info=(type(e), e, e.__traceback__))
+            log.excpt("Ошибка создания чата для user_id=%d: ", user_id, e=e)
             return {"error": str(e)}
 
     def delete_chat(self, chat_id, user_id: int):
@@ -117,8 +116,7 @@ class ChatManager:
             log.info("Удалён чат chat_id=%d пользователем user_id=%d", chat_id, user_id)
             return {"status": "ok"}
         except Exception as e:
-            log.excpt("Ошибка удаления чата chat_id=%d: %s", chat_id, str(e),
-                      exc_info=(type(e), e, e.__traceback__))
+            log.excpt("Ошибка удаления чата chat_id=%d: ", chat_id, e=e)
             return {"error": str(e)}
 
     def get_chat_hierarchy(self, chat_id):
@@ -163,6 +161,5 @@ class ChatManager:
             log.debug("Получена статистика файлов для chat_id=%d: %d файлов", chat_id, stats['total_files'])
             return stats
         except Exception as e:
-            log.excpt("Ошибка получения статистики файлов для chat_id=%d: %s", chat_id, str(e),
-                      exc_info=(type(e), e, e.__traceback__))
+            log.excpt("Ошибка получения статистики файлов для chat_id=%d: ", chat_id, e=e)
             return {"error": str(e)}

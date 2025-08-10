@@ -51,3 +51,122 @@
 - Added `checkAwaitedFiles` method to initiate file list requests when new posts contain unknown file IDs, integrated with `startPolling` to run after `fetchHistory`.
 - Enhanced `reformatMessages` to update message formatting after file list updates, removing resolved file IDs from `awaited_files` and decrementing retry counts for unresolved IDs.
 - Added logging for file list requests and `awaited_files` updates to aid debugging (`Requested file list for awaited_files: ...`, `Updated awaited_files: ...`).
+
+
+====================================== COMMIT 10.08.2025 =========================================================
+
+Change List for Colloquium DevSpace Update
+Date: 2025-08-08Purpose: Document key changes in the Colloquium DevSpace project update, focusing on LLM interaction improvements, agent processing enhancements, and parser unification. This update integrates SandwichPack compression support for better context control in multi-chat development.
+Overview
+This update advances the Colloquium DevSpace multi-chat tool for development, enabling LLM and agent collaboration in code editing, testing, and container execution. Changes include better handling of LLM responses, entity updates, file operations, and unified parsing with IterativeRegex for consistency across languages. The integration of SandwichPack compression ensures efficient context management, resolving issues with truncated files and improving API performance.
+Changes
+1. LLM Interaction and Context Assembly
+
+File: context_assembler.py
+
+Description:
+
+Added filter_input method to remove <traceback> tags from messages.
+Updated assemble_posts for better chat hierarchy handling and file attachment resolution.
+Introduced JSON and Path imports for improved file path management.
+Enhanced logging for sandwich block parsers.
+
+
+File: llm_interactor.py
+
+Description:
+
+Updated pre-prompt loading with UTF-8 encoding support.
+Added llm_usage_table for tracking LLM token usage and costs.
+Enhanced _write_context_stats for logging context statistics and index JSON.
+Improved send_to_llm with search parameters and usage logging.
+
+
+File: llm_api.py
+
+Description:
+
+Added set_search_params stub for future search configuration.
+Updated XAIConnection and OpenAIConnection for max_tokens and temperature settings.
+Improved error handling and logging in API calls.
+
+
+
+2. Agent Processing and Command Handling
+
+File: llm_hands.py
+
+
+Description:
+
+Updated process_message to handle multiple processors (e.g., CommandProcessor, FileEditProcessor, CodePatchProcessor).
+Added support for <user_input> tags in shell commands.
+Enhanced result aggregation for handled/failed commands and agent replies.
+
+
+File: post_processor.py
+
+
+Description:
+
+Updated process_response to extract quotes and handle edit commands.
+Added save_quote for storing quotes in the database.
+Improved quote replacement with @quote#id.
+
+
+File: block_processor.py
+
+
+Description:
+
+Updated ProcessResult to include call_stack and agent_messages.
+Added CommandProcessor for handling commands like ping, run_test, commit.
+Enhanced pattern matching for dynamic tags.
+
+
+File: shell_code.py
+
+
+Description:
+
+Updated ShellCodeProcessor for MCP API integration and user inputs.
+Added timeout and project_name handling.
+
+
+File: file_processors.py
+
+
+Description:
+
+Updated FileEditProcessor for file creation and modification with project support.
+Added FileReplaceProcessor for full file replacement.
+Added FileMoveProcessor and FileUndoProcessor for file operations.
+
+
+File: patch_processor.py
+
+
+Description:
+
+Updated PatchMismatch and HunkBlock for better patch application.
+Enhanced CodePatchProcessor for handling patch mismatches and backups.
+
+
+File: entity_processor.py
+
+
+
+Description:
+
+Updated EntityUpdateProcessor for entity updates with context lines checking.
+
+
+3. Other Enhancements
+
+File: execute_commands.py
+
+
+Description:
+
+Added support for executing commands in containers with user inputs.
+

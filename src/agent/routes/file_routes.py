@@ -1,4 +1,4 @@
-# /agent/routes/file_routes.py, updated 2025-07-23 17:02 EEST
+# /agent/routes/file_routes.py, updated 2025-07-26 19:00 EEST
 from fastapi import APIRouter, Request, UploadFile, File, Form, HTTPException, Query
 import time
 from managers.db import Database
@@ -12,12 +12,12 @@ db = Database.get_database()
 
 @router.post("/chat/upload_file")
 async def upload_file(request: Request, file: UploadFile = File(...), chat_id: int = Form(...), file_name: str = Form(...), project_id: int = Form(None)):
-    log.debug("Запрос POST /chat/upload_file, IP=%s, Cookies=~C95%s~C00, project_id=%s", request.client.host, str(request.cookies), str(project_id))
+    log.debug("Запрос POST /chat/upload_file, IP=%s, Cookies=~%s, project_id=%s", request.client.host, str(request.cookies), str(project_id))
     try:
         user_id = globals.check_session(request)
         content = await file.read()
         timestamp = int(time.time())
-        file_id = globals.file_manager.add_file(content, file_name, timestamp, project_id)
+        file_id = globals.file_manager.add_file(file_name, content, timestamp, project_id)
         if not file_id:
             log.error("Не удалось добавить файл file_name=%s, project_id=%s", file_name, str(project_id))
             raise HTTPException(status_code=500, detail="Failed to add file")
@@ -30,7 +30,7 @@ async def upload_file(request: Request, file: UploadFile = File(...), chat_id: i
 
 @router.post("/chat/update_file")
 async def update_file(request: Request, file: UploadFile = File(...), file_id: int = Form(...), project_id: int = Form(None)):
-    log.debug("Запрос POST /chat/update_file, IP=%s, Cookies=~C95%s~C00, project_id=%s", request.client.host, str(request.cookies), str(project_id))
+    log.debug("Запрос POST /chat/update_file, IP=%s, Cookies=~%s, project_id=%s", request.client.host, str(request.cookies), str(project_id))
     try:
         user_id = globals.check_session(request)
         content = await file.read()
@@ -45,7 +45,7 @@ async def update_file(request: Request, file: UploadFile = File(...), file_id: i
 
 @router.post("/chat/move_file")
 async def move_file(request: Request):
-    log.debug("Запрос POST /chat/move_file, IP=%s, Cookies=~C95%s~C00", request.client.host, str(request.cookies))
+    log.debug("Запрос POST /chat/move_file, IP=%s, Cookies=~%s", request.client.host, str(request.cookies))
     try:
         user_id = globals.check_session(request)
         data = await request.json()
@@ -67,7 +67,7 @@ async def move_file(request: Request):
 
 @router.post("/chat/delete_file")
 async def delete_file(request: Request):
-    log.debug("Запрос POST /chat/delete_file, IP=%s, Cookies=~C95%s~C00", request.client.host, str(request.cookies))
+    log.debug("Запрос POST /chat/delete_file, IP=%s, Cookies=~%s", request.client.host, str(request.cookies))
     try:
         user_id = globals.check_session(request)
         data = await request.json()
@@ -84,10 +84,12 @@ async def delete_file(request: Request):
 
 @router.get("/chat/list_files")
 async def list_files(request: Request, project_id: int = Query(None)):
-    log.debug("Запрос GET /chat/list_files, IP=%s, Cookies=~C95%s~C00, project_id=%s", request.client.host, str(request.cookies), str(project_id))
+    log.debug("Запрос GET /chat/list_files, IP=%s, Cookies=~%s, project_id=%s", request.client.host, str(request.cookies), str(project_id))
     try:
         user_id = globals.check_session(request)
-        files = globals.file_manager.list_files(user_id, project_id)
+        # Интерпретируем project_id <= 0 как запрос всех файлов
+        effective_project_id = None if project_id is None or project_id <= 0 else project_id
+        files = globals.file_manager.list_files(user_id, effective_project_id)
         log.debug("Возвращено %d файлов для user_id=%d, project_id=%s", len(files), user_id, str(project_id))
         return files
     except Exception as e:
@@ -96,7 +98,7 @@ async def list_files(request: Request, project_id: int = Query(None)):
 
 @router.get("/chat/file_contents")
 async def get_file_contents(request: Request, file_id: int = Query(...)):
-    log.debug("Запрос GET /chat/file_contents, IP=%s, Cookies=~C95%s~C00, file_id=%d", request.client.host, str(request.cookies), file_id)
+    log.debug("Запрос GET /chat/file_contents, IP=%s, Cookies=~%s, file_id=%d", request.client.host, str(request.cookies), file_id)
     try:
         user_id = globals.check_session(request)
         file_data = globals.file_manager.get_file(file_id)

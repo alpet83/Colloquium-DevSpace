@@ -1,4 +1,4 @@
-# /agent/managers/post_processor.py, updated 2025-07-19 09:42 EEST
+# /agent/managers/post_processor.py, updated 2025-07-27 09:44 EEST
 import re
 import datetime
 import globals
@@ -8,7 +8,6 @@ from llm_hands import process_message
 from lib.basic_logger import BasicLogger
 
 log = globals.get_logger("postproc")
-
 
 class PostProcessor:
     def __init__(self):
@@ -39,6 +38,24 @@ class PostProcessor:
             log.error("Неверный тип ответа: %s", type(response))
             return {"handled_cmds": 0, "failed_cmds": 1, "processed_msg": response,
                     "agent_reply": "Error: Invalid response type"}
+
+        # Извлекаем @post#post_id для reply_to
+        reply_to = post_id
+        cite_match = re.search(r'@post#(\d+)', response)
+        if cite_match:
+            post_id_candidate = int(cite_match.group(1))
+            if post_id_candidate < 1_000_000:  # Проверяем, что это post_id, а не timestamp
+                reply_to = post_id_candidate
+                log.debug("Извлечён reply_to=%d из @post#%d", reply_to, post_id_candidate)
+        else:
+            # Для ответов моделей/агентов (user_id >= 2) используем последний пост
+            if user_id >= 2:
+                last_post = globals.post_manager.db.fetch_one(
+                    'SELECT id FROM posts WHERE chat_id = :chat_id ORDER BY id DESC LIMIT 1',
+                    {'chat_id': chat_id}
+                )
+                reply_to = last_post[0] if last_post else None
+                log.debug("Установлен reply_to=%s на основе последнего поста для user_id=%d", str(reply_to), user_id)
 
         # Проверяем команды для llm_hands
         user_name = globals.user_manager.get_user_name(user_id)
@@ -118,6 +135,6 @@ class PostProcessor:
             quote_id = self.quotes_table.insert_into(values)
             return quote_id
         except Exception as e:
-            log.excpt("Ошибка сохранения цитаты для chat_id=%d, user_id=%d: %s",
-                      chat_id, user_id, str(e), exc_info=(type(e), e, e.__traceback__))
+            log.excpt("Ошибка сохранения цитаты для chat_id=%d, user_id=%d: ",
+                      chat_id, user_id, e=e)
             return 0

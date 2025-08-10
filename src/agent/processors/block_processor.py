@@ -163,8 +163,7 @@ class BlockProcessor:
                 log.error("Ошибка записи обновленного контента в %s, функция вернула %d", file_name, res)
                 raise ProcessorError(f"Error: Failed to store @attach#{file_id}, returned code {res}", user_name)
         except Exception as e:
-            log.excpt("Ошибка сохранения файла file_id=%d: %s", file_id, str(e),
-                      exc_info=(type(e), e, e.__traceback__))
+            log.excpt("Ошибка сохранения файла file_id=%d: ", file_id, e=e)
             raise ProcessorError(f"Error: Failed to save {file_name}: {e}", user_name)
 
     def handle_block(self, attrs, block_code):

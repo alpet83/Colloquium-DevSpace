@@ -57,15 +57,13 @@ async def log_requests_and_exceptions(request: Request, call_next):
         log.error("Валидационная ошибка для %s %s: ~C95%s~C00", request.method, str(request.url), str(exc.errors()))
         raise
     except Exception as exc:
-        log.excpt("Ошибка сервера для %s %s: %s", request.method, str(request.url), str(exc),
-                  exc_info=(type(exc), exc, exc.__traceback__))
+        log.excpt("Ошибка сервера для %s %s: ", request.method, str(request.url), e=exc)
         raise
 
 
 @app.exception_handler(UnicornException)
 async def unicorn_exception_handler(request: Request, exc: UnicornException):
-    log.excpt("Unicorn raised %s", str(exc),
-                      exc_info=(type(exc), exc, exc.__traceback__))
+    log.excpt("Unicorn raised ", e=exc)
     return JSONResponse(
         status_code=418,
         content={"message": f"Oops! {exc.name} did something. There goes a rainbow..."},

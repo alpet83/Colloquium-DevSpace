@@ -1,4 +1,4 @@
-# /agent/managers/files.py, updated 2025-07-23 17:02 EEST
+# /agent/managers/files.py, updated 2025-07-26 19:45 EEST
 import globals
 import os
 import time
@@ -10,9 +10,16 @@ from lib.basic_logger import BasicLogger
 
 log = globals.get_logger("fileman")
 
-def _qfn(file_name, project_id):
+
+def _qfn(file_name, project_id: int):
     file_name = str(file_name).lstrip("@").lstrip("/")
     return globals.project_manager.locate_file(file_name, project_id)
+
+
+def _mod_time(file_name: str, project_id: int):
+    qfn = _qfn(file_name, project_id)
+    return os.path.getmtime(qfn)
+
 
 class FileManager:
     def __init__(self):
@@ -31,7 +38,6 @@ class FileManager:
         self.check()
 
     def check(self):
-        """Сканирует attached_files, добавляет @ к ссылкам, проверяет файлы на диске, преобразует устаревшие ссылки в вложения."""
         rows = self.files_table.select_from(
             columns=['id', 'file_name', 'content', 'project_id', 'ts']
         )
@@ -46,17 +52,12 @@ class FileManager:
                 )
                 log.debug("Добавлен префикс @ для ссылки: id=%d, file_name=%s -> %s", file_id, file_name, new_file_name)
                 file_name = new_file_name
-            if is_link and not self.link_valid(file_id):
-                log.warn("%50s @ %d более не существует на диске, удаляется запись %d", file_name, project_id, file_id)
-                self.unlink(file_id)
+            if is_link and not self.link_valid(file_id) and project_id > 0:
+                log.warn("Для проекта %3d, @%5d: %s  более не существует на диске", project_id, file_id, file_name)
+
 
     def _dedup(self, project_id: int = None):
-        """Удаляет дубликаты файлов по file_name и project_id, сохраняя запись с минимальным id."""
-        if project_id is None:
-            project_id = globals.project_manager.project_id
-        if project_id is None:
-            return
-        conditions = {'project_id': project_id}
+        conditions = {'project_id': project_id} if project_id is not None else {}
         query = 'SELECT COUNT(*) as count, file_name, project_id FROM attached_files'
         if conditions:
             query += ' WHERE project_id = :project_id'
@@ -74,16 +75,16 @@ class FileManager:
 
     def exists(self, file_name, project_id=None, disk_check=True):
         file_id = self.find(file_name, project_id)
+        if file_id is None:
+            return False
         if not disk_check:
-            log.debug("Ссылка на файл существует: %40s, project_id=%s, id=%d", str(file_name), project_id, file_id)
+            log.debug("Ссылка на файл существует: %s, project_id=%s, id=%d", str(file_name), project_id, file_id)
             return True
         return self.link_valid(file_id)
 
     def find(self, file_name, project_id=None):
         conditions = {'file_name': f"@{file_name}"}
-        if project_id is None:
-            conditions['project_id'] = globals.project_manager.project_id
-        else:
+        if project_id is not None:
             conditions['project_id'] = project_id
 
         row = self.files_table.select_row(
@@ -101,13 +102,12 @@ class FileManager:
         qfn = _qfn(file_name, project_id)
         if os.path.exists(qfn):
             return True
-        log.warn("link_valid: Не найден %5d: %s ", file_id, qfn)
+        log.warn("link_valid: Не найден %d: %s ", file_id, qfn)
         return False
 
     def get_record(self, file_id: int, err_fmt: str = "Failed get_record for %d"):
         if file_id is None:
-            log.error("Attempt get record for file_id = None")
-            return None
+            raise FileExistsError("attempt get record for file_id = None")
 
         rec = self.files_table.select_row(
             conditions={'id': file_id},
@@ -124,15 +124,15 @@ class FileManager:
             log.warn("Запись id=%d не найдена в attached_files", file_id)
             return None
         file_name = rec[1].lstrip('@')
-        file_data = {'id': rec[0], 'file_name': file_name, 'content': rec[2], 'ts': rec[3], 'project_id': rec[4]}
+        project_id = rec[4]
+        file_data = {'id': rec[0], 'file_name': file_name, 'content': rec[2], 'ts': rec[3], 'project_id': project_id}
         content = None
         if file_data['content'] is None:
-            file_path = _qfn(file_name, file_data['project_id'])
-
+            file_path = _qfn(file_name, project_id)
             if not file_path.exists():
                 log.warn("Реальный файл %s не существует", str(file_path))
                 return None
-            with file_path.open('r') as f:
+            with file_path.open('r', encoding='utf-8') as f:
                 content = f.read()
 
             if content is None:
@@ -142,38 +142,51 @@ class FileManager:
             content = file_data['content']
 
         file_data['content'] = globals.unitext(content)
-        log.debug("Получен файл id=%d, file_name=%s, project_id=%s", file_id, file_name, str(file_data['project_id']))
+        log.debug("Получен файл id=%d, file_name=%s, project_id=%s", file_id, file_name, str(project_id))
         return file_data
 
     def get_file_name(self, file_id: int):
+        if file_id is None or file_id <= 0:
+            raise FileExistsError("Not specified valid file_id")
         rec = self.get_record(file_id)
         if rec:
-            return rec[1]
+            file_name = rec[1].lstrip('@')
+            project_id = rec[4]
+            return file_name
         return None
 
-    def add_file(self, content, file_name, timestamp, project_id=None):
+    def add_file(self, file_name: str, content: str, timestamp=None, project_id=None):
         file_name = str(file_name).lstrip("@").lstrip("/")
-        safe_path = _qfn(file_name, project_id)
+        if len(file_name) > 300:
+            raise ValueError(f"Слишком длинное имя файла {len(file_name)}")
         file_id = self.exists(file_name, project_id)
         if file_id:
             return file_id
-        wb = 0
+        if timestamp is None:
+            timestamp = int(time.time())
+
         if content:
-            wb = self.write_file(file_name, content, project_id)
+            self.write_file(file_name, content, project_id)
+
+        if timestamp is None:
+            timestamp = _mod_time(file_name, project_id)
+
+        effective_file_name = f"@{file_name}" if not content else file_name
+        if project_id == 0:
+            effective_file_name = f"@{file_name}"
         file_id = self.files_table.insert_into(
             values={
                 'content': None,
                 'ts': timestamp,
-                'file_name': f"@{file_name}" if not content else file_name,
+                'file_name': effective_file_name,
                 'project_id': project_id
             },
             ignore=True
         )
-
         log.debug("Добавлен файл id=%d, file_name=%s, project_id=%s", file_id, file_name, str(project_id))
         return file_id
 
-    def update_file(self, file_id: int, content, timestamp, project_id=None):
+    def update_file(self, file_id: int, content: str, timestamp=None, project_id=None):
         if not self.link_valid(file_id):
             log.error("Файл id=%d не найден для обновления", file_id)
             return -1
@@ -193,14 +206,18 @@ class FileManager:
                     return -4
                 os.chown(safe_path, pwd.getpwnam('agent').pw_uid, -1)
                 log.debug("Установлен владелец agent для файла: %s", file_name)
+                if timestamp is None:
+                    timestamp = _mod_time(file_name, project_id)
+
             except Exception as e:
-                log.excpt("Ошибка записи файла %s: %s", file_name, str(e), exc_info=(type(e), e, e.__traceback__))
+                log.excpt("Ошибка записи файла %s: ", file_name, e=e)
                 return -6
+        effective_file_name = f"@{file_name}" if project_id == 0 else file_name
         self.files_table.update(
             conditions={'id': file_id},
             values={
                 'content': None,
-                'file_name': f"@{file_name}",
+                'file_name': effective_file_name,
                 'ts': timestamp,
                 'project_id': project_id
             }
@@ -224,8 +241,7 @@ class FileManager:
             log.error("Целевой файл %s уже существует, file_id=%d", new_name, existing_file_id)
             return -2
         elif existing_file_id:
-            log.debug("Target file %s exists, overwrite=%s, removing existing file_id=%d", new_name, overwrite,
-                      existing_file_id)
+            log.debug("Target file %s exists, overwrite=%s, removing existing file_id=%d", new_name, overwrite, existing_file_id)
             self.unlink(existing_file_id)
 
         backup_path = self.backup_file(file_id)
@@ -239,44 +255,42 @@ class FileManager:
             os.chown(new_path, pwd.getpwnam('agent').pw_uid, -1)
             log.debug("Moved file_id=%d from %s to %s", file_id, old_file_name, new_name)
         except Exception as e:
-            log.excpt("Ошибка переименования файла id=%d с %s на %s: %s", file_id, old_file_name, new_name, str(e),
-                      exc_info=(type(e), e, e.__traceback__))
+            log.excpt("Ошибка переименования файла id=%d с %s на %s: ", file_id, old_file_name, new_name, e=e)
             return -6
 
+        effective_new_name = f"@{new_name}" if project_id == 0 else new_name
         self.files_table.update(
             conditions={'id': file_id},
             values={
-                'file_name': f"@{new_name}",
+                'file_name': effective_new_name,
                 'ts': int(time.time()),
                 'project_id': project_id
             }
         )
         log.debug("Updated file record id=%d, new_name=%s, project_id=%s", file_id, new_name, str(project_id))
         return file_id
+
     def unlink(self, file_id: int):
-        """Удаляет запись из attached_files, не затрагивая файл на диске."""
-        self.files_table.delete_from(conditions={'id': file_id})
-        log.debug("Удалена запись файла id=%d", file_id)
+        if file_id > 0:
+            self.files_table.delete_from(conditions={'id': file_id})
+            log.debug("Удалена запись файла id=%d через unlink", file_id)
 
     def backup_file(self, file_id: int):
-        """Создаёт бэкап файла по file_id, если это ссылка (@file_name или пустой content)."""
         proj_man = globals.project_manager
         proj_dir = proj_man.projects_dir
         if proj_dir is None:
             log.warn("Попытка бэкапа без выбранного проекта")
-            return
+            return None
 
-        row = self.files_table.select_from(
+        row = self.files_table.select_row(
             conditions={'id': file_id},
-            columns=['file_name', 'content', 'project_id'],
-            limit=1
-        )
-        log.debug("Запись файла для бэкапа: ~C95%s~C00", str(row))
-        if not row or not row[0]:
+            columns=['file_name', 'content', 'project_id'])
+        log.debug("Запись файла для бэкапа: ~%s", str(row))
+        if not row:
             log.warn("Файл id=%d не найден для бэкапа", file_id)
             return None
         try:
-            file_name, content, project_id = row[0]
+            file_name, content, project_id = row
         except ValueError as e:
             log.error("Ошибка распаковки результата запроса в backup_file: id=%d, row=%s, error=%s", file_id, str(row), str(e))
             return None
@@ -295,7 +309,7 @@ class FileManager:
             os.chown(backup_path.parent, pwd.getpwnam('agent').pw_uid, -1)
             log.debug("Установлен владелец agent для папки бэкапа: %s", str(backup_path.parent))
         except Exception as e:
-            log.excpt("Ошибка установки владельца для папки бэкапа %s: %s", str(backup_path.parent), str(e), exc_info=(type(e), e, e.__traceback__))
+            log.excpt("Ошибка установки владельца для папки бэкапа %s: ", str(backup_path.parent), e=e)
         file = self.get_file(file_id)
         if file is None:
             log.warn("Файл %s не найден на диске для бэкапа", clean_file_name)
@@ -311,12 +325,11 @@ class FileManager:
             os.chown(backup_path, pwd.getpwnam('agent').pw_uid, -1)
             log.debug("Установлен владелец agent для бэкапа: %s", str(backup_path))
         except Exception as e:
-            log.excpt("Ошибка установки владельца для бэкапа %s: %s", str(backup_path), str(e), exc_info=(type(e), e, e.__traceback__))
+            log.excpt("Ошибка установки владельца для бэкапа %s: ", str(backup_path), e=e)
         log.debug("Создан бэкап: %s", str(backup_path))
         return str(backup_path)
 
     def remove_file(self, file_id: int):
-        """Удаляет ссылку из attached_files и перемещает файл в бэкап."""
         row = self.files_table.select_from(
             conditions={'id': file_id},
             columns=['file_name', 'content', 'project_id'],
@@ -330,13 +343,13 @@ class FileManager:
             log.warn("Запись id=%d не является ссылкой, удаление невозможно", file_id)
             return
         backup_path = self.backup_file(file_id)
-        if backup_path:
+        if backup_path and project_id > 0:
             clean_file_name = file_name.lstrip('@')
             file_path = _qfn(clean_file_name, project_id)
             if file_path.exists():
                 file_path.unlink()
                 log.debug("Удалён файл с диска: %s", str(file_path))
-        self.unlink(file_id)
+            self.unlink(file_id)
 
     def write_file(self, file_name, content, project_id=None):
         safe_path = _qfn(file_name, project_id)
@@ -346,18 +359,18 @@ class FileManager:
             os.chown(safe_path.parent, pwd.getpwnam('agent').pw_uid, -1)
             log.debug("Установлен владелец agent для папки: %s", str(safe_path.parent))
         except Exception as e:
-            log.excpt("Ошибка установки владельца для папки %s: %s", str(safe_path.parent), str(e), exc_info=(type(e), e, e.__traceback__))
+            log.excpt("Ошибка установки владельца для папки %s: ", str(safe_path.parent), e=e)
         with safe_path.open('w', encoding='utf-8') as f:
             try:
                 wb = f.write(content)
             except Exception as e:
-                log.excpt("Ошибка записи в %s: %s", str(safe_path), str(e), exc_info=(type(e), e, e.__traceback__))
+                log.excpt("Ошибка записи в %s: ", str(safe_path), e=e)
                 return 0
         try:
             os.chown(safe_path, pwd.getpwnam('agent').pw_uid, -1)
             log.debug("Установлен владелец agent для файла: %s", file_name)
         except Exception as e:
-            log.excpt("Ошибка установки владельца для файла %s: %s", file_name, str(e), exc_info=(type(e), e, e.__traceback__))
+            log.excpt("Ошибка установки владельца для файла %s: ", file_name, e=e)
         if wb < len(content):
             log.error("Частично записано в файл %s, %d / %d", file_name, wb, len(content))
             return wb
@@ -365,26 +378,35 @@ class FileManager:
         return wb
 
     def list_files(self, user_id: int, project_id=None):
-        """Возвращает список файлов из attached_files, удаляя ссылки на отсутствующие файлы."""
         self._dedup(project_id)
-        rows = self.files_table.select_from(
-            columns=['id', 'file_name', 'ts', 'project_id'],
-            conditions={'project_id': project_id} if project_id is not None else {}
-        )
+        if project_id is None:
+            log.debug("Запрошены все зарегистрированные файлы для user_id=%d", user_id)
+            conditions = {}
+        else:
+            log.debug("Запрошены файлы для project_id=%d, user_id=%d", project_id, user_id)
+            conditions = {'project_id': project_id}
+        query = 'SELECT id, file_name, ts, project_id FROM attached_files'
+        if conditions:
+            query += ' WHERE project_id = :project_id'
+        log.debug("Выполняется SQL-запрос: %s, conditions=%s", query, str(conditions))
+        rows = self.db.fetch_all(query, conditions)
+        log.debug("Получено %d строк из attached_files", len(rows))
         files = []
         deleted = []
         for row in rows:
             file_id, file_name, ts, project_id = row
+            clean_file_name = file_name.lstrip('@')
             if file_name.startswith('@'):
-                clean_file_name = file_name.lstrip('@')
                 file_path = _qfn(clean_file_name, project_id)
                 if not file_path.exists():
-                    log.warn("Имеется отсутствующая ссылка: id=%d, qfn=%s", file_id, str(file_path))
+                    log.warn("Имеется отсутствующая ссылка: id=%3d, project_id=%2d, qfn=%s",
+                             file_id, project_id, str(file_path))
+                    deleted.append(file_id)
                 else:
                     files.append({'id': file_id, 'file_name': clean_file_name, 'ts': ts, 'project_id': project_id})
             else:
-                files.append({'id': file_id, 'file_name': file_name, 'ts': ts, 'project_id': project_id})
+                files.append({'id': file_id, 'file_name': clean_file_name, 'ts': ts, 'project_id': project_id})
         if deleted:
-            log.warn("Удалены отсутствующие файлы из attached_files: ~C95%s~C00", deleted)
+            log.warn("Имеются отсутствующие файлы в attached_files: %s", deleted)
         log.debug("Возвращено %d файлов для user_id=%d, project_id=%s", len(files), user_id, str(project_id))
         return files

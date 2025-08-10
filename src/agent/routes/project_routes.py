@@ -2,11 +2,11 @@
 from fastapi import APIRouter, Request, HTTPException
 from managers.db import Database
 from managers.project import ProjectManager
-import globals
+import globals as g
 from lib.basic_logger import BasicLogger
 
 router = APIRouter()
-log = globals.get_logger("projectman")
+log = g.get_logger("projectman")
 
 @router.get("/project/list")
 async def list_projects(request: Request):
@@ -24,15 +24,14 @@ async def list_projects(request: Request):
             log.info("Неверный session_id для IP=%s", request.client.host)
             raise HTTPException(status_code=401, detail="Invalid session")
         user_id = user_id[0]
-        projects = globals.project_manager.list_projects()
+        projects = g.project_manager.list_projects()
         log.debug("Возвращено %d проектов для user_id=%d", len(projects), user_id)
         return projects
     except HTTPException as e:
         log.error("HTTP ошибка в GET /project/list: %s", str(e))
         raise
     except Exception as e:
-        log.excpt("Ошибка сервера в GET /project/list: %s", str(e), exc_info=(type(e), e, e.__traceback__))
-        raise HTTPException(status_code=500, detail="Server error: %s" % str(e))
+        g.handle_exception("Ошибка сервера в GET /project/list: ", e)
 
 @router.post("/project/create")
 async def create_project(request: Request):
@@ -59,15 +58,14 @@ async def create_project(request: Request):
         if not project_name:
             log.info("Неверный параметр project_name=%s для IP=%s", str(project_name), request.client.host)
             raise HTTPException(status_code=400, detail="Missing project_name")
-        project_id = globals.project_manager.create_project(project_name, description, local_git, public_git, dependencies)
+        project_id = g.project_manager.create_project(project_name, description, local_git, public_git, dependencies)
         log.debug("Создан проект project_id=%d, project_name=%s для user_id=%d", project_id, project_name, user_id)
         return {"project_id": project_id}
     except HTTPException as e:
         log.error("HTTP ошибка в POST /project/create: %s", str(e))
         raise
     except Exception as e:
-        log.excpt("Ошибка сервера в POST /project/create: %s", str(e), exc_info=(type(e), e, e.__traceback__))
-        raise HTTPException(status_code=500, detail="Server error: %s" % str(e))
+        g.handle_exception("Ошибка сервера в POST /project/create: ", e)
 
 @router.post("/project/update")
 async def update_project(request: Request):
@@ -104,8 +102,7 @@ async def update_project(request: Request):
         log.error("HTTP ошибка в POST /project/update: %s", str(e))
         raise
     except Exception as e:
-        log.excpt("Ошибка сервера в POST /project/update: %s", str(e), exc_info=(type(e), e, e.__traceback__))
-        raise HTTPException(status_code=500, detail="Server error: %s" % str(e))
+        g.handle_exception("Ошибка сервера в POST /project/update: ", e)
 
 @router.post("/project/select")
 async def select_project(request: Request):
@@ -126,15 +123,14 @@ async def select_project(request: Request):
         data = await request.json()
         project_id = data.get('project_id')
         if project_id is not None:
-            globals.project_manager = ProjectManager(project_id)
+            g.project_manager = ProjectManager(project_id)
             log.debug("Выбран проект project_id=%d для user_id=%d", project_id, user_id)
         else:
-            globals.project_manager = ProjectManager()
+            g.project_manager = ProjectManager()
             log.debug("Очищена выборка проекта для user_id=%d", user_id)
         return {"status": "Project selected"}
     except HTTPException as e:
         log.error("HTTP ошибка в POST /project/select: %s", str(e))
         raise
     except Exception as e:
-        log.excpt("Ошибка сервера в POST /project/select: %s", str(e), exc_info=(type(e), e, e.__traceback__))
-        raise HTTPException(status_code=500, detail="Server error: %s" % str(e))
+        g.handle_exception("Ошибка сервера в POST /project/select: ", e)

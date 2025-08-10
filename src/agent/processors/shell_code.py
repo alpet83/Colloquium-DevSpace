@@ -54,8 +54,7 @@ class ShellCodeProcessor(BlockProcessor):
                          shell_command, resp.status_code, response[:50])
                 return res_success(user_name, response) if resp.status_code == 200 else res_error(user_name, response)
             except requests.RequestException as e:
-                log.excpt("Ошибка вызова MCP API для команды %s: %s", shell_command, str(e),
-                          exc_info=(type(e), e, e.__traceback__))
+                log.excpt("Ошибка вызова MCP API для команды %s: ", shell_command, e=e)
                 return res_error(user_name, f"<stdout>Error: MCP API call failed: {str(e)}</stdout>")
         else:
             result = execute(shell_command, user_inputs, user_name, timeout=timeout)
