@@ -2,6 +2,7 @@
 import re
 import asyncio
 import datetime
+import time
 from pathlib import Path
 from llm_interactor import LLMInteractor
 from managers.db import Database, DataTable
@@ -113,9 +114,12 @@ class ReplicationManager(LLMInteractor):
         self.processing_start = int(datetime.datetime.now(datetime.UTC).timestamp())
         log.debug("Начался рекурсивный диалог для actor_id=%d (%s), chat_id=%d, rql=%d",
                   actor.user_id, actor.user_name, chat_id, rql)
+        t_start = time.time()
         try:
             original_response = await self.interact(content_blocks, users, chat_id, actor, self.debug_mode, rql)
+            elapsed = time.time() - t_start
             if original_response:
+                log.debug("Ответ получен после %.1f секунд, проверка возможности обработки агентом...", elapsed)
                 # Вырезаем всё до @agent, если присутствует
                 prefix = ''
                 agent_command = original_response
@@ -187,9 +191,9 @@ class ReplicationManager(LLMInteractor):
                                     rql + 1, max_rql
                                 )
             else:
-                log.warn("Ответ от LLM не получен для user_id=%d, rql=%d", actor.user_id, rql)
+                log.warn("Ответ от LLM не получен для user_id=%d, rql=%d: %s", actor.user_id, rql, str(original_response))
                 globals.post_manager.add_message(
-                    chat_id, 2, f"Нет ответа от LLM для {actor.user_name}", rql, None
+                    chat_id, 2, f"Нет ответа от LLM для {actor.user_name}, время запроса {elapsed} сек.", rql, None
                 )
         finally:
             self.processing_state = "free"
@@ -254,7 +258,7 @@ class ReplicationManager(LLMInteractor):
                           rql)
             elif latest_post:
                 message = latest_post[1]
-                if re.search(f'@{user_name}|#critics_allowed', message, re.IGNORECASE):
+                if re.search(rf"@{user_name}\s+", message):
                     should_respond = True
                     log.debug("Триггер ответа для actor_id=%d: message=%s", actor.user_id, message[:50])
             if should_respond:

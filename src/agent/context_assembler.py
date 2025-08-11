@@ -5,7 +5,7 @@ from managers.db import Database, DataTable
 from lib.content_block import ContentBlock
 from lib.sandwich_pack import SandwichPack
 import globals
-import json
+import json, math
 from pathlib import Path
 
 log = globals.get_logger("context_assembler")
@@ -59,11 +59,18 @@ class ContextAssembler:
         log.debug("Сборка постов для chat_id=%d", chat_id)
         history = globals.post_manager.scan_history(chat_id)
         log.debug("Получено %d постов для chat_id=%d", len(history), chat_id)
-        for post in reversed(history.values()):  # история обязательно нужна реверсированной, для эффективной обработки LLM
+        count = len(history.keys())
+        base_rel = 10
+        for post in reversed(history.values()):  # история нужна реверсированной, для эффективной обработки LLM
             message = self.filter_input(post["message"]) if post["message"] else ""
             message = message.replace('@attach#', '@attached_file#')
             message = re.sub(r'@attach_dir#([\w\d/]+)|@attached_file#(\d+)|@attach_index#(\d+)',
                              lambda m: self._resolve_file_id(m, file_ids, file_map), message)
+            relevance = post.get('relevance', 50) + base_rel
+            relevance = min(100, relevance)
+            relevance = max(0, relevance)
+            base_rel -= 1
+
             content_blocks.append(ContentBlock(
                 content_text=message,
                 content_type=":post",
@@ -71,7 +78,7 @@ class ContextAssembler:
                 timestamp=datetime.fromtimestamp(post["timestamp"], timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
                 post_id=post["id"],
                 user_id=post["user_id"],
-                relevance=50
+                relevance=math.floor(relevance)
             ))
             log.debug("Добавлен пост post_id=%d для chat_id=%d", post["id"], post["chat_id"])
         return content_blocks
@@ -100,13 +107,18 @@ class ContextAssembler:
                     continue
                 try:
                     content_text = file_data['content']
+                    relevance = file_data.get('relevance', 50)
+                    if '.rulz' == extension:
+                        relevance = 100
+
                     content_block = SandwichPack.create_block(
                         content_text=content_text,
                         content_type=extension,
                         file_name=file_data['file_name'],
                         timestamp=datetime.fromtimestamp(file_data['ts'], timezone.utc).strftime(
                             "%Y-%m-%d %H:%M:%SZ"),
-                        file_id=file_id
+                        file_id=file_id,
+                        relevance=relevance
                     )
                     content_blocks.append(content_block)
                     log.debug(

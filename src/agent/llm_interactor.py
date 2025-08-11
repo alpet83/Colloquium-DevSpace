@@ -47,7 +47,7 @@ class LLMInteractor(ContextAssembler):
             log.debug("Загружен пре-промпт из %s", globals.PRE_PROMPT_PATH)
             return pre_prompt
         except FileNotFoundError as e:
-            globals.handle_exception("Файл пре-промпта %s не найден", globals.PRE_PROMPT_PATH, e)
+            globals.handle_exception("Файл пре-промпта %s не найден" % globals.PRE_PROMPT_PATH, e=e)
             raise
 
     def _write_context_stats(self, content_blocks: list, llm_name: str, chat_id: int, index_json: str):
@@ -61,14 +61,14 @@ class LLMInteractor(ContextAssembler):
         """
         stats_file = Path(f"/app/logs/{llm_name}_context.stats")
         stats = []
-        pre_prompt_tokens = len(self.pre_prompt) // 4 if self.pre_prompt else 0
+        pre_prompt_tokens = estimate_tokens(self.pre_prompt)
         stats.append({
             "block_type": ":pre_prompt",
             "block_id": "N/A",
             "file_name": globals.PRE_PROMPT_PATH,
             "tokens": pre_prompt_tokens
         })
-        index_tokens = len(index_json) // 4 if index_json else 0
+        index_tokens = estimate_tokens(index_json)
         stats.append({
             "block_type": ":index",
             "block_id": "N/A",
@@ -78,7 +78,7 @@ class LLMInteractor(ContextAssembler):
         unique_file_names = set()
         for block in content_blocks:
             block_text = block.to_sandwich_block()
-            token_count = len(block_text) // 4 if block_text else 0
+            token_count = estimate_tokens(block_text)
             block_id = block.post_id or block.file_id or getattr(block, 'quote_id', None) or "N/A"
             file_name = block.file_name or "N/A"
             if file_name != "N/A" and file_name in unique_file_names:
@@ -150,7 +150,7 @@ class LLMInteractor(ContextAssembler):
         """
         tokens_limit, tokens_cost = globals.user_manager.get_user_token_limits(actor.user_id)
         content_blocks.sort(key=lambda x: x.relevance if x.relevance else 0, reverse=True)
-        total_tokens = len(self.pre_prompt) // 4
+        total_tokens = estimate_tokens(self.pre_prompt)
         filtered_blocks = []
         for block in content_blocks:
             block_text = block.to_sandwich_block()
@@ -167,9 +167,9 @@ class LLMInteractor(ContextAssembler):
         try:
             proj_man = globals.project_manager
             project_name = proj_man.project_name if proj_man else 'not specified'
-            packer = SandwichPack(project_name, max_size=1_000_000, system_prompt=self.pre_prompt, compression=True)
+            packer = SandwichPack(project_name, max_size=1_000_000, compression=True)
             result = packer.pack(content_blocks, users=users)
-            context = f"{self.pre_prompt}\nRQL: {rql}\n{result['index']}\n{''.join(result['sandwiches'])}"
+            context = f"RQL: {rql}\n{result['index']}\n{''.join(result['sandwiches'])}"
             self.last_sandwich_idx = result['index']  # Кэшируем индекс
             log.debug("Контекст сгенерирован, длина %d символов, индекс кэширован", len(context))
             self._write_context_stats(content_blocks, actor.user_name, chat_id, json.dumps(result['index']))
@@ -199,14 +199,17 @@ class LLMInteractor(ContextAssembler):
             return "OK"
         else:
             conn = actor.llm_connection
-            log.debug("Отправка в LLM для user_id=%d: %d символов, rql=%d", actor.user_id, len(context), rql)
-            search_parameters = conn.set_search_params(actor.user_id)
+            conn.pre_prompt = self.pre_prompt
+            log.debug("Отправка в LLM для user_id=%d: %d символов, rql %d", actor.user_id, len(context) + len(self.pre_prompt), rql)
+            search_params = conn.get_search_params(actor.user_id)
             try:
-                if search_parameters.get("mode") == "off":
+                conn.make_payload(context)
+                if search_params.get("mode", 'off') == "off":
                     log.debug("Поиск отключён для user_id=%d", actor.user_id)
-                    response = await conn.call(context)
+                    response = await conn.call()
                 else:
-                    response = await conn.call(context, search_parameters=search_parameters)
+                    conn.add_search_tool(search_params)
+                    response = await conn.call()
                 if response:
                     usage = response.get('usage', {})
                     used_tokens = usage.get('prompt_tokens', 0)

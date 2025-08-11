@@ -1,156 +1,195 @@
-# /app/agent/lib/llm_api.py, updated 2025-07-26 21:15 EEST
+# /app/agent/lib/llm_api.py, updated 2025-08-11 12:02 EEST
+# Formatted with proper line breaks and indentation for project compliance.
+
 import aiohttp
 import json
 import re
-from typing import Dict, Optional
+import codecs
+# from typing import dict, Optional  PROHIBITED OBSOLETE CODE, NEVER USE!
 from managers.db import Database
 import globals
 import datetime
 
+Optional = Dict = None
 log = globals.get_logger("llm_api")
-
 class LLMConnection:
-    def __init__(self, config: Dict):
+    def __init__(self, config: dict):
         self.api_key = config.get("api_key")
+        self.name = "Local"
         self.model = config.get("model", "default")
-
-    async def call(self, prompt: str, search_parameters: Optional[Dict] = None) -> Dict:
-        log.warn("Базовый LLMConnection вызван для model=%s, не реализован", self.model)
-        return {}
-
-    def set_search_params(self, user_id: int) -> Dict:
-        """Заглушка для настройки параметров поиска."""
-        log.debug("Заглушка set_search_params вызвана для user_id=%d", user_id)
-        return {}
-
-class XAIConnection(LLMConnection):
-    def __init__(self, config: Dict):
-        super().__init__(config)
-        self.base_url = "https://api.x.ai/v1"
+        self.flood = [r'\.\s+\?']
+        self.last_result = {}
+        self.base_url = 'http://localhost'  # dummy local model
+        self.search_sources = ["web"]
         self.db = Database.get_database()
+        self.pre_prompt = ''
+        self.payload = {}
+        self.timeout = aiohttp.ClientTimeout(total=600, connect=45)  # default for OpenAI
 
-    async def call(self, prompt: str, search_parameters: Optional[Dict] = None) -> Dict:
-        log.debug("XAIConnection вызов: model=%s, prompt_length=%d, search_parameters=~C95%s~C00",
-                  self.model, len(prompt), str(search_parameters))
+    async def call(self) -> dict:
         try:
+            messages = self.payload.get("messages", [])
+            if messages:
+                log.debug(f"{self.name} API вызов: model=%s, макро-сообщений %d", self.model, len(messages))
+            else:
+                log.error(" Нет сообщений для запроса к API")
+                return {}
             async with aiohttp.ClientSession() as session:
-                payload = {
-                    "model": self.model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 4096,
-                    "temperature": 0.7  # Для большей предсказуемости
-                }
-                if search_parameters:
-                    payload["search_parameters"] = search_parameters
                 async with session.post(
-                    f"{self.base_url}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json"
-                    },
-                    json=payload
+                        f"{self.base_url}/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {self.api_key}",
+                            "Content-Type": "application/json; charset=utf-8",
+                            "Accept": "application/json; charset=UTF-8",
+                            "Accept-Charset": "UTF-8"
+                        },
+                        json=self.payload,
+                        timeout=self.timeout
                 ) as response:
+                    text = await response.text()
+                    self.last_result = result = json.loads(text)
+                    sr = []
                     if response.status != 200:
-                        log.error("Ошибка XAI API: status=%d, response=%s", response.status, await response.text())
-                        return {}
-                    result = await response.json()
-                    log.debug("Ответ XAI API: ~C95%s~C00", json.dumps(result, indent=2, ensure_ascii=False))
-                    text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    # Постобработка: удаление нежелательного '?' в конце или после '. ?'
-                    last_15 = text[-15:] if len(text) >= 15 else text
-                    if '?' in last_15:
-                        original_text = text
-                        # Удаляем ' ?' или '?' перед тегами или в конце
-                        text = re.sub(r'\s*\?\s*(?=(@post#\d+)?$)', '', text)
-                        if text != original_text:
-                            log.debug("Удалён нежелательный '?' из ответа Grok3-mini: %s", original_text[-50:])
+                        log.error(f"Ошибка {self.name} API: status=%d, response=%s", response.status, text)
+                    else:
+                        log.debug(f"Ответ {self.name} API {response.charset} : %s", json.dumps(result, indent=2))
+                        sr = self.get_search_results()
+
                     return {
-                        "text": text,
+                        "text": self.get_text(),
+                        "search_results": sr,
                         "usage": result.get("usage", {})
                     }
         except Exception as e:
-            log.excpt("Ошибка XAIConnection: ", e=e)
+            log.excpt(f"Ошибка {self.name} API: ", e=e)
             return {}
 
-    def set_search_params(self, user_id: int) -> Dict:
-        """Настраивает параметры поиска для xAI API."""
-        log.debug("Настройка search_parameters для user_id=%d", user_id)
+    def make_payload(self, prompt: str, max_tokens=27000, max_completion_tokens=13500, reasoning_effort="low", temp=0.3, extra=None) -> dict:
+        # TODO: нужно считывать параметры role, max_tokens, max_completion_tokens, reasoning_effort из БД
+        messages = []
+        if self.pre_prompt:
+            messages.append({"role": "system", "content": self.pre_prompt})
+        messages.append({"role": "user", "content": prompt})
+        self.payload = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "max_completion_tokens": max_completion_tokens,
+            "reasoning_effort": reasoning_effort,
+            "temperature": temp  # Для большей предсказуемости
+        }
+        if extra is not None:
+            self.payload.update(extra)
+        return self.payload
+
+    def clean_response(self, text: str) -> str:
+        for token in self.flood:
+            text = re.sub(token, '', text)  # response artefact removing
+        return text
+
+    def get_text(self) -> str:
+        """Extracts text from API response, formatting errors in <llm_error> tags if present.
+
+        Returns:
+            str: Extracted text or formatted error message.
+        """
+        response = self.last_result
+        choices = response.get("choices", [{}])
+        if not choices:
+            log.error("No choices in response: %s", json.dumps(response, indent=2))
+            return "<llm_error>No choices in response</llm_error>"
+
+        choice = choices[0]
+        if "error" in choice:
+            error = choice["error"]
+            message = error.get("message", "Unknown error")
+            code = error.get("code", "Unknown")
+            provider = response.get("provider", "Unknown")
+            log.error("API error: %s, code=%s, provider=%s", message, code, provider)
+            return f"<llm_error>\n{message}\nError code: {code}\nProvider: {provider}\n</llm_error>"
+
+        msg = choice.get("message", {})
+        text = msg.get("content", "") + msg.get("text", "")
+
+
+        text = text.strip()
+        if not text:
+            reason = choice.get("native_finish_reason", choice.get("finish_reason", "unknown reason"))
+            text = f"<void_response>Due {reason}</void_response>"
+        return self.clean_response(text)
+
+    def add_search_tool(self, params: dict) -> dict:
+        if 'off' == params.get('mode', 'off'):
+            return self.payload
+        tools = self.payload.get('tools', [])
+        tools.append({
+            "type": "web_search",
+            "web_search": {
+                "query": {"type": "string"},
+                "max_results": params.get("max_search_results", 5),
+                "search_depth": params.get("search_depth", "basic")
+            }
+        })
+        self.payload['tools'] = tools
+        return self.payload
+
+    def get_search_params(self, user_id: int) -> dict:
+        """Настраивает параметры поиска web_search."""
+        log.debug("Настройка search_params для user_id=%d", user_id)
         settings = self.db.fetch_one(
             'SELECT search_mode, search_sources, max_search_results, from_date, to_date FROM user_settings '
             'WHERE user_id = :user_id',
             {'user_id': user_id}
         )
+        today = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d")
+        def_sources = self.search_sources
         if settings:
             try:
-                sources = json.loads(settings[1]) if settings[1] else ['web', 'x', 'news']
-                sources = [{"type": src} for src in sources if src in ['web', 'x', 'news']]
+                sources = json.loads(settings[1]) if settings[1] else def_sources
+                sources = [{"type": src} for src in sources if src in def_sources]
             except json.JSONDecodeError:
-                sources = [{"type": "web"}, {"type": "x"}, {"type": "news"}]
+                sources = []
             return {
                 "mode": settings[0] or "off",
                 "sources": sources,
                 "max_search_results": settings[2] or 20,
-                "from_date": settings[3],
-                "to_date": settings[4]
+                "from_date": settings[3].replace("today", today),
+                "to_date": settings[4].replace("today", today)
             }
         return {
             "mode": "off",
-            "sources": [{"type": "web"}, {"type": "x"}, {"type": "news"}],
+            "sources": [],
             "max_search_results": 20,
-            "from_date": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d"),
-            "to_date": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d")
+            "from_date": today,
+            "to_date": today
         }
 
-class OpenAIConnection(LLMConnection):
-    def __init__(self, config: Dict):
+    def get_search_results(self) -> list:
+        tool_calls = self.last_result.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])
+        for call in tool_calls:
+            if call.get("function", {}).get("name") == "web_search":
+                return call.get("function", {}).get("arguments", "{}").get("results", [])
+        return []
+
+
+class XAIConnection(LLMConnection):
+    def __init__(self, config: dict):
         super().__init__(config)
+        self.base_url = "https://api.x.ai/v1"
+        self.search_sources = ["web", "x", "news"]
+
+
+class OpenAIConnection(LLMConnection):
+    def __init__(self, config: dict):
+        super().__init__(config)
+        self.name = "OpenAI"
         self.base_url = "https://api.openai.com/v1"
 
-    async def call(self, prompt: str, search_parameters: Optional[Dict] = None) -> Dict:
-        log.debug("OpenAIConnection вызов: model=%s, prompt_length=%d, search_parameters=~C95%s~C00",
-                  self.model, len(prompt), str(search_parameters))
-        try:
-            async with aiohttp.ClientSession() as session:
-                payload = {
-                    "model": self.model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 4096
-                }
-                if search_parameters:
-                    payload["tools"] = [{
-                        "type": "web_search",
-                        "web_search": {
-                            "query": search_parameters.get("query", prompt),
-                            "max_results": search_parameters.get("max_results", 5),
-                            "search_depth": search_parameters.get("search_depth", "basic")
-                        }
-                    }]
-                    payload["tool_choice"] = "web_search"
-                async with session.post(
-                    f"{self.base_url}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json"
-                    },
-                    json=payload
-                ) as response:
-                    if response.status != 200:
-                        log.error("Ошибка OpenAI API: status=%d, response=%s", response.status, await response.text())
-                        return {}
-                    result = await response.json()
-                    log.debug("Ответ OpenAI API: ~C95%s~C00", json.dumps(result, indent=2))
-                    text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    search_results = []
-                    if "tools" in payload:
-                        tool_calls = result.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])
-                        for call in tool_calls:
-                            if call.get("function", {}).get("name") == "web_search":
-                                search_results = json.loads(call.get("function", {}).get("arguments", "{}")).get("results", [])
-                    return {
-                        "text": text,
-                        "search_results": search_results,
-                        "usage": result.get("usage", {})
-                    }
-        except Exception as e:
-            log.excpt("Ошибка OpenAIConnection: ", e=e)
-            return {}
+
+class OpenRouterConnection(LLMConnection):
+    def __init__(self, config: dict):
+        super().__init__(config)
+        self.model = self.model.split(':')[-1]  # MATTER: llm_class have prefix 'openrouter:', need ignore it
+        self.name = "OpenRouter"
+        self.base_url = "https://openrouter.ai/api/v1"
+
