@@ -9,9 +9,6 @@ import globals
 log = globals.get_logger("projectman")
 
 
-
-
-
 class ProjectManager:
     def __init__(self, project_id=None):
         self.db = Database.get_database()

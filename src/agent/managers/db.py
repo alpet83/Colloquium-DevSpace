@@ -63,8 +63,6 @@ class Database:
                 params = params if params is not None else {}
                 result = conn.execute(text(query), params)
                 rows = result.fetchall()
-                log.debug("Выбрано %d строк: %s, params=~%s", len(rows),
-                          query[:50] + "..." if len(query) > 50 else query, str(params))
                 return rows
         except SQLAlchemyError as e:
             log.excpt("Ошибка fetch_all: %s, params=~%s, error=%s",

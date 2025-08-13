@@ -380,17 +380,17 @@ class FileManager:
     def list_files(self, user_id: int, project_id=None):
         self._dedup(project_id)
         if project_id is None:
-            log.debug("Запрошены все зарегистрированные файлы для user_id=%d", user_id)
+            # log.debug("Запрошены все зарегистрированные файлы для user_id=%d", user_id)
             conditions = {}
         else:
-            log.debug("Запрошены файлы для project_id=%d, user_id=%d", project_id, user_id)
+            # log.debug("Запрошены файлы для project_id=%d, user_id=%d", project_id, user_id)
             conditions = {'project_id': project_id}
         query = 'SELECT id, file_name, ts, project_id FROM attached_files'
         if conditions:
             query += ' WHERE project_id = :project_id'
-        log.debug("Выполняется SQL-запрос: %s, conditions=%s", query, str(conditions))
+        # log.debug("Выполняется SQL-запрос: %s, conditions=%s", query, str(conditions))
         rows = self.db.fetch_all(query, conditions)
-        log.debug("Получено %d строк из attached_files", len(rows))
+        # log.debug("Получено %d строк из attached_files", len(rows))
         files = []
         deleted = []
         for row in rows:
@@ -408,5 +408,4 @@ class FileManager:
                 files.append({'id': file_id, 'file_name': clean_file_name, 'ts': ts, 'project_id': project_id})
         if deleted:
             log.warn("Имеются отсутствующие файлы в attached_files: %s", deleted)
-        log.debug("Возвращено %d файлов для user_id=%d, project_id=%s", len(files), user_id, str(project_id))
         return files

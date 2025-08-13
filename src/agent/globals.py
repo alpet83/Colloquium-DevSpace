@@ -22,18 +22,15 @@ CONFIG_FILE = "/app/data/colloquium_config.toml"
 PRE_PROMPT_PATH = "/app/docs/llm_pre_prompt.md"
 CHAT_META_DIR = "/app/projects/.chat-meta"
 
+MCP_AUTH_TOKEN = "Grok-xAI-Agent-The-Best"
+
+ATTACHES_REGEX = r"@attach_dir[#:]([\w\/\"']+)|@attached_file[#:](\d+)|@attach_index[#:](\d+)|@attached_files[#:]\[([\"'\d+, ]+)]"
+
 # форматирование строк даты-времени
 SQL_TIMESTAMP = "%Y-%m-%d %H:%M:%S"
 SQL_TIMESTAMP6 = "%Y-%m-%d %H:%M:%S.%f"
 
 loggers = {}
-chat_switch_events = {}
-chat_manager = None
-post_manager = None
-replication_manager = None
-post_processor = None
-file_manager = None
-user_manager = None
 
 sessions_table = None
 
@@ -57,8 +54,9 @@ def check_session(request: Request) -> int:
     uid = row[0]
     return uid
 
-def handle_exception(message: str, e: Exception, _raise: bool = True):
-    """Общая функция для обработки исключений и логирования."""
+
+def handle_exception(message: str, e: Exception, _raise: bool = True):  # TODO: надо будет куда-то переместить
+    """Общая функция для обработки исключений сервера."""
     log = get_logger("exception")
     if isinstance(e, HTTPException):
         log.error(f"HTTP ошибка: {message}: {str(e)}")
@@ -68,6 +66,7 @@ def handle_exception(message: str, e: Exception, _raise: bool = True):
         log.excpt(f"Ошибка сервера: {message}: ", e=e)
         if _raise:
             raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+
 
 def unitext(content):
     if isinstance(content, bytes):

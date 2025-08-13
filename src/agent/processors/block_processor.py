@@ -5,6 +5,7 @@ import requests
 import globals
 import hashlib
 import time
+import globals as g
 from pathlib import Path
 
 MCP_URL = "http://mcp-sandbox:8084"
@@ -80,7 +81,11 @@ class BlockProcessor:
                 failed_cmds += 1
                 exc_info = (type(e), e, e.__traceback__)
                 backtrace = "".join(traceback.format_exception(*exc_info))
-                agent_messages.append(f"@{e.user_name}: {str(e)}\n<traceback>{backtrace}</traceback>")
+                msg = str(e)
+                user_link = f"@{e.user_name}"
+                if user_link not in msg:
+                    msg = f"{user_link}: {msg}"
+                agent_messages.append(f"{msg}\n<traceback>{backtrace}</traceback>")
                 continue
             handled_cmds += result.handled_cmds
             failed_cmds += result.failed_cmds
@@ -158,7 +163,7 @@ class BlockProcessor:
                 new_lines_count = len(new_content.splitlines())
                 log.debug("Saved file_id=%d, file_name=%s, project_id=%s, old_lines=%d, new_lines=%d, MD5=%s",
                           file_id, file_name, str(project_id) if project_id is not None else "None", old_lines_count, new_lines_count, md5)
-                return res_success(user_name, f"Файл @attach#{file_id} успешно модифицирован, MD5:{md5}, было {old_lines_count} строк, стало {new_lines_count} строк")
+                return res_success(user_name, f"@{user_name} Файл @attach#{file_id} успешно модифицирован, MD5:{md5}, было {old_lines_count} строк, стало {new_lines_count} строк")
             else:
                 log.error("Ошибка записи обновленного контента в %s, функция вернула %d", file_name, res)
                 raise ProcessorError(f"Error: Failed to store @attach#{file_id}, returned code {res}", user_name)
@@ -175,25 +180,43 @@ class CommandProcessor(BlockProcessor):
         self.replace = False
 
     def handle_block(self, attrs, block_code):
-        command = block_code.strip().split()[0].lower() if block_code.strip().split() else None
+        block_code = block_code.strip()
+        tokens = block_code.split(' ')
+        command = tokens[0].lower() if tokens else ''
+        command = command.strip()
+        proj_name = g.project_manager.get("project_name", "default")
         user_name = attrs.get('user_name', 'Unknown')
-        log.debug("Обработка команды: %s", command or "None")
+        tail = ' '.join(tokens[1:])
+        log.debug("Обработка команды: %s с параметрами %s", command or "None", tail[:50])
+        auth_header = {'Authorization': f"Bearer {g.MCP_AUTH_TOKEN}"}
         if not command:
             log.error("Пустая команда")
             return res_error(user_name, "Error: Empty command")
         if command == 'ping':
             return res_success(user_name, f"@{user_name} pong")
         elif command == 'run_test':
-            params = {'project_name': 'default', 'test_name': 'test'}
-            resp = requests.get(f"{MCP_URL}/run_test", params=params,
-                                headers={'Authorization': 'Bearer Grok-xAI-Agent-The-Best'})
+            params = {'project_name': proj_name, 'test_name': 'test'}
+            resp = requests.get(f"{MCP_URL}/run_test", params=params, headers=auth_header)
             response = resp.text if resp.status_code == 200 else f"Ошибка: {resp.status_code}"
             return res_success(user_name, f"@{user_name} {response}") if resp.status_code == 200 else res_error(user_name, f"@{user_name} {response}")
         elif command == 'commit':
-            params = {'project_name': 'default', 'msg': 'commit msg'}
-            resp = requests.post(f"{MCP_URL}/commit", json=params,
-                                 headers={'Authorization': 'Bearer Grok-xAI-Agent-The-Best'})
+            params = {'project_name': proj_name, 'msg': 'commit msg'}
+            resp = requests.post(f"{MCP_URL}/commit", json=params, headers=auth_header)
             response = resp.text if resp.status_code == 200 else f"Ошибка: {resp.status_code}"
             return res_success(user_name, f"@{user_name} {response}") if resp.status_code == 200 else res_error(user_name, f"@{user_name} {response}")
+        elif command == 'show':
+            _all = set()
+            for match in re.findall(g.ATTACHES_REGEX, tail, re.M):
+                log.debug(" attach matched %s", str(match))
+                for i in range(4):
+                    if ids := match[i]:  # tuple
+                        ids = str(ids).strip()
+                        ids = re.sub(r"[\"' ]", "", ids).split(',')
+                        for _id in ids:
+                            _all.add(int(_id))
+            if not _all:
+                return res_error(user_name, f"invalid request format, can't parse `{tail}`")
+
+            return res_success(user_name, f"@{user_name} OK, temporary attached {_all}")
         log.error("Неподдерживаемая команда: %s", command)
         return res_error(user_name, f"AgentError: Unsupported command '{command}'")

@@ -167,29 +167,31 @@ class ReplicationManager(LLMInteractor):
 
                 processed_msg = response_result.get("processed_msg", "")
                 agent_reply = response_result.get("agent_reply")
+                query_filter = ""
                 if agent_reply:
+                    query_filter = "AND user_id = 2"
                     log.debug("Добавлен ответ агента для chat_id=%d: %s", chat_id, agent_reply[:50])
                 if processed_msg and rql < max_rql:
                     latest_post = self.db.fetch_one(
-                        'SELECT user_id, message FROM posts WHERE chat_id = :chat_id ORDER BY id DESC LIMIT 1',
+                        f"SELECT user_id, message FROM posts\n WHERE chat_id = :chat_id {query_filter}\n ORDER BY id DESC LIMIT 1",
                         {'chat_id': chat_id}
                     )
-                    if latest_post and '@all' in latest_post[1].lower():
-                        # Выбрать всех доступных других LLM-актёров
-                        for next_actor in self.actors:
-                            if (next_actor.user_id > 1 and next_actor.user_id != actor.user_id and
-                                    next_actor.llm_connection):
-                                file_ids = set()
-                                file_map = {}
-                                new_content_blocks = self.assemble_posts(chat_id, exclude_source_id, file_ids,
-                                                                        file_map)
-                                new_content_blocks.extend(self.assemble_files(file_ids, file_map))
-                                log.debug("Начался рекурсивный диалог между %s и %s для rql=%d",
-                                          actor.user_name, next_actor.user_name, rql + 1)
-                                await self._recursive_replicate(
-                                    new_content_blocks, users, chat_id, next_actor, exclude_source_id,
-                                    rql + 1, max_rql
-                                )
+                    latest_post = latest_post[1].strip().lower() if latest_post else ""
+
+                    for next_actor in self.actors:
+                        ref = f"@{next_actor.user_name} "
+                        if ('@all ' in latest_post) or (ref in latest_post) and (next_actor.user_id > 2) and next_actor.llm_connection:
+                            # Выбрать всех доступных других LLM-актёров
+                            file_ids = set()
+                            file_map = {}
+                            new_content_blocks = self.assemble_posts(chat_id, exclude_source_id, file_ids, file_map)
+                            new_content_blocks.extend(self.assemble_files(file_ids, file_map))
+                            log.debug("Продолжение рекурсивного диалога между %s и %s для rql=%d",
+                                      actor.user_name, next_actor.user_name, rql + 1)
+                            await self._recursive_replicate(
+                                new_content_blocks, users, chat_id, next_actor, exclude_source_id,
+                                rql + 1, max_rql
+                            )
             else:
                 log.warn("Ответ от LLM не получен для user_id=%d, rql=%d: %s", actor.user_id, rql, str(original_response))
                 globals.post_manager.add_message(

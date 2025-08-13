@@ -112,13 +112,13 @@ class LLMInteractor(ContextAssembler):
             globals.handle_exception(f"Не удалось записать статистику контекста в {stats_file}", e)
             globals.post_manager.add_message(chat_id, 2, f"Не удалось записать статистику контекста для {llm_name}: {str(e)}")
 
-    def _write_chat_index(self, chat_id: int, index_content: str):
+    def _write_chat_index(self, chat_id: int):
         """Сохраняет индекс чата в /app/projects/.chat-meta/{chat_id}-index.json и регистрирует в БД.
 
         Args:
             chat_id (int): ID чата.
-            index_content (str): JSON-строка индекса.
         """
+        index_content = self.last_sandwich_idx
         file_name = f".chat-meta/{chat_id}-index.json"
         try:
             fm = globals.file_manager
@@ -152,28 +152,46 @@ class LLMInteractor(ContextAssembler):
         content_blocks.sort(key=lambda x: x.relevance if x.relevance else 0, reverse=True)
         total_tokens = estimate_tokens(self.pre_prompt)
         filtered_blocks = []
-        for block in content_blocks:
-            block_text = block.to_sandwich_block()
-            block_tokens = estimate_tokens(block_text)
-            if total_tokens + block_tokens <= tokens_limit:
-                filtered_blocks.append(block)
-                total_tokens += block_tokens
-            else:
-                log.debug("Пропуск блока post_id=%s, file_id=%s из-за лимита токенов %d",
-                          str(block.post_id or 'N/A'), str(block.file_id or 'N/A'), tokens_limit)
-        content_blocks = filtered_blocks
         context = ''
+        last_post_id = 0
         log.debug("Упаковка %d блоков контента для rql=%d", len(content_blocks), rql)
         try:
             proj_man = globals.project_manager
             project_name = proj_man.project_name if proj_man else 'not specified'
             packer = SandwichPack(project_name, max_size=1_000_000, compression=True)
             result = packer.pack(content_blocks, users=users)
-            context = f"RQL: {rql}\n{result['index']}\n{''.join(result['sandwiches'])}"
-            self.last_sandwich_idx = result['index']  # Кэшируем индекс
+            self.last_sandwich_idx = full_idx = result['index']  # Запомнить индекс, это уже JSON в строке
+            self._write_chat_index(chat_id)  # сохранение отдельного файла с индексом, для перекрестного взаимодействия в разных чатах
+
+            context = f"RQL: {rql}\n{full_idx}\n"  # От полного списка блоков забираются только индексы, содержащий описание файлов и сущностей. Детальный deep_index сохранять сейчас нельзя, поскольку привязывается к блокам
+
+            files_passed = []
+            # пере-сборка блоков, с контентом актуальных файлов, до наступления переполнения контекста
+            for block in content_blocks:
+                block_text = block.to_sandwich_block()
+                block_tokens = estimate_tokens(block_text)
+                if total_tokens + block_tokens >= tokens_limit:
+                    log.debug("Пропуск блока post_id=%s, file_id=%s из-за лимита токенов %d",
+                              str(block.post_id or 'N/A'), str(block.file_id or 'N/A'), tokens_limit)
+                    break
+                if block.content_type == ":post":
+                    last_post_id = max(block.post_id, last_post_id)
+                elif block.file_id and block.file_id in self.fresh_files:
+                    files_passed.append(block.file_id)
+                else:
+                    continue
+                filtered_blocks.append(block)
+
+            log.debug("Отфильтровано %d блоков из %d, добавлено %d файлов из %s ", len(filtered_blocks), len(content_blocks), len(files_passed), str(self.fresh_files))
+            # Второй вызов: компактный сэндвич с ограниченным детализированным индексом
+            result = packer.pack(filtered_blocks, users=users)
+            context += result['deep_index'] + "\n" + ''.join(result['sandwiches'])
+            focus = {"last_post_id": last_post_id, "attached_files": files_passed}
+            context += f"\n<focus>\n{focus}\n</focus>"  # подстраховка для моделей, что ценят больше последние символы контекста
+
             log.debug("Контекст сгенерирован, длина %d символов, индекс кэширован", len(context))
-            self._write_context_stats(content_blocks, actor.user_name, chat_id, json.dumps(result['index']))
-            self._write_chat_index(chat_id, self.last_sandwich_idx)
+            self._write_context_stats(content_blocks, actor.user_name, chat_id, result['index'])
+
         except Exception as e:
             globals.handle_exception("Не удалось упаковать блоки контента для chat_id=%d" % chat_id, e)
         context_file = Path(f"/app/logs/context-{actor.user_name}-{chat_id}.llm")
@@ -190,6 +208,7 @@ class LLMInteractor(ContextAssembler):
         if sent_tokens > tokens_limit:
             log.error("Контекст превышает лимит токенов для user_id=%d: %d > %d", actor.user_id, sent_tokens, tokens_limit)
             raise ValueError(f"Контекст превышает лимит токенов: {sent_tokens} > {tokens_limit}")
+
         if debug_mode:
             debug_file = Path(f"/app/logs/debug_{actor.user_name}_"
                               f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
@@ -203,7 +222,7 @@ class LLMInteractor(ContextAssembler):
             log.debug("Отправка в LLM для user_id=%d: %d символов, rql %d", actor.user_id, len(context) + len(self.pre_prompt), rql)
             search_params = conn.get_search_params(actor.user_id)
             try:
-                conn.make_payload(context)
+                conn.make_payload(prompt=context)
                 if search_params.get("mode", 'off') == "off":
                     log.debug("Поиск отключён для user_id=%d", actor.user_id)
                     response = await conn.call()

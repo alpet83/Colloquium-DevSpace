@@ -2,16 +2,20 @@
 # Formatted with proper line breaks and indentation for project compliance.
 
 import aiohttp
+
 import json
 import re
 import codecs
 # from typing import dict, Optional  PROHIBITED OBSOLETE CODE, NEVER USE!
 from managers.db import Database
+from openai import AsyncOpenAI, RateLimitError, APIStatusError, APIConnectionError
 import globals
 import datetime
 
 Optional = Dict = None
 log = globals.get_logger("llm_api")
+
+
 class LLMConnection:
     def __init__(self, config: dict):
         self.api_key = config.get("api_key")
@@ -24,9 +28,65 @@ class LLMConnection:
         self.db = Database.get_database()
         self.pre_prompt = ''
         self.payload = {}
+        # TODO: нужно считывать параметры role, max_tokens, max_completion_tokens, reasoning_effort из таблицы users, поле JSON model_params
+        self.model_params = {"max_tokens": 27000, "max_completion_tokens": 13500, "temperature": 0.3}
         self.timeout = aiohttp.ClientTimeout(total=600, connect=45)  # default for OpenAI
 
+    def _process_result(self, result: dict, http_status=200):
+        self.last_result = result
+        sr = []
+        if http_status != 200:
+            log.error(f"Ошибка {self.name} API: status=%d, response=%s", http_status, json.dumps(result, indent=2))
+        else:
+            log.debug(f"Ответ {self.name} API: %s", json.dumps(result, indent=2))
+            sr = self.get_search_results()
+
+        return {
+            "text": self.get_text(),
+            "usage": result.get("usage", {}),
+            "search_results": sr
+        }
+
+    def api_error_result(self, _class: str, e: Exception, code: int = 500):
+        if hasattr(e, 'status_code'):
+            code = e.status_code
+            log.error(f"Ошибка {self.name} API (%s) %s: status=%d", _class, str(e), code)
+        else:
+            log.excpt(f"Сбой {self.name} API (%s):", _class, e=e)
+        result = None
+        if hasattr(e, 'response'):
+            try:
+                result = json.loads(e.response.text)
+            except BaseException as E:
+                log.excpt("Response load fails ", e=E)
+        if isinstance(result, dict) and hasattr(result, 'choices'):
+            return self._process_result(result, http_status=code)
+        else:
+            return {"text": f"<llm_error>{_class} API Error: {e}\nhttp_status: {code}</llm_error>",
+                    "usage": 0,
+                    "search_results": []}
+
     async def call(self) -> dict:
+        """Calls the LLM API using OpenAI SDK, overriding in subclasses for specific APIs."""
+        _void = {"choices": []}
+        try:
+            messages = self.payload.get("messages", [])
+            if not messages:
+                log.error("Нет сообщений для запроса к API")
+                return {"text": "<llm_error>No messages in payload\nError code: InvalidRequest\nProvider: %s</llm_error>" % self.name, "usage": {}}
+            client = AsyncOpenAI(base_url=self.base_url, api_key=self.api_key, timeout=self.timeout.total)
+            comp = await client.chat.completions.create(**self.payload)
+            return self._process_result(comp.to_dict())
+        except RateLimitError as e:
+            return self.api_error_result('RateLimit', e, 429)
+        except APIStatusError as e:
+            return self.api_error_result('Status', e)
+        except APIConnectionError as e:
+            return self.api_error_result('Connection', e, 503)
+        except Exception as e:
+            return self.api_error_result('Unknown', e, 500)
+
+    async def call_debug(self) -> dict:
         try:
             messages = self.payload.get("messages", [])
             if messages:
@@ -46,38 +106,22 @@ class LLMConnection:
                         json=self.payload,
                         timeout=self.timeout
                 ) as response:
-                    text = await response.text()
-                    self.last_result = result = json.loads(text)
-                    sr = []
-                    if response.status != 200:
-                        log.error(f"Ошибка {self.name} API: status=%d, response=%s", response.status, text)
-                    else:
-                        log.debug(f"Ответ {self.name} API {response.charset} : %s", json.dumps(result, indent=2))
-                        sr = self.get_search_results()
-
-                    return {
-                        "text": self.get_text(),
-                        "search_results": sr,
-                        "usage": result.get("usage", {})
-                    }
+                    result = await response.json()
+                    return self._process_result(result, response.status)
         except Exception as e:
             log.excpt(f"Ошибка {self.name} API: ", e=e)
             return {}
 
-    def make_payload(self, prompt: str, max_tokens=27000, max_completion_tokens=13500, reasoning_effort="low", temp=0.3, extra=None) -> dict:
-        # TODO: нужно считывать параметры role, max_tokens, max_completion_tokens, reasoning_effort из БД
+    def make_payload(self, prompt: str, extra=None) -> dict:
         messages = []
         if self.pre_prompt:
             messages.append({"role": "system", "content": self.pre_prompt})
         messages.append({"role": "user", "content": prompt})
         self.payload = {
             "model": self.model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "max_completion_tokens": max_completion_tokens,
-            "reasoning_effort": reasoning_effort,
-            "temperature": temp  # Для большей предсказуемости
+            "messages": messages
         }
+        self.payload.update(self.model_params)
         if extra is not None:
             self.payload.update(extra)
         return self.payload
@@ -96,8 +140,9 @@ class LLMConnection:
         response = self.last_result
         choices = response.get("choices", [{}])
         if not choices:
-            log.error("No choices in response: %s", json.dumps(response, indent=2))
-            return "<llm_error>No choices in response</llm_error>"
+            dump = json.dumps(response, indent=2)
+            log.error("No choices in response: %s", dump)
+            return f"<llm_error>No choices in response:{dump}</llm_error>"
 
         choice = choices[0]
         if "error" in choice:
@@ -111,11 +156,10 @@ class LLMConnection:
         msg = choice.get("message", {})
         text = msg.get("content", "") + msg.get("text", "")
 
-
         text = text.strip()
         if not text:
             reason = choice.get("native_finish_reason", choice.get("finish_reason", "unknown reason"))
-            text = f"<void_response>Due {reason}</void_response>"
+            text = f"<void_response>Due {reason}</void_response>\n<response>\n{json.dumps(choice, indent=2)}\n</response>"
         return self.clean_response(text)
 
     def add_search_tool(self, params: dict) -> dict:
@@ -175,6 +219,7 @@ class LLMConnection:
 class XAIConnection(LLMConnection):
     def __init__(self, config: dict):
         super().__init__(config)
+        self.name = "xAI"
         self.base_url = "https://api.x.ai/v1"
         self.search_sources = ["web", "x", "news"]
 
@@ -183,6 +228,7 @@ class OpenAIConnection(LLMConnection):
     def __init__(self, config: dict):
         super().__init__(config)
         self.name = "OpenAI"
+        self.model_params["reasoning_effort"] = "low"  # fast by default
         self.base_url = "https://api.openai.com/v1"
 
 

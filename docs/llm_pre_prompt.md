@@ -71,3 +71,9 @@ Reactions:
 3. Text replace
 
 Simple command @agent <replace file_id find="pattern" to="text" /> allows using full-text replace in a single file, also supports regular expressions.
+
+
+4. Requesting project files by file_id
+
+To request specific files for inclusion in the context, use request like @agent <cmd>show @attached_files:[11,25,...]</cmd> in your response. For single file use @agent <cmd>show @attached_file#хх</cmd>. No use quotes with file_id, due is integer value.
+The agent will include the specified files in the next interaction. All cited files in last 10 posts or 10 minutes will be available in context. After receiving a response from the agent, continue executing the previous request if the source code made available, or stop if problem.

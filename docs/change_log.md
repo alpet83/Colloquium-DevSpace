@@ -170,3 +170,38 @@ Description:
 
 Added support for executing commands in containers with user inputs.
 
+
+====================================== COMMIT 13.08.2025 =========================================================
+
+Change Log: Context Optimization (August 2025)
+Overview
+This change log documents recent updates to the Colloquium DevSpace project, focusing on optimizing context size to address the GPT-5 token limit (30K tokens/min). The changes reduced context size from ~210 KB to ~88 KB, enabling reliable processing by the LLM. The updates include modifications to llm_pre_prompt.md, context_assembler.py, and llm_interactor.py.
+Changes
+llm_pre_prompt.md
+
+Location: docs/llm_pre_prompt.md
+Description: Added section 4 under USING MULTICHAT AGENT to allow LLMs to request files via @agent <cmd>show @attached_files:[file_id1,file_id2...]</cmd> or @attached_file#xx. This enables dynamic file inclusion within the 10-minute freshness window or last 10 posts.
+Impact: Supports iterative context building, reducing manual file uploads.
+
+context_assembler.py
+
+Location: src/agent/context_assembler.py
+Description:
+Added time import and self.fresh_files = set() in __init__ to track fresh file IDs.
+Modified assemble_posts to filter posts within a 10-minute window or the last 10 posts, populating self.fresh_files with file_id from @attached_file# or @attach_dir#.
+Updated globals to g for consistency and replaced regex with g.ATTACHES_REGEX.
+
+
+Impact: Enables selective file inclusion, reducing context size by excluding outdated files.
+
+llm_interactor.py
+
+Location: src/agent/managers/llm_interactor.py
+Description:
+Updated interact method to implement two-stage sandwich packing:
+First packer.pack call generates a full index (result['index']) with all files, entities, and project datasheet.
+Filtered content_blocks to include only posts (content_type=":post") or files with file_id in self.fresh_files.
+Second packer.pack call creates a compact sandwich with deep_index for filtered blocks.
+Added <focus> block with last_post_id and attached_files to prioritize recent context.
+
+Summary impact: Reduces context size more than two times, ensuring compliance with GPT-5 token limits while maintaining full index for LLM orientation.
