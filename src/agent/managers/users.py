@@ -24,9 +24,9 @@ class UserManager:
                 "salt TEXT"
             ]
         )
-        self._init_admin_user()
+        self._init_users()
 
-    def _init_admin_user(self):
+    def _init_users(self):
         count = self.users_table.select_row(
             columns=["COUNT(*)"],
             conditions={"user_name": "admin"}

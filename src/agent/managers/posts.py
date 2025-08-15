@@ -3,10 +3,11 @@ import time
 import re
 import asyncio
 from managers.db import Database, DataTable
-import globals
+import globals as g
 from lib.basic_logger import BasicLogger
 
-log = globals.get_logger("postman")
+log = g.get_logger("postman")
+
 
 class PostManager:
     """Управляет сообщениями и их историей в чат-приложении."""
@@ -102,7 +103,7 @@ class PostManager:
                     quote_ids.update(int(qid) for qid in matches)
             quotes = {}
             for quote_id in quote_ids:
-                row = globals.post_processor.quotes_table.select_from(
+                row = g.post_processor.quotes_table.select_from(
                     columns=['quote_id', 'chat_id', 'user_id', 'content', 'timestamp'],
                     conditions=[('quote_id', '=', quote_id)]
                 )
@@ -164,6 +165,9 @@ class PostManager:
             log.excpt("Ошибка сохранения сообщения для chat_id=%d, user_id=%d: ", chat_id, user_id, e=e)
             return {"error": str(e)}
 
+    def agent_message(self, chat_id: int, message: str, rql: int = 1, reply_to: int = None):
+        self.add_message(chat_id, g.AGENT_UID, message, rql, reply_to)
+
     def add_message(self, chat_id: int, user_id: int, message: str, rql: int = 0, reply_to: int = None) -> dict:
         """Добавляет сообщение, обрабатывает его через post_processor и сохраняет ответ агента, если есть.
 
@@ -198,7 +202,7 @@ class PostManager:
             # через пост-процессор не требуется пропускать лишь ответы агента
             if chat_id != 2:
                 try:
-                    pp = globals.post_processor
+                    pp = g.post_processor
                     result = pp.process_response(chat_id, user_id, message, post_id)
                     log.debug("Результат process_response: handled_cmds=%d, failed_cmds=%d, processed_msg=%s",
                               result["handled_cmds"], result["failed_cmds"], result["processed_msg"][:50])
@@ -231,7 +235,7 @@ class PostManager:
                               agent_post_id, chat_id, rql, str(post_id), agent_message[:50])
 
             # Проверяем необходимость репликации
-            sr = globals.replication_manager.check_start_replication(chat_id, post_id, user_id, message, rql)
+            sr = g.replication_manager.check_start_replication(chat_id, post_id, user_id, message, rql)
             log.debug("Добавление сообщения %d в чат %d завершено %s",
                       post_id, chat_id, 'с репликацией' if sr else 'без репликации')
 
@@ -244,32 +248,6 @@ class PostManager:
         except Exception as e:
             log.excpt("Ошибка добавления сообщения для chat_id=%d, user_id=%d: ", chat_id, user_id, e=e)
             return {"error": str(e)}
-
-    async def trigger_replication(self, chat_id: int, post_id: int):
-        """Запускает репликацию для указанного chat_id.
-
-        Args:
-            chat_id (int): ID чата.
-            post_id (int): ID поста.
-        """
-        try:
-            log.debug("Запуск репликации для chat_id=%d, post_id=%d", chat_id, post_id)
-            await globals.replication_manager.replicate_to_llm(chat_id)
-            log.debug("Репликация завершена для chat_id=%d, post_id=%d", chat_id, post_id)
-        except Exception as e:
-            log.excpt("Ошибка репликации для chat_id=%d, post_id=%d: %s", chat_id, post_id, e=e)
-            user_row = self.users_table.select_row(
-                conditions=[('user_id', '=', 2)],
-                columns=['user_name']
-            )
-            user_name = user_row[0] if user_row else 'agent'
-            error_result = self.save_message(
-                chat_id, 2, f"@{user_name} Replication error: {str(e)}", 0, post_id
-            )
-            if error_result.get("error"):
-                log.warn("Не удалось сохранить сообщение об ошибке репликации: %s", error_result["error"])
-            else:
-                log.debug("Добавлено сообщение об ошибке репликации в chat_id=%d для user_id=2", chat_id)
 
     def scan_history(self, chat_id: int, visited: set = None, before_id: int = None) -> dict:
         """Рекурсивно собирает историю постов для указанного chat_id, включая родительские чаты.

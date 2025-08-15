@@ -1,10 +1,10 @@
 # /agent/managers/chats.py, updated 2025-07-20 15:45 EEST
 from .db import Database, DataTable
 from lib.basic_logger import BasicLogger
-import globals
+import globals as g
 import asyncio
 
-log = globals.get_logger("chatman")
+log = g.get_logger("chatman")
 
 
 class ChatManager:
@@ -33,11 +33,14 @@ class ChatManager:
         )
         self.switch_events = {}  # Хранилище событий переключения чата: {f"{user_id}:{chat_id}": asyncio.Event}
 
-    def active_chat(self, user_id: int) -> int:
+    def active_chat(self, user) -> int:
         # Проверяем active_chat в sessions_table
-        row = globals.sessions_table.select_row(
+        user_id = user
+        if isinstance(user, str):
+            user_id = g.user_manager.get_user_id_by_name(user)
+        row = g.sessions_table.select_row(
             columns=['session_id', 'active_chat'],
-            conditions={'user_id': user_id})
+            conditions={'user_id': int(user_id)} )
         if not row:
             log.error("No session record for user_id %d", user_id)
             return None

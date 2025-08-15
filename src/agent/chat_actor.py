@@ -6,6 +6,7 @@ class ChatActor:
     def __init__(self, user_id, user_name, llm_class=None, llm_token=None, post_manager=None):
         self.user_id = user_id
         self.user_name = user_name
+        self.llm_class = llm_class
         self.llm_connection = None
         if llm_class and llm_token:
             config = {"api_key": llm_token, "model": llm_class}

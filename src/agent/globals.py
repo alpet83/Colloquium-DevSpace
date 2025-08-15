@@ -10,6 +10,9 @@ project_manager = None
 replication_manager = None
 post_processor = None
 
+ADMIN_UID = 1
+AGENT_UID = 2
+
 # Хранилище для событий переключения чата (user_id:chat_id -> asyncio.Event)
 chat_switch_events = {}
 

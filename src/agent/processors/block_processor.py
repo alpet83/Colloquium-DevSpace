@@ -39,16 +39,19 @@ class ProcessResult:
     def failed_cmds(self):
         return 1 if self.is_error() else 0
 
+
 def res_success(user, msg, pmsg=None, agent_messages=None):
     result = ProcessResult("success", msg, user, pmsg)
     result.agent_messages = agent_messages or []
     return result
+
 
 def res_error(user, msg, pmsg=None, agent_messages=None):
     result = ProcessResult("error", msg, user, pmsg)
     result.agent_messages = agent_messages or []
     result.call_stack = "  ".join(traceback.format_stack(limit=5)).strip()
     return result
+
 
 class BlockProcessor:
     def __init__(self, tag):
@@ -104,7 +107,7 @@ class BlockProcessor:
             "has_code_file": self.tag == 'code_file'
         }
 
-    def _parse_attrs(self, attrs_str):
+    def _parse_attrs(self, attrs_str):   # can be overriden
         attrs = {}
         for attr in re.findall(r'(\w+)="([^"]*)"', attrs_str):
             attrs[attr[0]] = attr[1]
@@ -122,7 +125,7 @@ class BlockProcessor:
             log.error("Неверный формат file_id: %s", file_id)
             raise ProcessorError("Error: Invalid file_id format", user_name)
 
-    def get_file_data(self, file_id, user_name):
+    def get_file_data(self, file_id, user_name) -> tuple:
         project_manager = globals.project_manager
         project_id = project_manager.project_id if project_manager and hasattr(project_manager, 'project_id') else None
         if project_id is None:
@@ -174,6 +177,7 @@ class BlockProcessor:
     def handle_block(self, attrs, block_code):
         raise NotImplementedError("Subclasses must implement handle_block")
 
+
 class CommandProcessor(BlockProcessor):
     def __init__(self):
         super().__init__('cmd')
@@ -184,7 +188,7 @@ class CommandProcessor(BlockProcessor):
         tokens = block_code.split(' ')
         command = tokens[0].lower() if tokens else ''
         command = command.strip()
-        proj_name = g.project_manager.get("project_name", "default")
+        proj_name = getattr(g.project_manager, "project_name", "default")
         user_name = attrs.get('user_name', 'Unknown')
         tail = ' '.join(tokens[1:])
         log.debug("Обработка команды: %s с параметрами %s", command or "None", tail[:50])

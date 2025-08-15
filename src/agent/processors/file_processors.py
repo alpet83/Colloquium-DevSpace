@@ -8,6 +8,7 @@ from processors.block_processor import BlockProcessor, res_error, res_success, P
 
 log = globals.get_logger("llm_proc")
 
+
 class FileEditProcessor(BlockProcessor):
     """Обрабатывает тег <code_file> для создания или модификации файлов."""
     def __init__(self):
@@ -70,6 +71,7 @@ class FileEditProcessor(BlockProcessor):
         if res.is_ok():
             res.processed_message = f"@attach#{file_id}"
         return res
+
 
 class FileUndoProcessor(BlockProcessor):
     """Обрабатывает тег <undo> для восстановления предыдущей версии файла."""
@@ -154,6 +156,7 @@ class FileUndoProcessor(BlockProcessor):
             return result
         except ProcessorError as e:
             return res_error(user_name, str(e))
+
 
 class FileReplaceProcessor(BlockProcessor):
     """Обрабатывает тег <replace> для замены текста в файле по шаблону."""

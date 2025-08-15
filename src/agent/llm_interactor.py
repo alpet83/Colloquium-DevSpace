@@ -5,18 +5,52 @@ from pathlib import Path
 from lib.sandwich_pack import SandwichPack, estimate_tokens
 from context_assembler import ContextAssembler
 from managers.db import DataTable
-import globals
+from chat_actor import ChatActor
+import globals as g
 import os
 
-log = globals.get_logger("interactor")
+log = g.get_logger("interactor")
+
+
+class ContextInput:
+    def __init__(self, content_blocks: list, users: list, chat_id: int, actor: ChatActor, exclude_source_id: int = None):
+        self.blocks = content_blocks
+        self.users = users
+        self.chat_id = chat_id
+        self.actor = actor
+        self.exclude_id = exclude_source_id
+        self.debug_mode = False
+
+
+def _load_pre_prompt() -> str:
+    """Загружает пре-промпт из файла.
+
+    Returns:
+        str: Содержимое пре-промпта.
+
+    Raises:
+        FileNotFoundError: Если файл пре-промпта не найден.
+    """
+    try:
+        with open(g.PRE_PROMPT_PATH, 'r', encoding='utf-8-sig') as f:
+            pre_prompt = f.read()
+        log.debug("Загружен пре-промпт из %s", g.PRE_PROMPT_PATH)
+        return pre_prompt
+    except FileNotFoundError as e:
+        g.handle_exception("Файл пре-промпта %s не найден" % g.PRE_PROMPT_PATH, e=e)
+        raise
+
 
 class LLMInteractor(ContextAssembler):
     """Базовый класс для взаимодействия с LLM, кэширования индекса и управления контекстом."""
-    def __init__(self):
+    def __init__(self, debug_mode: bool = False):
         """Инициализирует LLMInteractor с загрузкой пре-промпта и настройкой таблицы llm_usage."""
         super().__init__()
-        self.pre_prompt = self._load_pre_prompt()
+        self.debug_mode = debug_mode
+        self.pre_prompt = _load_pre_prompt()
         self.last_sandwich_idx = None
+        self.entities_idx = {}   # index per chat
+        self.tokens_limit = 131072
         self.llm_usage_table = DataTable(
             table_name="llm_usage",
             template=[
@@ -31,24 +65,6 @@ class LLMInteractor(ContextAssembler):
                 "chat_id INTEGER"
             ]
         )
-
-    def _load_pre_prompt(self) -> str:
-        """Загружает пре-промпт из файла.
-
-        Returns:
-            str: Содержимое пре-промпта.
-
-        Raises:
-            FileNotFoundError: Если файл пре-промпта не найден.
-        """
-        try:
-            with open(globals.PRE_PROMPT_PATH, 'r', encoding='utf-8-sig') as f:
-                pre_prompt = f.read()
-            log.debug("Загружен пре-промпт из %s", globals.PRE_PROMPT_PATH)
-            return pre_prompt
-        except FileNotFoundError as e:
-            globals.handle_exception("Файл пре-промпта %s не найден" % globals.PRE_PROMPT_PATH, e=e)
-            raise
 
     def _write_context_stats(self, content_blocks: list, llm_name: str, chat_id: int, index_json: str):
         """Записывает статистику контекста в файл логов.
@@ -65,7 +81,7 @@ class LLMInteractor(ContextAssembler):
         stats.append({
             "block_type": ":pre_prompt",
             "block_id": "N/A",
-            "file_name": globals.PRE_PROMPT_PATH,
+            "file_name": g.PRE_PROMPT_PATH,
             "tokens": pre_prompt_tokens
         })
         index_tokens = estimate_tokens(index_json)
@@ -109,8 +125,8 @@ class LLMInteractor(ContextAssembler):
             log.info("Статистика контекста записана в %s для chat_id=%d, блоков=%d",
                      str(stats_file), chat_id, len(stats))
         except Exception as e:
-            globals.handle_exception(f"Не удалось записать статистику контекста в {stats_file}", e)
-            globals.post_manager.add_message(chat_id, 2, f"Не удалось записать статистику контекста для {llm_name}: {str(e)}")
+            g.handle_exception(f"Не удалось записать статистику контекста в {stats_file}", e)
+            g.post_manager.add_message(chat_id, 2, f"Не удалось записать статистику контекста для {llm_name}: {str(e)}")
 
     def _write_chat_index(self, chat_id: int):
         """Сохраняет индекс чата в /app/projects/.chat-meta/{chat_id}-index.json и регистрирует в БД.
@@ -121,7 +137,7 @@ class LLMInteractor(ContextAssembler):
         index_content = self.last_sandwich_idx
         file_name = f".chat-meta/{chat_id}-index.json"
         try:
-            fm = globals.file_manager
+            fm = g.file_manager
             file_id = fm.add_file(file_name, content=index_content, project_id=0)
             if file_id > 0:
                 log.debug("Дамп индекса '%s' зарегистрирован как %d", file_name, file_id)
@@ -130,49 +146,40 @@ class LLMInteractor(ContextAssembler):
                 log.error("Не удалось зарегистрировать %s", file_name)
         except Exception as e:
             log.excpt("Не удалось сохранить индекс для chat_id=%d", chat_id, e=e)
-            globals.post_manager.add_message(
+            g.post_manager.add_message(
                 chat_id, 2, f"Не удалось сохранить индекс для {file_name}: {str(e)}"
             )
 
-    async def interact(self, content_blocks: list, users: list, chat_id: int, actor, debug_mode: bool = False, rql: int = 1) -> str:
-        """Взаимодействует с LLM, формируя контекст и сохраняя статистику.
+    def entity_index(self, chat_id: int):
+        return self.entities_idx.get(chat_id, None)
 
-        Args:
-            content_blocks (list): Список блоков контента.
-            users (list): Список пользователей.
-            chat_id (int): ID чата.
-            actor: Объект ChatActor.
-            debug_mode (bool, optional): Режим отладки. Defaults to False.
-            rql (int, optional): Уровень рекурсии. Defaults to 1.
-
-        Returns:
-            str: Ответ LLM или сообщение об ошибке.
-        """
-        tokens_limit, tokens_cost = globals.user_manager.get_user_token_limits(actor.user_id)
-        content_blocks.sort(key=lambda x: x.relevance if x.relevance else 0, reverse=True)
-        total_tokens = estimate_tokens(self.pre_prompt)
+    def build_context(self, ci: ContextInput, rql: int=1):
+        """ TODO: need extract from interact """
         filtered_blocks = []
+        actor = ci.actor
         context = ''
+        total_tokens = estimate_tokens(self.pre_prompt)
         last_post_id = 0
-        log.debug("Упаковка %d блоков контента для rql=%d", len(content_blocks), rql)
+        log.debug("Упаковка %d блоков контента для rql=%d", len(ci.blocks), rql)
         try:
-            proj_man = globals.project_manager
-            project_name = proj_man.project_name if proj_man else 'not specified'
+            proj_man = g.project_manager
+            project_name = proj_man.project_name
             packer = SandwichPack(project_name, max_size=1_000_000, compression=True)
-            result = packer.pack(content_blocks, users=users)
+            result = packer.pack(ci.blocks, users=ci.users)
+            self.entities_idx[ci.chat_id] = list(packer.entities).copy()
             self.last_sandwich_idx = full_idx = result['index']  # Запомнить индекс, это уже JSON в строке
-            self._write_chat_index(chat_id)  # сохранение отдельного файла с индексом, для перекрестного взаимодействия в разных чатах
+            self._write_chat_index(ci.chat_id)  # сохранение отдельного файла с индексом, для перекрестного взаимодействия в разных чатах
 
             context = f"RQL: {rql}\n{full_idx}\n"  # От полного списка блоков забираются только индексы, содержащий описание файлов и сущностей. Детальный deep_index сохранять сейчас нельзя, поскольку привязывается к блокам
 
             files_passed = []
             # пере-сборка блоков, с контентом актуальных файлов, до наступления переполнения контекста
-            for block in content_blocks:
+            for block in ci.blocks:
                 block_text = block.to_sandwich_block()
                 block_tokens = estimate_tokens(block_text)
-                if total_tokens + block_tokens >= tokens_limit:
+                if total_tokens + block_tokens >= self.tokens_limit:
                     log.debug("Пропуск блока post_id=%s, file_id=%s из-за лимита токенов %d",
-                              str(block.post_id or 'N/A'), str(block.file_id or 'N/A'), tokens_limit)
+                              str(block.post_id or 'N/A'), str(block.file_id or 'N/A'), self.tokens_limit)
                     break
                 if block.content_type == ":post":
                     last_post_id = max(block.post_id, last_post_id)
@@ -182,19 +189,37 @@ class LLMInteractor(ContextAssembler):
                     continue
                 filtered_blocks.append(block)
 
-            log.debug("Отфильтровано %d блоков из %d, добавлено %d файлов из %s ", len(filtered_blocks), len(content_blocks), len(files_passed), str(self.fresh_files))
+            log.debug("Отфильтровано %d блоков из %d, добавлено %d файлов из %s ", len(filtered_blocks), len(ci.blocks), len(files_passed), str(self.fresh_files))
             # Второй вызов: компактный сэндвич с ограниченным детализированным индексом
-            result = packer.pack(filtered_blocks, users=users)
+            result = packer.pack(filtered_blocks, users=ci.users)
             context += result['deep_index'] + "\n" + ''.join(result['sandwiches'])
             focus = {"last_post_id": last_post_id, "attached_files": files_passed}
             context += f"\n<focus>\n{focus}\n</focus>"  # подстраховка для моделей, что ценят больше последние символы контекста
 
             log.debug("Контекст сгенерирован, длина %d символов, индекс кэширован", len(context))
-            self._write_context_stats(content_blocks, actor.user_name, chat_id, result['index'])
-
+            self._write_context_stats(filtered_blocks, actor.user_name, ci.chat_id, result['index'])
+            return context
         except Exception as e:
-            globals.handle_exception("Не удалось упаковать блоки контента для chat_id=%d" % chat_id, e)
-        context_file = Path(f"/app/logs/context-{actor.user_name}-{chat_id}.llm")
+            g.handle_exception("Не удалось упаковать блоки контента для chat_id=%d" % ci.chat_id, e)
+            raise e
+
+    async def interact(self, ci: ContextInput, rql: int = 1) -> str:
+        """Взаимодействует с LLM, формируя контекст и сохраняя статистику.
+
+        Args:
+            ci (ContextInput): Набор входных данных в объекте
+            rql (int, optional): Уровень рекурсии. Defaults to 1.
+
+        Returns:
+            str: Ответ LLM или сообщение об ошибке.
+        """
+        actor = ci.actor
+        tokens_limit, tokens_cost = g.user_manager.get_user_token_limits(actor.user_id)
+        context = self.build_context(ci, rql)
+        if not context:
+            return "ERROR: failed build_context"
+
+        context_file = Path(f"/app/logs/context-{actor.user_name}-{ci.chat_id}.llm")
         try:
             with open(context_file, "w", encoding="utf-8") as f:
                 f.write(context)
@@ -202,64 +227,60 @@ class LLMInteractor(ContextAssembler):
                      str(context_file), actor.user_id, len(context))
         except Exception as e:
             err = f"Не удалось сохранить контекст для {actor.user_name}: {str(e)}"
-            globals.post_manager.add_message(chat_id, 2, err, rql=rql)
-            globals.handle_exception(err, e)
+            g.post_manager.add_message(ci.chat_id, 2, err, rql=rql)
+            g.handle_exception(err, e)
         sent_tokens = estimate_tokens(context)
         if sent_tokens > tokens_limit:
             log.error("Контекст превышает лимит токенов для user_id=%d: %d > %d", actor.user_id, sent_tokens, tokens_limit)
             raise ValueError(f"Контекст превышает лимит токенов: {sent_tokens} > {tokens_limit}")
 
-        if debug_mode:
-            debug_file = Path(f"/app/logs/debug_{actor.user_name}_"
-                              f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
-            with open(debug_file, "w", encoding="utf-8") as f:
-                f.write(context)
-            log.info("Сохранён отладочный контекст в %s для user_id=%d", str(debug_file), actor.user_id)
-            return "OK"
-        else:
-            conn = actor.llm_connection
-            conn.pre_prompt = self.pre_prompt
-            log.debug("Отправка в LLM для user_id=%d: %d символов, rql %d", actor.user_id, len(context) + len(self.pre_prompt), rql)
-            search_params = conn.get_search_params(actor.user_id)
-            try:
-                conn.make_payload(prompt=context)
-                if search_params.get("mode", 'off') == "off":
-                    log.debug("Поиск отключён для user_id=%d", actor.user_id)
-                    response = await conn.call()
-                else:
-                    conn.add_search_tool(search_params)
-                    response = await conn.call()
-                if response:
-                    usage = response.get('usage', {})
-                    used_tokens = usage.get('prompt_tokens', 0)
-                    output_tokens = usage.get('completion_tokens', 0)
-                    sources_used = usage.get('num_sources_used', 0)
-                    total_cost = (used_tokens + output_tokens) * tokens_cost / 1_000_000
-                    self.llm_usage_table.insert_into({
-                        "ts": int(datetime.datetime.now().timestamp()),
-                        "model": conn.model,
-                        "sent_tokens": sent_tokens,
-                        "used_tokens": used_tokens,
-                        "output_tokens": output_tokens,
-                        "sources_used": sources_used,
-                        "token_limit": tokens_limit,
-                        "token_cost": total_cost,
-                        "chat_id": chat_id
-                    })
-                    log.debug("Сохранена статистика LLM для chat_id=%d, user_id=%d: model=%s, sent_tokens=%d, used_tokens=%d, output_tokens=%d, sources_used=%d, token_cost=%f",
-                              chat_id, actor.user_id, conn.model, sent_tokens, used_tokens, output_tokens, sources_used, total_cost)
-                    text = response.get('text', 'void-response')
-                    response_file = Path(f"/app/logs/response-{actor.user_name}-{chat_id}.llm")
-                    with open(response_file, "w", encoding="utf-8") as f:
-                        f.write(text)
-                    return text
-                else:
-                    log.error("llm_connection вернул %s", str(response))
-                    return f"invalid_response: {response}"
-            except Exception as e:
-                error_msg = f"Ошибка LLM для {actor.user_name}: {str(e)}"
-                globals.handle_exception(error_msg, e)
-                globals.post_manager.add_message(
-                    chat_id, 2, error_msg, rql=rql if rql >= 2 else None
-                )
-                return f"LLMException {e}"
+        if ci.debug_mode:
+            log.info("Отладочный режим, контекст не отправлен LLM %s", actor.user_name)
+            return f"OK: debug_mode, context size = {len(context)}"
+
+        conn = actor.llm_connection
+        conn.pre_prompt = f"You are @{actor.user_name}, participant of software developers chat\n" + self.pre_prompt
+        log.debug("Отправка в LLM для user_id=%d: %d символов, rql %d", actor.user_id, len(context) + len(self.pre_prompt), rql)
+        search_params = conn.get_search_params(actor.user_id)
+        try:
+            conn.make_payload(prompt=context)
+            if search_params.get("mode", 'off') == "off":
+                log.debug("Поиск отключён для user_id=%d", actor.user_id)
+                response = await conn.call()
+            else:
+                conn.add_search_tool(search_params)
+                response = await conn.call()
+            if response:
+                usage = response.get('usage', {})
+                used_tokens = usage.get('prompt_tokens', 0)
+                output_tokens = usage.get('completion_tokens', 0)
+                sources_used = usage.get('num_sources_used', 0)
+                total_cost = (used_tokens + output_tokens) * tokens_cost / 1_000_000
+                self.llm_usage_table.insert_into({
+                    "ts": int(datetime.datetime.now().timestamp()),
+                    "model": conn.model,
+                    "sent_tokens": sent_tokens,
+                    "used_tokens": used_tokens,
+                    "output_tokens": output_tokens,
+                    "sources_used": sources_used,
+                    "token_limit": tokens_limit,
+                    "token_cost": total_cost,
+                    "chat_id": ci.chat_id
+                })
+                log.debug("Сохранена статистика LLM для chat_id=%d, user_id=%d: model=%s, sent_tokens=%d, used_tokens=%d, output_tokens=%d, sources_used=%d, token_cost=%f",
+                          ci.chat_id, actor.user_id, conn.model, sent_tokens, used_tokens, output_tokens, sources_used, total_cost)
+                text = response.get('text', 'void-response')
+                response_file = Path(f"/app/logs/response-{actor.user_name}-{ci.chat_id}.llm")
+                with open(response_file, "w", encoding="utf-8") as f:
+                    f.write(text)
+                return text
+            else:
+                log.error("llm_connection вернул %s", str(response))
+                return f"invalid_response: {response}"
+        except Exception as e:
+            error_msg = f"Ошибка LLM для {actor.user_name}: {str(e)}"
+            g.handle_exception(error_msg, e)
+            g.post_manager.add_message(
+                ci.chat_id, 2, error_msg, rql=rql if rql >= 2 else None
+            )
+            return f"LLMException {e}"

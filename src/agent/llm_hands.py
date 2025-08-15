@@ -4,7 +4,7 @@ import globals
 from processors.block_processor import CommandProcessor, ProcessResult
 from processors.shell_code import ShellCodeProcessor
 from processors.file_processors import FileEditProcessor, FileReplaceProcessor, FileMoveProcessor, FileUndoProcessor
-from processors.entity_processor import EntityUpdateProcessor
+from processors.entity_processor import LookupSpanProcessor, LookupEntityProcessor, ReplaceSpanProcessor
 from processors.patch_processor import CodePatchProcessor
 
 log = globals.get_logger("llm_hands")
@@ -39,7 +39,9 @@ def process_message(text, timestamp, user_name: str, rql: int = 0) -> dict:
         FileUndoProcessor(),
         FileReplaceProcessor(),
         ShellCodeProcessor(),
-        EntityUpdateProcessor()
+        LookupSpanProcessor(),
+        LookupEntityProcessor(),
+        ReplaceSpanProcessor()
     ]
     log.info("Инициализировано %d процессоров для обработки сообщения", len(processors))
 

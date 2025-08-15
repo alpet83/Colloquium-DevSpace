@@ -47,7 +47,7 @@ class HunkBlock:
         self.start_new = 0
         self.count_new = 0
         self.offset = 0
-        self.warnings = {}
+        self.sp_warns = {}
         self.mismatches = []
         self.patch = []
 
@@ -149,7 +149,7 @@ class HunkBlock:
             real_text = new_lines[l_num].rstrip() if new_lines[l_num] else '[None]'
             if real_text != line:
                 if unspaced == real_text:
-                    self.warnings[l_num] = 1
+                    self.sp_warns[l_num] = 1
                     line = unspaced
                 else:
                     if 0 == self.offset:
@@ -173,7 +173,7 @@ class HunkBlock:
         new_lines = file_lines.copy()
         self.offset = offset
         self.mismatches = []
-        self.warnings = {}
+        self.sp_warns = {}
         removed = 0
         added = 0
         agent_message = None
@@ -194,7 +194,7 @@ class HunkBlock:
                     log.debug("Removed line at line=%d: '%s' ? '%s' ", l_num, line, text.rstrip())
                     removed += 1
             elif effect == 1:  # Addition
-                if self.warnings.get(l_num, None):  # обработка замены линии с лишним пробелом
+                if self.sp_warns.get(l_num, None):  # обработка замены линии с лишним пробелом
                     line = line[1:]
                 log.debug("Inserted line at line=%d with content '%s'", l_num, line)
                 new_lines.insert(l_num, line + line_ending)
@@ -222,6 +222,7 @@ class HunkBlock:
         pm = PatchMismatch(l_num, patch_line, file_line, effect)
         self.mismatches.append(pm)
 
+
 class CodePatchProcessor(BlockProcessor):
     """Обрабатывает тег <code_patch> для применения патчей к файлам."""
     def __init__(self):
@@ -246,7 +247,7 @@ class CodePatchProcessor(BlockProcessor):
             log.debug("Trying hunk with offset=%d at start_old=%d", offset, hunk.start_old)
             block_lines, agent_message = hunk.apply(self.current_lines, offset, self.line_ending)
             results[offset] = {"new_lines": block_lines, "mismatches": hunk.mismatches.copy(),
-                              "agent_message": agent_message}
+                               "agent_message": agent_message}
             if not hunk.mismatches:
                 log.debug("Hunk successful with offset=%d for file_id=%d", offset, file_id)
                 return results[offset]
@@ -303,8 +304,7 @@ class CodePatchProcessor(BlockProcessor):
                 if patch_line.startswith('@@'):
                     hunk = HunkBlock(patch_line)
                     if hunk.start_old <= 0:
-                        mismatches.append(PatchMismatch(patch_idx + 1, f"Invalid hunk header: {patch_line.rstrip()}",
-                                                        '', 0))
+                        mismatches.append(PatchMismatch(patch_idx + 1, f"Invalid hunk header: {patch_line.rstrip()}", '', 0))
                         patch_idx += 1
                         continue
                     patch_at = patch_idx
@@ -318,10 +318,14 @@ class CodePatchProcessor(BlockProcessor):
                         mismatches.extend(block_mismatches)
                     else:
                         new_lines = block_lines
-                        if hunk.warnings:
-                            agent_messages.append(f"@{user_name} Исправлено: В начале строк патча избыточные пробелы")
+                        reply = ""
                         if agent_message:
-                            agent_messages.append(f"@{user_name} {agent_message}")
+                            reply = f"@{user_name} {agent_message}"
+                        if hunk.sp_warns:
+                            reply += f"\nПатч успешно применен, повторять не требуется. Обнаружены избыточные пробелы, при форматировании ханка, будьте внимательней в следующий раз ;)"
+                        if reply:
+                            agent_messages.append(reply)
+
                     patch_idx += len(hunk.patch)
                 else:
                     patch_idx += 1
@@ -334,7 +338,7 @@ class CodePatchProcessor(BlockProcessor):
                 log.debug("Formatted mismatch error as HTML table")
                 log.error("Патч не соответствует содержимому файла file_id=%d", file_id)
                 raise ProcessorError(
-                    f"PatchError: <mismatch>Удаленные или пропускаемые линии патча не совпадают " + \
+                    f"PatchError: <mismatch>Удаленные или пропускаемые линии патча не совпадают " +
                     f"в файле {file_id} - {file_name}</mismatch>\n{table}",
                     user_name
                 )

@@ -50,30 +50,47 @@ You can edit and create files in the project by strictly following the instructi
 @agent is the first word addressing the agent, followed by the file text wrapped in the HTML code_file tag with the name specified in the 'name' attribute.
 Any other methods of offering a file with code in chat are not supported!
 
-2. For small changes, use code_patch instruction
+2. For average changes, above 9 lines affected, use iterative scheme. Retrieve code span or entity span:
+@agent <lookup_span file_id="42" start="178" end="183" /> or @agent <lookup_entity file_id="42" name="method_name" defined="178" />
+In answer you will receive link to code fragment @span#hash, also attached to context between <file_span> tags. Only if is code expected for make changes, use replace_span command for overwrite, like:
+@agent <replace_span file_id="2" hash="span_hash" cut_lines="5"> 
+    def my_method(
+        p: int
+        ):
+        # test
+        print(f"Value: {p}")
+</replace_span>
+You should precisely specify cut_lines count - it will deleted in span, before insert alternate content. 
 
-Example:@agent <code_patch file_id="2">
-@@ -1,3 +1,4 @@
-Line 1
--Line 2
-+Line 2 modified
-Line 3
-+Line 4
+3. For small changes, less 10 lines affected, use code_patch instruction
+
+Example: @agent <code_patch file_id="42">
+@@ -178,5 +178,5 @@
+    def my_method(
+        p: int
+        ):
+        # test
+-        print(f"Value: {p}")
++        print(f"Sqr: {p*p}")
 </code_patch>
 
+ATTENTION:
+* Reduce lines count in every patch blocks <= 10 at once, or error will signaled.
+* Be very careful, always check file_id is related to the needed file. 
+* First line and lines count must be correctly declared in the hunk header, especially for code with hyphenation (like multiline function header).* 
+* Do not add whitespaces that do not exist in source code before '-' or '+'. 
+* Any multiline construction must be included in the hunk fully, e.g., "import re,math,\n     datetime".*
 
-Try to minimize lines count in patch blocks to less than 10 at once. Be very careful, always check file_id is related to the needed file, and the first line is correctly declared in the hunk header.
-FOCUS: Do not add whitespaces that do not exist in source code before '-' or '+', as it can cause rejection of the patch. Any multiline construction must be included in the hunk fully, e.g., "import re,math,\n     datetime".
 Reactions:
 (1) Agent says "file successfully modified" (or similar in native language), goal reached, no further attempts needed. Agent can correct small mistakes with line numbers but notify if it persists. Always check file source after successful patch if available (stop attempts if not).
 (2) Agent says "Removed or skipped patch lines do not match in the file", meaning the patch affects the wrong file or line. Stop and tag @admin with message "Mission Impossible :(".
 
-3. Text replace
+4. Text replace
 
 Simple command @agent <replace file_id find="pattern" to="text" /> allows using full-text replace in a single file, also supports regular expressions.
 
 
-4. Requesting project files by file_id
+5. Requesting project files by file_id
 
 To request specific files for inclusion in the context, use request like @agent <cmd>show @attached_files:[11,25,...]</cmd> in your response. For single file use @agent <cmd>show @attached_file#хх</cmd>. No use quotes with file_id, due is integer value.
 The agent will include the specified files in the next interaction. All cited files in last 10 posts or 10 minutes will be available in context. After receiving a response from the agent, continue executing the previous request if the source code made available, or stop if problem.

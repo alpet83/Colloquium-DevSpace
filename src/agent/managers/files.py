@@ -35,6 +35,16 @@ class FileManager:
                 "FOREIGN KEY (project_id) REFERENCES projects(id)"
             ]
         )
+        self.spans_table = DataTable(
+            table_name="file_spans",
+            template=[
+                "hash TEXT PRIMARY KEY",
+                "file_id INTEGER",
+                "meta_data JSON",
+                "block_code TEXT",
+                "FOREIGN KEY (file_id) REFERENCES attached_files(id)"
+            ]
+        )
         self.check()
 
     def check(self):
