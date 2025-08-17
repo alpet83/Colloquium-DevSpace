@@ -1,26 +1,35 @@
 FROM python:3.11-slim
 
-
 # Создание виртуальной среды и установка зависимостей
 RUN python3 -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
+ENV PYTHONPATH=/app/agent
+
 RUN pip install --no-cache-dir fastapi uvicorn openai requests asyncio gitpython
 RUN apt-get update && apt-get install -y git
 RUN apt install -y inetutils-ping net-tools traceroute dnsutils nano 
-RUN apt install -y sqlite3
+RUN apt install -y sqlite3 sudo
 RUN pip install watchgod toml python-multipart
-RUN pip install sqlalchemy
+RUN pip install sqlalchemy aiohttp colorama
 # Рабочая директория
 WORKDIR /app/agent
 VOLUME /app/agent
 VOLUME /app/projects
 VOLUME /app/logs
+VOLUME /app/docs
 VOLUME /app/tests
 
-# Экспозит порта
+# Создание виртуальной среды и установка зависимостей
+RUN apt-get update && apt-get install -y git
+RUN apt install -y inetutils-ping net-tools traceroute dnsutils nano
+
+# Создание непривилегированного пользователя agent
+RUN useradd -m -s /bin/bash -d /app/projects agent
+RUN chown agent -R /app/projects
+# Настройка sudoers для разрешения apt без пароля
+RUN echo "agent ALL=(ALL) NOPASSWD: /usr/bin/apt, /usr/bin/apt-get" > /etc/sudoers.d/agent
+RUN apt install -y curl wget
+
 EXPOSE 8080
-
 # Запуск
-
-# CMD ["sh", "-c", "/app/agent/start_agent.sh"]
 CMD ["python3", "/app/agent/server.py"]

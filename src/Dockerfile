@@ -15,10 +15,18 @@ RUN apt -y install libmariadb-dev libmariadb-dev-compat \
     libcairo2-dev \
     libpango1.0-dev   
 
-RUN pip3 install toml
+RUN apt install -y sudo git
+RUN apt install -y build-essential
+RUN pip install --no-cache-dir toml gitpython quart fastapi asyncio
+# Создание непривилегированного пользователя agent
+RUN useradd -m -s /bin/bash -d /app/projects agent
+# Настройка sudoers для разрешения apt без пароля
+RUN echo "agent ALL=(ALL) NOPASSWD: /usr/bin/apt, /usr/bin/apt-get" > /etc/sudoers.d/agent
+
 # Рабочая директория
 WORKDIR /app/projects
 VOLUME /app/projects
+ENV PYTHONPATH=/app/agent
 
 EXPOSE 8084
 

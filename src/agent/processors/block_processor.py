@@ -58,7 +58,7 @@ class BlockProcessor:
         self.tag = tag
         self.replace = True
 
-    def process(self, post_message: str, user_name: str = '@self'):
+    async def process(self, post_message: str, user_name: str = '@self'):
         pattern = fr'<{self.tag}(?:\s+([^>]+))?>\s*([\s\S\n\r]*?)\s*</{self.tag}>'
         matches = list(re.finditer(pattern, post_message, flags=re.DOTALL))
         count = len(matches)
@@ -79,7 +79,7 @@ class BlockProcessor:
             try:
                 if attrs.get('user_name', None) is None:
                     attrs['user_name'] = user_name
-                result = self.handle_block(attrs, block_code)
+                result = await self.handle_block(attrs, block_code)
             except ProcessorError as e:
                 failed_cmds += 1
                 exc_info = (type(e), e, e.__traceback__)
@@ -174,7 +174,7 @@ class BlockProcessor:
             log.excpt("Ошибка сохранения файла file_id=%d: ", file_id, e=e)
             raise ProcessorError(f"Error: Failed to save {file_name}: {e}", user_name)
 
-    def handle_block(self, attrs, block_code):
+    async def handle_block(self, attrs, block_code):
         raise NotImplementedError("Subclasses must implement handle_block")
 
 
@@ -183,7 +183,7 @@ class CommandProcessor(BlockProcessor):
         super().__init__('cmd')
         self.replace = False
 
-    def handle_block(self, attrs, block_code):
+    async def handle_block(self, attrs, block_code):
         block_code = block_code.strip()
         tokens = block_code.split(' ')
         command = tokens[0].lower() if tokens else ''

@@ -110,8 +110,7 @@ export const useChatStore = defineStore('chat', {
                 .map(post => post.id))
             for (const [postId, post] of Object.entries(data.posts)) {
               if (post.action !== 'delete') {
-                newHistory[postId] = post
-                log_msg('CHAT', `Have changes, added post ${postId}, refreshing UI`)
+                newHistory[postId] = post                
               }
             }
             for (const postId of deletedIds) {

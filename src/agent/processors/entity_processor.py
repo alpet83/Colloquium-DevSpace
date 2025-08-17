@@ -147,7 +147,7 @@ class SpanProcessor(BlockProcessor):
             del new_lines[0]  # Удаляем смещение индекса
         return new_lines
 
-    def handle_block(self, attrs: dict, block_code: str) -> dict:
+    async def handle_block(self, attrs: dict, block_code: str) -> dict:
         """Обрабатывает блок для итеративного редактирования.
 
         Args:

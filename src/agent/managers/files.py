@@ -55,16 +55,14 @@ class FileManager:
             file_id, file_name, content, project_id, ts = row
             is_link = not content or file_name.startswith('@')
             if is_link and not file_name.startswith('@'):
-                new_file_name = f"@{file_name}"
                 self.files_table.update(
                     conditions={'id': file_id},
-                    values={'file_name': new_file_name}
+                    values={'file_name': f"@{file_name}"}
                 )
-                log.debug("Добавлен префикс @ для ссылки: id=%d, file_name=%s -> %s", file_id, file_name, new_file_name)
-                file_name = new_file_name
+                log.debug("Добавлен префикс @ для ссылки: id=%d, file_name=%s", file_id, file_name)
+                file_name = f"@{file_name}"
             if is_link and not self.link_valid(file_id) and project_id > 0:
                 log.warn("Для проекта %3d, @%5d: %s  более не существует на диске", project_id, file_id, file_name)
-
 
     def _dedup(self, project_id: int = None):
         conditions = {'project_id': project_id} if project_id is not None else {}
@@ -152,7 +150,7 @@ class FileManager:
             content = file_data['content']
 
         file_data['content'] = globals.unitext(content)
-        log.debug("Получен файл id=%d, file_name=%s, project_id=%s", file_id, file_name, str(project_id))
+        # log.debug("Получен файл id=%d, file_name=%s, project_id=%s", file_id, file_name, str(project_id))
         return file_data
 
     def get_file_name(self, file_id: int):
@@ -176,25 +174,25 @@ class FileManager:
             timestamp = int(time.time())
 
         if content:
-            self.write_file(file_name, content, project_id)
+            self.write_file('@' + file_name, content, project_id)
 
         if timestamp is None:
             timestamp = _mod_time(file_name, project_id)
 
-        effective_file_name = f"@{file_name}" if not content else file_name
-        if project_id == 0:
-            effective_file_name = f"@{file_name}"
-        file_id = self.files_table.insert_into(
+        file_id = self._add_link(file_name, project_id, timestamp)
+        log.debug("Добавлен файл id=%d, file_name=%s, project_id=%s", file_id, file_name, str(project_id))
+        return file_id
+
+    def _add_link(self, file_name: str, project_id: int, timestamp):
+        return self.files_table.insert_into(
             values={
                 'content': None,
                 'ts': timestamp,
-                'file_name': effective_file_name,
+                'file_name': f"@{file_name}",
                 'project_id': project_id
             },
             ignore=True
         )
-        log.debug("Добавлен файл id=%d, file_name=%s, project_id=%s", file_id, file_name, str(project_id))
-        return file_id
 
     def update_file(self, file_id: int, content: str, timestamp=None, project_id=None):
         if not self.link_valid(file_id):
@@ -220,14 +218,14 @@ class FileManager:
                     timestamp = _mod_time(file_name, project_id)
 
             except Exception as e:
-                log.excpt("Ошибка записи файла %s: ", file_name, e=e)
+                log.excpt("Ошибка записи файла %s   : ", file_name, e=e)
                 return -6
-        effective_file_name = f"@{file_name}" if project_id == 0 else file_name
+
         self.files_table.update(
             conditions={'id': file_id},
             values={
                 'content': None,
-                'file_name': effective_file_name,
+                'file_name': f"@{file_name}",
                 'ts': timestamp,
                 'project_id': project_id
             }
@@ -362,6 +360,7 @@ class FileManager:
             self.unlink(file_id)
 
     def write_file(self, file_name, content, project_id=None):
+        # assert file_name.startswith('@'), "Using write_file not for a link"
         safe_path = _qfn(file_name, project_id)
         log.debug("Creating directory for file: %s", safe_path.parent)
         os.makedirs(safe_path.parent, exist_ok=True)

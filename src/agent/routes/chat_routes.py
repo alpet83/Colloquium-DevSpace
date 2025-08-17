@@ -1,4 +1,6 @@
 # /app/agent/routes/chat_routes.py, updated 2025-07-26 15:15 EEST
+import math
+
 from fastapi import APIRouter, Request, HTTPException
 import asyncio
 import time
@@ -58,15 +60,21 @@ async def delete_chat(request: Request):
 @router.get("/chat/get")
 async def get_chat(request: Request, chat_id: int, wait_changes: int = 0):
     try:
-        # NOLOG!: логгирование запрещено из-за флуда
+        # NOLOG!: постоянное логирование запрещено из-за флуда
         user_id = check_session(request)
-        if g.replication_manager is None:
-            status = {"status": "replication not ready"}
-        else:
-            status = g.replication_manager.get_processing_status()
+        status = {'status': "nope"}
         if wait_changes:
-            max_wait = 150 if status['status'] == 'free' else 20
-            for _ in range(max_wait):
+            max_wait = 15
+            _elps = 0
+            _loops = 0
+            _start = time.time()
+            while _elps < max_wait:
+                _elps = time.time() - _start
+                _loops += 1
+                status = g.chat_manager.chat_status(chat_id)
+                if status['status'] == 'busy' and max_wait > 1:
+                    log.debug(" Ожидание сокращено, поскольку чат занят пользователем %s ", status['actor'])
+                    max_wait = 1
                 active = g.chat_manager.active_chat(user_id)
                 history = g.post_manager.get_history(chat_id, wait_changes == 1)
                 if history != {"chat_history": "no changes"}:
@@ -76,7 +84,7 @@ async def get_chat(request: Request, chat_id: int, wait_changes: int = 0):
                     log.debug("Chat switch detected for user_id=%d, chat_id=%d, active=%d", user_id, chat_id, active)
                     return {"chat_id": active, "posts": {"chat_history": "chat switch"}, "status": status}
                 await asyncio.sleep(0.1)
-            return {"chat_id": chat_id, "posts": {"chat_history": "no changes"}, "quotes": {}, "status": status}
+            return {"chat_id": chat_id, "posts": {"chat_history": "no changes"}, "quotes": {}, "status": status, "wait_loops": _loops, "elapsed": "%.1f" % _elps}
         else:
             log.debug("Статус обработки для user_id=%d, chat_id=%d: %s", user_id, chat_id, status)
             history = g.post_manager.get_history(chat_id, only_changes=False)
@@ -111,6 +119,7 @@ async def notify_chat_switch(request: Request):
         handle_exception("Ошибка в POST /chat/notify_switch", e)
         raise
 
+
 @router.post("/chat/post")
 async def post_message(request: Request):
     log.debug("Запрос POST /chat/post, IP=%s, Cookies=~%s", request.client.host, str(request.cookies))
@@ -122,12 +131,14 @@ async def post_message(request: Request):
         if not chat_id or not message:
             log.info("Неверные параметры chat_id=%s или message для IP=%s", str(chat_id) if chat_id is not None else "None", request.client.host)
             raise HTTPException(status_code=400, detail="Missing chat_id or message")
-        result = g.post_manager.add_message(chat_id, user_id, message)
-        log.debug("Добавлено сообщение для chat_id=%d, user_id=%d: %s", chat_id, user_id, str(result))
-        return result
+        post = g.post_manager.add_post(chat_id, user_id, message, rql=0, reply_to=None)
+        log.debug("Добавлено сообщение для chat_id=%d, user_id=%d: %s, ожидание обработки", chat_id, user_id, str(post))
+        await asyncio.sleep(0.2)   # дать шанс /get
+        return await g.post_manager.process_post(post, True)
     except Exception as e:
         handle_exception("Ошибка в POST /chat/post", e)
         raise
+
 
 @router.post("/chat/edit_post")
 async def edit_post(request: Request):
@@ -146,6 +157,7 @@ async def edit_post(request: Request):
     except Exception as e:
         handle_exception("Ошибка в POST /chat/edit_post", e)
         raise
+
 
 @router.post("/chat/delete_post")
 async def delete_post(request: Request):

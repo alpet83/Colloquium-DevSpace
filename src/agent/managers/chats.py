@@ -1,10 +1,24 @@
 # /agent/managers/chats.py, updated 2025-07-20 15:45 EEST
 from .db import Database, DataTable
-from lib.basic_logger import BasicLogger
+from datetime import datetime
 import globals as g
 import asyncio
 
 log = g.get_logger("chatman")
+
+
+class ChatLocker:    # можно использовать с оператором with
+    def __init__(self, chat_id: int, user_name: str):
+        self.chat_id = chat_id
+        self.user_name = user_name
+
+    def __enter__(self):
+        g.chat_manager.set_chat_busy(self.chat_id, self.user_name)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        g.chat_manager.release_chat(self.chat_id, self.user_name)
+        if exc_value:
+            log.excpt("ChatLocker.__exit__", exc_info=(exc_type, exc_value, traceback))
 
 
 class ChatManager:
@@ -31,9 +45,13 @@ class ChatManager:
                 "FOREIGN KEY(project_id) REFERENCES projects(id)"
             ]
         )
+        self.chats_busy = {}  # [id] = dict[user_name]:start_from, где статус free или thinking:user_name
+        self.set_chat_busy(0, 'admin')
+        log.debug("chats_info = %s", str(self.chats_busy))
         self.switch_events = {}  # Хранилище событий переключения чата: {f"{user_id}:{chat_id}": asyncio.Event}
 
-    def active_chat(self, user) -> int:
+    @staticmethod
+    def active_chat(user) -> int:
         # Проверяем active_chat в sessions_table
         user_id = user
         if isinstance(user, str):
@@ -43,8 +61,39 @@ class ChatManager:
             conditions={'user_id': int(user_id)} )
         if not row:
             log.error("No session record for user_id %d", user_id)
-            return None
+            return 0
         return row[1] if row and row[1] is not None else None
+
+    def chat_status(self, chat_id: int) -> dict:
+        busy = self.chats_busy.get(chat_id, {})
+        now = datetime.utcnow().timestamp()
+        if not busy:
+            return {'status': 'free', 'actor': '', 'elapsed': 0}
+
+        oldest = now
+        for from_ts in busy.values():
+            oldest = min(oldest, from_ts)
+        result = {'status': 'busy', 'from_ts': oldest}
+        if result:
+            result['elapsed'] = int(now - oldest)
+            result['actor'] = ', '.join(busy.keys())  # TODO: better user actors
+        return result
+
+    def set_chat_busy(self, chat_id: int, user_name: str):
+        now = datetime.utcnow().timestamp()
+        busy = self.chats_busy.get(chat_id, {})
+        if busy.get(user_name):
+            log.debug("Повторный захват пользователем %s", user_name)
+        else:
+            busy[user_name] = now
+        self.chats_busy[chat_id] = busy
+        log.debug("Чат %d занят пользователями %s ", chat_id, str(busy.keys))
+
+    def release_chat(self, chat_id: int, user_name: str):
+        busy = self.chats_busy.get(chat_id, {})
+        if user_name in busy:
+            busy.pop(user_name)
+            log.debug("Чат %d разблокирован пользователем %s", chat_id, user_name)
 
     def sw_event(self, user_id: int, chat_id: int, action=None):
         """Управляет событием переключения чата и возвращает его состояние is_set."""

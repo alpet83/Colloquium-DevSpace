@@ -254,7 +254,7 @@ class CodePatchProcessor(BlockProcessor):
         log.warn("No suitable offset detected")
         return results[0]
 
-    def handle_block(self, attrs: dict, block_code: str) -> dict:
+    async def handle_block(self, attrs: dict, block_code: str) -> dict:
         """Обрабатывает блок <code_patch> для применения патча к файлу.
 
         Args:

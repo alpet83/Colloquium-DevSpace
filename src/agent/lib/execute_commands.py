@@ -4,6 +4,7 @@ import os
 import pwd
 import select
 import time
+import asyncio
 from lib.basic_logger import BasicLogger
 
 log = BasicLogger("execute_commands", "exec_commands")
@@ -51,12 +52,13 @@ class StdX:
         output = ls[-max_lines:] if len(ls) > max_lines else ls
         msg = EOL.join(output)
         if len(msg) > max_bytes:
-            msg[:max_bytes]
+            msg = msg[:max_bytes]
             msg += "\n... (output truncated due to size limit)";
         return f"<{tag}>{msg}</{tag}>"
 
-def execute(shell_command: str, user_inputs: list, user_name: str, cwd: str = '/app/projects',
-            timeout: int = 300) -> dict:
+
+async def execute(shell_command: str, user_inputs: list, user_name: str, cwd: str = '/app/projects',
+                  timeout: int = 300) -> dict:
     """Выполняет команду в указанном cwd от пользователя agent, возвращает ограниченный вывод в тегах."""
     if not shell_command:
         log.error("Пустая команда")
@@ -95,9 +97,10 @@ def execute(shell_command: str, user_inputs: list, user_name: str, cwd: str = '/
         reads = [_out.fd(), _err.fd()]
         start_time = time.time()
         active = True
-
+        _loops = 0
         # Обрабатываем вывод и интерактивный ввод
         while active and (time.time() - start_time) < timeout:
+            _loops += 1
             active = process.poll() is None
             fds = select.select(reads, [], [], 0.1)[0]
             line = _out.read(fds, 'stdout')
@@ -110,7 +113,9 @@ def execute(shell_command: str, user_inputs: list, user_name: str, cwd: str = '/
 
             err = _err.read(fds, 'stderr')
             active |= bool(line) or bool(err)
-            print(f"[{tss()}] #EXEC: process is running: {active}\r")
+            if 0 == _loops % 10:
+                print(f"[{tss()}] #EXEC: process is running: {active}\r")
+            await asyncio.sleep(0.1)
 
         # Записываем полный вывод в логи
         _out.store(STDOUT_LOG_FILE)

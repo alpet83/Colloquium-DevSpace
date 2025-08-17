@@ -1,4 +1,4 @@
-<!-- /frontend/rtm/src/components/RightPanel.vue, updated 2025-07-22 17:30 EEST -->
+<!-- /frontend/rtm/src/components/RightPanel.vue, updated 2025-07-27 10:30 EEST -->
 <template>
   <div class="right-panel" :class="{ collapsed: isCollapsed }">
     <button class="toggle-btn" @click="toggleCollapse">
@@ -106,16 +106,18 @@ export default defineComponent({
   },
   computed: {
     filteredFiles() {
-      log_msg('FILE', 'Computing filteredFiles, fileStore.files:', JSON.stringify(this.fileStore.files, null, 2), 'selectedProject:', this.selectedProject)
+      // log_msg('FILE', 'Computing filteredFiles, fileStore.files:', JSON.stringify(this.fileStore.files, null, 2), 'selectedProject:', this.selectedProject)
       if (!this.selectedProject) {
-        return this.fileStore.files.map(file => ({
-          ...file,
-          file_name: file.file_name.startsWith('/') ? file.file_name.slice(1) : file.file_name
-        }))
+        return this.fileStore.files
+          .filter(file => file.project_id > 0) // Исключаем файлы с project_id=0
+          .map(file => ({
+            ...file,
+            file_name: file.file_name.startsWith('/') ? file.file_name.slice(1) : file.file_name
+          }))
       }
       const projectId = parseInt(this.selectedProject)
       return this.fileStore.files
-        .filter(file => file.project_id === projectId)
+        .filter(file => file.project_id > 0 && file.project_id === projectId)
         .map(file => ({
           ...file,
           file_name: file.file_name.startsWith('/') ? file.file_name.slice(1) : file.file_name
@@ -126,6 +128,14 @@ export default defineComponent({
     this.fetchProjects()
     this.loadProjectFiles()
     this.loadSearchSettings()
+    this.mitt.on('files-updated', () => {
+      clearTimeout(this.debounceLoadFiles)
+      this.debounceLoadFiles = setTimeout(() => this.loadProjectFiles(), 100)
+    })
+  },
+  beforeUnmount() {
+    this.mitt.off('files-updated')
+    clearTimeout(this.debounceLoadFiles)
   },
   methods: {
     async fetchProjects() {
@@ -136,7 +146,8 @@ export default defineComponent({
           credentials: 'include'
         })
         if (res.ok) {
-          this.projects = await res.json()
+          this.projects = (await res.json()).filter(project => project.id > 0) // Исключаем project_id=0 (.chat-meta)
+          if (this.selectedProject === '0') this.selectedProject = '' // Сбрасываем выбор .chat-meta
           log_msg('FILE', 'Fetched projects:', JSON.stringify(this.projects, null, 2))
         } else {
           log_error(this, new Error('Failed to fetch projects'), 'fetch projects')
@@ -147,20 +158,9 @@ export default defineComponent({
     },
     async loadProjectFiles() {
       try {
-        const url = this.selectedProject
-          ? `${this.fileStore.apiUrl}/chat/list_files?project_id=${this.selectedProject}`
-          : `${this.fileStore.apiUrl}/chat/list_files`
-        log_msg('FILE', 'Loading files from:', url)
-        const res = await fetch(url, {
-          method: 'GET',
-          credentials: 'include'
-        })
-        if (res.ok) {
-          this.fileStore.files = await res.json()
-          log_msg('FILE', 'Loaded files:', JSON.stringify(this.fileStore.files, null, 2))
-        } else {
-          log_error(this, new Error('Failed to load files'), 'load files')
-        }
+        const project_id = this.selectedProject ? parseInt(this.selectedProject) : null
+        log_msg('FILE', 'Loading files for project_id:', project_id)
+        await this.fileStore.fetchFiles(project_id)
       } catch (e) {
         log_error(this, e, 'load files')
       }
@@ -169,6 +169,7 @@ export default defineComponent({
       try {
         const project_id = this.selectedProject ? parseInt(this.selectedProject) : null
         log_msg('ACTION', 'Selecting project:', this.fileStore.apiUrl + '/project/select', 'ProjectId:', project_id)
+        this.fileStore.setSelectedProject(project_id)
         await fetch(this.fileStore.apiUrl + '/project/select', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -243,6 +244,7 @@ export default defineComponent({
         if (res.ok) {
           const data = await res.json()
           this.selectedProject = data.project_id
+          this.fileStore.setSelectedProject(data.project_id)
           await this.fetchProjects()
           await this.loadProjectFiles()
           this.closeCreateProjectModal()

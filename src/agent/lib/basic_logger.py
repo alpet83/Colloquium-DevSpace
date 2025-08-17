@@ -258,9 +258,9 @@ class BasicLogger:
         self.log_msg(f"~C91#ERROR:~C00 {fmt}", *args, echo=logging.error)
 
     def excpt(self, fmt, *args, e=None, exc_info=None):
-        if isinstance(e, Exception):
+        if isinstance(e, Exception) and exc_info is None:
             exc_info = (type(e), e, e.__traceback__)
-        else:
+        elif exc_info is None and e is None:
             self.error("expt: не указан параметр объекта исключения: %s", str(e))
         backtrace = "".join(traceback.format_exception(*exc_info)) if exc_info else self._format_backtrace()
         self.log_msg(f"~C91#EXCEPTION:~C00 {fmt}", *args, echo=logging.error)

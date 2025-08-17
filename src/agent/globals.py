@@ -3,11 +3,17 @@ from lib.basic_logger import BasicLogger
 from fastapi import Request, HTTPException
 
 user_manager = None
+""" user_manager (UserManager) - control users/actors"""
 chat_manager = None
+""" chat_manager (ChatManager) - control chats: adding, deleting, list"""
 post_manager = None
+""" post_manager (PostManager) - control posts: adding, editing, deleting, get_history"""
 file_manager = None
+""" file_manager (FileManager) - control file attaches, common operations"""
 project_manager = None
+""" project_manager (ProjectManager) - control projects: adding, loading, updating"""
 replication_manager = None
+""" replication_manager (ReplicationManager) - control replication: interaction with LLMs"""
 post_processor = None
 
 ADMIN_UID = 1

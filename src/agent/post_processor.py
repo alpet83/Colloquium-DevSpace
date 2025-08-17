@@ -1,13 +1,26 @@
 # /agent/managers/post_processor.py, updated 2025-07-27 09:44 EEST
 import re
-import datetime
-import globals
+from datetime import datetime
+import globals as g
+from managers.chats import ChatLocker
 from managers.db import DataTable
-from managers.posts import PostManager
 from llm_hands import process_message
-from lib.basic_logger import BasicLogger
 
-log = globals.get_logger("postproc")
+log = g.get_logger("postproc")
+
+
+async def _hands_work(chat_id, user_id: int, response: str):
+    # Проверяем команды для llm_hands
+    user_name = g.user_manager.get_user_name(user_id)
+    with ChatLocker(chat_id, 'agent'):
+        hands_response = await process_message(response, int(datetime.utcnow().timestamp()), user_name)
+        if hands_response and (hands_response["handled_cmds"] > 0 or hands_response["failed_cmds"] > 0):
+            log.debug("llm_hands response: handled_cmds=%d, failed_cmds=%d, processed_msg=%s, agent_reply=%s",
+                      hands_response["handled_cmds"], hands_response["failed_cmds"],
+                      hands_response["processed_msg"][:50],
+                      hands_response["agent_reply"][:50] if hands_response["agent_reply"] else None)
+            return hands_response
+        return None
 
 class PostProcessor:
     def __init__(self):
@@ -25,14 +38,14 @@ class PostProcessor:
         )
         log.debug("Инициализирован PostProcessor с таблицей quotes")
 
-    def process_response(self, chat_id: int, user_id: int, response: str, post_id: int = None) -> dict:
+    async def process_response(self, chat_id: int, user_id: int, response: str, post_id: int = None) -> dict:
         """Обрабатывает ответ LLM, извлекая цитаты, команды редактирования, файлы и патчи, вызывая llm_hands."""
         log.debug("Обработка ответа для chat_id=%d, user_id=%d, post_id=%s, response_type=%s, response=%s",
                   chat_id, user_id, str(post_id) if post_id is not None else "None", type(response), response[:50])
 
         # Декодируем response, если он байтовый
         if isinstance(response, bytes):
-            response = globals.unitext(response)
+            response = g.unitext(response)
             log.warn("Response был байтовым, декодирован в строку: %s", response[:50])
         elif not isinstance(response, str):
             log.error("Неверный тип ответа: %s", type(response))
@@ -50,49 +63,40 @@ class PostProcessor:
         else:
             # Для ответов моделей/агентов (user_id >= 2) используем последний пост
             if user_id >= 2:
-                last_post = globals.post_manager.db.fetch_one(
+                last_post = g.post_manager.db.fetch_one(
                     'SELECT id FROM posts WHERE chat_id = :chat_id ORDER BY id DESC LIMIT 1',
                     {'chat_id': chat_id}
                 )
                 reply_to = last_post[0] if last_post else None
                 log.debug("Установлен reply_to=%s на основе последнего поста для user_id=%d", str(reply_to), user_id)
 
-        # Проверяем команды для llm_hands
-        user_name = globals.user_manager.get_user_name(user_id)
-        hands_response = process_message(response, int(datetime.datetime.now(datetime.UTC).timestamp()), user_name)
-        if hands_response and (hands_response["handled_cmds"] > 0 or hands_response["failed_cmds"] > 0):
-            log.debug("llm_hands response: handled_cmds=%d, failed_cmds=%d, processed_msg=%s, agent_reply=%s",
-                      hands_response["handled_cmds"], hands_response["failed_cmds"],
-                      hands_response["processed_msg"][:50],
-                      hands_response["agent_reply"][:50] if hands_response["agent_reply"] else None)
-            return hands_response
-
         # Извлечение и сохранение цитат
-        def save_quote(match):
-            quote_content = match.group(1)
+        def save_quote(_match):
+            quote_content = _match.group(1)
             quote_id = self._save_quote(chat_id, user_id, quote_content)
             log.debug("Сохранена цитата quote_id=%d для chat_id=%d: %s", quote_id, chat_id, quote_content[:50])
             return "@quote#%d" % quote_id
 
-        processed_response = re.sub(r'<quote>(.*?)</quote>', save_quote, response, flags=re.DOTALL)
+        agent_reply = []
 
         # Обработка <edit_post id="X">
-        def handle_edit_post(match):
-            post_id = int(match.group(1))
-            new_content = match.group(2)
-            result = globals.post_manager.edit_post(post_id, new_content, user_id)
-            if result.get("error"):
-                log.warn("Не удалось отредактировать post_id=%d для user_id=%d: %s", post_id, user_id, result['error'])
+        def handle_edit_post(_match):
+            _id = int(_match.group(1))
+            new_content = _match.group(2)
+            res = g.post_manager.edit_post(_id, new_content, user_id)
+            if res.get("error"):
+                log.warn("Не удалось отредактировать post_id=%d для user_id=%d: %s", _id, user_id, result['error'])
                 return {"handled_cmds": 0, "failed_cmds": 1, "processed_msg": processed_response,
-                        "agent_reply": f"Error: {result['error']} ❌"}
-            log.debug("Отредактирован post_id=%d с новым содержимым=%s", post_id, new_content[:50])
+                        "agent_reply": f"Error: {res['error']} ❌"}
+            log.debug("Отредактирован post_id=%d с новым содержимым=%s", _id, new_content[:50])
             return {"handled_cmds": 1, "failed_cmds": 0,
-                    "processed_msg": processed_response.replace(match.group(0), f"Edited post_id={post_id} ✅"),
-                    "agent_reply": f"Edited post_id={post_id} ✅"}
+                    "processed_msg": processed_response.replace(_match.group(0), f"Edited post_id={_id} ✅"),
+                    "agent_reply": f"Edited post_id={_id} ✅"}
 
+        processed_response = response
         matches = list(re.finditer(r'<edit_post id="(\d+)">([\s\S]*?)</edit_post>', processed_response,
                                    flags=re.DOTALL))
-        agent_reply = []
+
         handled_cmds = 0
         failed_cmds = 0
         for match in matches:
@@ -104,22 +108,31 @@ class PostProcessor:
             failed_cmds += result["failed_cmds"]
 
         # Замена @quote#id
-        def replace_quote_ref(match):
-            quote_id = int(match.group(1))
+        def replace_quote_ref(_match):
+            quote_id = int(_match.group(1))
             quote = self.quotes_table.select_from(
                 conditions={'quote_id': quote_id, 'chat_id': chat_id},
                 limit=1
             )
-            if quote:
-                return "@quote#%d" % quote_id
-            return match.group(0)
+            return "@quote#%d" % quote_id if quote else "@wrong_quote#%d" % quote_id
 
+        processed_response = re.sub(r'<quote>(.*?)</quote>', save_quote, response, flags=re.DOTALL)
         processed_response = re.sub(r'@quote#(\d+)', replace_quote_ref, processed_response)
-        agent_reply_text = "\n".join(agent_reply) if agent_reply else None
+
+        hr = await _hands_work(chat_id, user_id, response)
+        if isinstance(hr, dict):
+            log.debug("Hands returns fields %s", str(hr.keys()))
+            processed_response = hr.get('processed_msg') or processed_response
+            agent_reply.append(hr.get('agent_reply', ''))
+            handled_cmds += hr.get('handled_cmds', 0)
+            failed_cmds += hr.get('failed_cmds', 0)
+
+        agent_reply_text = "\n".join(agent_reply) if agent_reply else ''
         log.debug(
             "Обработанный ответ для chat_id=%d: handled_cmds=%d, failed_cmds=%d, processed_msg=%s, agent_reply=%s",
             chat_id, handled_cmds, failed_cmds, processed_response[:50],
-            agent_reply_text[:50] if agent_reply_text else None)
+            agent_reply_text[:50])
+
         return {"handled_cmds": handled_cmds, "failed_cmds": failed_cmds, "processed_msg": processed_response,
                 "agent_reply": agent_reply_text}
 
@@ -130,7 +143,7 @@ class PostProcessor:
                 'chat_id': chat_id,
                 'user_id': user_id,
                 'content': content,
-                'timestamp': int(datetime.datetime.now(datetime.UTC).timestamp())
+                'timestamp': int(datetime.utcnow().timestamp())
             }
             quote_id = self.quotes_table.insert_into(values)
             return quote_id

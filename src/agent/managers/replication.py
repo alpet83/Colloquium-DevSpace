@@ -5,7 +5,7 @@ import datetime
 import time
 from pathlib import Path
 from llm_interactor import LLMInteractor, ContextInput
-from managers.db import Database, DataTable
+from managers.chats import ChatLocker
 from chat_actor import ChatActor
 import globals as g
 
@@ -25,9 +25,6 @@ class ReplicationManager(LLMInteractor):
         self.failed_tasks = 0
         self.actors = self._load_actors()
         self.active_replications = set()
-        self.processing_state = "free"
-        self.processing_actor = None
-        self.processing_start = None
         if debug_mode:
             log.debug("Режим отладки репликации включён")
         else:
@@ -60,11 +57,8 @@ class ReplicationManager(LLMInteractor):
             log.debug("Задача %s завершена: %s", task.get_name(), str(result))
         except Exception as e:
             log.excpt("Task caused exception ", e=e)
-            g.post_manager.agent_message(task.chat_id, f"Async task caused exception {e}", task.rql + 1, task.post_id)
+            g.post_manager.agent_post(task.chat_id, f"Async task caused exception {e}", task.rql + 1, task.post_id)
             self.failed_tasks += 1
-            self.processing_state = "free"
-            self.processing_actor = None
-            self.processing_start = None
 
     def check_start_replication(self, chat_id: int, post_id: int,
                                 user_id: int, message: str, rql: int = 0) -> bool:
@@ -107,7 +101,7 @@ class ReplicationManager(LLMInteractor):
         except Exception as e:
             log.excpt("Ошибка запуска репликации для post_id=%d, chat_id=%d: %s", post_id, chat_id, e=e)
             user_name = g.user_manager.get_user_name(user_id) or 'unknown'
-            error_result = g.post_manager.save_message(
+            error_result = g.post_manager.add_post(
                 chat_id, 2, f"@{user_name} Replication check error: {str(e)}", 0, post_id
             )
             if error_result.get("error"):
@@ -125,21 +119,23 @@ class ReplicationManager(LLMInteractor):
             max_rql (int, optional): Максимальный уровень рекурсии. Defaults to 5.
         """
         actor = ci.actor
+        post_man = g.post_manager
 
         if rql > max_rql:
             log.info("Достигнут предел рекурсивного диалога %d для actor_id=%d, chat_id=%d",
                      max_rql, actor.user_id, ci.chat_id)
             return
 
-        self.processing_state = "busy"
-        self.processing_actor = actor.user_name
-        self.processing_start = int(datetime.datetime.now(datetime.UTC).timestamp())
-        log.debug("Начался рекурсивный диалог для actor_id=%d (%s), chat_id=%d, rql=%d",
+        msg = "Начался рекурсивный диалог для " if rql <= 1 else "Продолжение рекурсивного диалога для "
+        log.debug(msg + "actor_id=%d (%s), chat_id=%d, rql=%d",
                   actor.user_id, actor.user_name, ci.chat_id, rql)
+
         t_start = time.time()
+
         try:
             ci.debug_mode = self.debug_mode
-            original_response = await self.interact(ci, rql=rql)
+            with ChatLocker(ci.chat_id, actor.user_name):
+                original_response = await self.interact(ci, rql=rql)
             elapsed = time.time() - t_start
             if original_response:
                 log.debug("Ответ получен после %.1f секунд, проверка возможности обработки агентом...", elapsed)
@@ -180,51 +176,34 @@ class ReplicationManager(LLMInteractor):
                     log.debug("Установлен reply_to=%s на основе последнего поста", str(reply_to))
 
                 # Сохраняем ответ модели через add_message
-                response_result = g.post_manager.add_message(
-                    ci.chat_id, actor.user_id, prefix + agent_command, rql, reply_to
+                post = post_man.add_post(
+                    ci.chat_id, actor.user_id, prefix + agent_command, rql, reply_to, elapsed
                 )
-                if response_result.get("error"):
+                if not post.get("status"):
                     log.warn("Не удалось сохранить ответ модели для actor_id=%d, chat_id=%d: %s",
+                             actor.user_id, ci.chat_id, str(post))
+                    return
+                response_result = await post_man.process_post(post, False)
+                if response_result.get("error"):
+                    log.warn("Не удалось обработать ответ модели для actor_id=%d, chat_id=%d: %s",
                              actor.user_id, ci.chat_id, response_result["error"])
                     return
-
                 processed_msg = response_result.get("processed_msg", "")
-                agent_reply = response_result.get("agent_reply")
-                query_filter = ""
-                if agent_reply:
-                    query_filter = "AND user_id = 2"
-                    log.debug("Добавлен ответ агента для chat_id=%d: %s", ci.chat_id, agent_reply[:50])
                 if processed_msg and rql < max_rql:
-                    latest_post = self.db.fetch_one(
-                        f"SELECT user_id, message FROM posts\n WHERE chat_id = :chat_id {query_filter}\n ORDER BY id DESC LIMIT 1",
-                        {'chat_id': ci.chat_id}
-                    )
-                    latest_post = latest_post[1].strip().lower() if latest_post else ""
-
-                    for next_actor in self.actors:
-                        ref = f"@{next_actor.user_name} "
-                        if next_actor.user_id == actor.user_id and not agent_reply:  # preventing self triggering
-                            continue
-
-                        if ('@all ' in latest_post) or (ref in latest_post) and (next_actor.user_id > 2) and next_actor.llm_connection:
-                            # Выбрать всех доступных других LLM-актёров
-                            new_blocks = self.collect_blocks(ci.chat_id, ci.exclude_id)
-                            log.debug("Продолжение рекурсивного диалога между %s и %s для rql=%d",
-                                      actor.user_name, next_actor.user_name, rql + 1)
-                            next_ci = ContextInput(new_blocks, ci.users, ci.chat_id, actor, ci.exclude_id)
-                            await self._recursive_replicate(next_ci, rql + 1, max_rql)
+                    await self._broadcast(ci.users, ci.chat_id, ci.exclude_id, rql=rql + 1, post_id=post['post_id'])
+                agent_reply = response_result.get("agent_reply")
+                if agent_reply:
+                    log.debug("Добавлен ответ агента для chat_id=%d: %s, проверка на репликацию", ci.chat_id, agent_reply[:50])
+                    agent_post = g.post_manager.latest_post({'chat_id': ci.chat_id, 'user_id': g.AGENT_UID})
+                    await self._broadcast(ci.users, ci.chat_id, ci.exclude_id, rql=rql + 1, post_id=agent_post['post_id'])
             else:
                 log.warn("Ответ от LLM не получен для user_id=%d, rql=%d: %s", actor.user_id, rql, str(original_response))
-                g.post_manager.agent_message(
+                g.post_manager.agent_post(
                     ci.chat_id, f"Нет ответа от LLM для {actor.user_name}, время запроса {elapsed} сек.", rql, None
                 )
         except Exception as e:
             log.excpt("Error in _recursive_replicate", e=e)
             raise e
-        finally:
-            self.processing_state = "free"
-            self.processing_actor = None
-            self.processing_start = None
 
     def collect_blocks(self, chat_id: int, exclude_id: int = None):
         file_ids = set()
@@ -234,82 +213,95 @@ class ReplicationManager(LLMInteractor):
         content_blocks.extend(self.assemble_spans())
         return content_blocks
 
-    async def _pack_and_send(self, users: list, chat_id: int, exclude_source_id: int = None):
+    async def _broadcast(self, users: list, chat_id: int, exclude_id: int = None, rql: int = 0, post_id: int = -1):
         """Отправляет контент всем LLM-актёрам при @all и RQL <= 1, иначе по триггерам.
 
         Args:
             users (list): Список пользователей.
             chat_id (int): ID чата.
-            exclude_source_id (int, optional): ID пользователя для исключения.
+            exclude_id (int, optional): ID пользователя для исключения.
+            rql (int, optional: Уровень рекурсии репликации (0 для начала, от инициатора)
+            post_id (int, optional): ID поста, в котором смотреть получателей репликации
         """
-        log.debug("Запуск _pack_and_send для chat_id=%d", chat_id)
 
-        latest_post = self.db.fetch_one(
-            'SELECT user_id, message, id, rql FROM posts WHERE chat_id = :chat_id ORDER BY id DESC LIMIT 1',
-            {'chat_id': chat_id}
-        )
-        if latest_post and latest_post[0] == 2 and "Permission denied" in latest_post[1]:
-            if not (re.search(r'@grok\S*|@all', latest_post[1], re.IGNORECASE)):
-                log.debug("Пропуск диалога для chat_id=%d из-за ошибки агента без @grok или @all: %s",
-                          chat_id, latest_post[1][:50])
-                return
+        cond = {'chat_id': chat_id}
+        if post_id >= 0:
+            cond['id'] = post_id
+
+        latest_post = g.post_manager.latest_post(cond)
+        if not latest_post:
+            log.warn("PostManager returned %s as latest_post", str(latest_post))
+            return
+        post_id = latest_post['id']
+        user_id = latest_post['user_id']
+        message = latest_post['message']
+        if not message or len(message) < 5:
+            log.warn("Длина сообщения поста слишком мала")
+            return
+
+        user_name = g.user_manager.get_user_name(user_id) if user_id else "Unknown"
+        refs = re.findall(r"@(\w+)\s", message, re.M)
+        if not refs:
+            log.debug("В посте нет ссылок на пользователей - выход")
+            return
+
+        log.debug("Проверка _broadcast для поста chat_id=%d, post_id=%d by user=%d:%s, refs: %s",
+                  chat_id, post_id, user_id, user_name, str(refs))
 
         llm_actors = [actor for actor in self.actors if actor.llm_connection and actor.user_id > 1]
-        log.debug("Найдено %d LLM-актёров (user_id > 1): ~C95%s~C00", len(llm_actors),
-                  str([actor.user_id for actor in llm_actors]))
+        llm_ids = [actor.user_id for actor in llm_actors]
+
+        log.debug("Найдено %d LLM-актёров (user_id > 1): %s", len(llm_actors),str(llm_ids))
         processed_actors = set()
 
         # Проверяем триггер @all перед циклом
         is_broadcast = False
-        rql = 0
-        triggered_by = None
-        if latest_post:
-            message = latest_post[1].lower()
-            rql = latest_post[3] if latest_post[3] is not None else 0
-            triggered_by = latest_post[2]
-            if '@all' in message and rql <= 1:
-                is_broadcast = True
-                log.debug("Обнаружен триггер @all для широковещательной репликации: chat_id=%d, rql=%d", chat_id, rql)
+
+        if ('all' in refs) and (user_id not in llm_ids):
+            is_broadcast = True
+            log.debug("BROADCAST!: Обнаружен триггер @all для широковещательной репликации: chat_id=%d, rql=%d от %s, refs: %s", chat_id, rql, user_name, str(refs))
 
         content_blocks = []
+        # =================  Цикл по потенциальным получателям нового контекста ========================
+        coro_list = []
         for actor in llm_actors:
             if actor.user_id in processed_actors:
                 log.debug("Пропуск дубликата actor_id=%d", actor.user_id)
                 continue
-            if exclude_source_id and actor.user_id == exclude_source_id:
-                log.debug("Пропуск actor_id=%d из-за exclude_source_id", actor.user_id)
+            if exclude_id and actor.user_id == exclude_id:
+                log.debug("Пропуск actor_id=%d из-за exclude_id", actor.user_id)
                 continue
-            if latest_post and latest_post[0] == actor.user_id:
-                log.debug("Пропуск диалога для actor_id=%d: последнее сообщение от этого актёра", actor.user_id)
+            if user_id == actor.user_id:
+                log.debug("Пропуск диалога для автора поста %d:%s", actor.user_id, actor.user_name)
                 continue
-            should_respond = False
-            user_name = g.user_manager.get_user_name(actor.user_id)
+            trigger = 0
             if is_broadcast:
-                should_respond = True
-                log.debug("Широковещательная репликация для actor_id=%d, chat_id=%d, rql=%d", actor.user_id, chat_id,
-                          rql)
-            elif latest_post:
-                message = latest_post[1]
-                if re.search(rf"@{user_name}\s+", message):
-                    should_respond = True
-                    log.debug("Триггер ответа для actor_id=%d: message=%s", actor.user_id, message[:50])
-            if should_respond:
-                log.debug("Начался диалог между %s и %s для chat_id=%d",
-                          g.user_manager.get_user_name(latest_post[0]) if latest_post else "Unknown",
-                          actor.user_name, chat_id)
-                content_blocks = self.collect_blocks(chat_id, exclude_source_id)
-                ci = ContextInput(content_blocks, users, chat_id, actor, exclude_source_id)
-                await self._recursive_replicate(ci, rql + 1)
+                trigger = 1
+            elif actor.user_name in refs:
+                trigger = 2
+                log.debug("Триггер ответа для LLM %d:%s message=%s ", actor.user_id, actor.user_name, message[:50])
+
+            if trigger > 0:
+                action = "Начат" if rql == 0 else "Продолжен"
+                log.debug(f"{action} диалог между %s и %s для chat_id=%d, trigger = %d", user_name, actor.user_name, chat_id, trigger)
+                content_blocks = self.collect_blocks(chat_id, exclude_id)
+                ci = ContextInput(content_blocks, users, chat_id, actor, exclude_id)
+                coro = self._recursive_replicate(ci, rql + 1)
+                coro_list.append(coro)
                 processed_actors.add(actor.user_id)
             else:
-                log.debug("Пропуск actor_id=%d: нет триггера для ответа", actor.user_id)
+                log.debug("Пропуск actor_id=%d: нет триггера для репликации", actor.user_id)
+
+        if coro_list:
+            log.debug(" Параллельный запуск %d репликаций ", len(coro_list))
+            await asyncio.gather(*coro_list)
 
         max_post_id = max([block.post_id for block in content_blocks if block.post_id is not None] or [0])
         if max_post_id:
             for actor in llm_actors:
                 if actor.user_id in processed_actors:
                     continue
-                if exclude_source_id and actor.user_id == exclude_source_id:
+                if exclude_id and actor.user_id == exclude_id:
                     continue
                 if latest_post and latest_post[0] == actor.user_id:
                     continue
@@ -355,7 +347,7 @@ class ReplicationManager(LLMInteractor):
                         'admin' if username == 'admin' else 'mcp' if username == 'agent' else 'developer')
                 users.append({"user_id": actor.user_id, "username": username, "role": role})
 
-            await self._pack_and_send(users, chat_id, exclude_source_id)
+            await self._broadcast(users, chat_id, exclude_source_id)
             log.debug("Диалог завершён для chat_id=%d, exclude_source_id=%s", chat_id, str(exclude_source_id))
         finally:
             self.active_replications.remove(replication_key)
@@ -393,18 +385,3 @@ class ReplicationManager(LLMInteractor):
                 log.excpt("Catched in fake_interact", e=e)
         log.error("Not avail LLM actors")
         return False
-
-    def get_processing_status(self) -> dict:
-        """Возвращает статус обработки и время выполнения.
-
-        Returns:
-            dict: {'status': str, 'actor': str | None, 'elapsed': int | None}
-        """
-        if self.processing_state == "busy" and self.processing_start:
-            elapsed = int(datetime.datetime.now(datetime.UTC).timestamp()) - self.processing_start
-            return {
-                "status": "busy",
-                "actor": self.processing_actor,
-                "elapsed": elapsed
-            }
-        return {"status": "free"}

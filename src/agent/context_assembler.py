@@ -13,12 +13,22 @@ from pathlib import Path
 log = g.get_logger("context_assembler")
 
 
+
+
+def filter_input(message: str) -> str:
+    filtered = re.sub(r'<traceback>[\s\S]*?</traceback>', '', message)
+    if filtered != message:
+        log.debug("Удалены теги <traceback> из сообщения: %s", message[:50])
+    return filtered
+
+
 class ContextAssembler:
     def __init__(self):
         self.db = Database.get_database()
         self._init_tables()
         self.fresh_files = set()
         self.fresh_spans = set()
+        self.t = 0
         res = SandwichPack.load_block_classes()
         log.debug("Загружены парсеры сэндвич-блоков: %s", str(res))
 
@@ -51,54 +61,10 @@ class ContextAssembler:
             ]
         )
 
-    def filter_input(self, message: str) -> str:
-        filtered = re.sub(r'<traceback>[\s\S]*?</traceback>', '', message)
-        if filtered != message:
-            log.debug("Удалены теги <traceback> из сообщения: %s", message[:50])
-        return filtered
-
-    def assemble_posts(self, chat_id: int, exclude_source_id: int, attached_files: set, file_map: dict) -> list:
-        content_blocks = []
-        log.debug("Сборка постов для chat_id=%d", chat_id)
-        history = g.post_manager.scan_history(chat_id)
-        log.debug("Получено %d постов для chat_id=%d", len(history), chat_id)
-        count = 0
-        self.fresh_files = set()
-        self.fresh_spans = set()
-        fresh_window = time.time() - 600
-        base_rel = 10
-        for post in reversed(history.values()):  # история нужна реверсированной, для эффективной обработки LLM
-            file_ids = set()
-            post_t = post['timestamp']  # expected float/int from DB
-            dt = datetime.fromtimestamp(post_t, timezone.utc)
-            message = self.filter_input(post["message"]) if post["message"] else ""
-            message = message.replace('@attach#', '@attached_file#')
-            message = re.sub(g.ATTACHES_REGEX, lambda m: self._resolve_file_id(m, file_ids, file_map), message, re.M)
-            relevance = post.get('relevance', 50) + base_rel
-            relevance = min(100, relevance)
-            relevance = max(0, relevance)
-            attached_files.update(file_ids)
-            if post_t >= fresh_window or count < 20:
-                self.fresh_files.update(file_ids)
-                # Extract @span#hash from message
-                spans = re.findall(r'@span#(\w+)', message)
-                self.fresh_spans.update(spans)
-            count += 1
-
-            content_blocks.append(ContentBlock(
-                content_text=message,
-                content_type=":post",
-                file_name=None,
-                timestamp=dt.strftime(g.SQL_TIMESTAMP + "Z"),
-                post_id=post["id"],
-                user_id=post["user_id"],
-                relevance=math.floor(relevance)
-            ))
-        return content_blocks
-
     def assemble_files(self, attached_files: set, file_map: dict) -> list:
         content_blocks = []
-        log.debug("Сборка файлов для attached_files=~%s", str(attached_files))
+        self.t += 1  # чтобы не доставал редактор, типа нужно статик
+        log.debug("Сборка файлов для attached_files=%s", str(attached_files))
         unique_files = {}
         for file_id in sorted(attached_files):
             file_data = g.file_manager.get_file(file_id)
@@ -142,6 +108,59 @@ class ContextAssembler:
                     continue
             else:
                 log.warn("Файл file_id=%d не найден в attached_files", file_id)
+        return content_blocks
+
+    def assemble_posts(self, chat_id: int, exclude_source_id: int, attached_files: set, file_map: dict) -> list:
+        content_blocks = []
+        log.debug("Сборка постов для chat_id=%d", chat_id)
+        history = g.post_manager.scan_history(chat_id)
+        log.debug("Получено %d постов для chat_id=%d", len(history), chat_id)
+        count = 0
+        self.fresh_files = set()
+        self.fresh_spans = set()
+        fresh_window = time.time() - 600
+        base_rel = 10
+        ref_relevance = {}
+
+        for post in reversed(history.values()):  # история нужна реверсированной, для эффективной обработки LLM
+            file_ids = set()
+            post_id = post["id"]
+            post_t = post['timestamp']  # expected float/int from DB
+            dt = datetime.fromtimestamp(post_t, timezone.utc)
+            message = filter_input(post["message"]) if post["message"] else ""
+            message = message.replace('@attach#', '@attached_file#')
+            message = re.sub(g.ATTACHES_REGEX, lambda m: self._resolve_file_id(m, file_ids, file_map), message, re.M)
+            post_refs = re.findall(r'@post#(\d+)', message)   # если данный пост ссылается на ранние посты, будет список id
+            pinned = ("#post_pinned" in message) or ("#pinned_post" in message)
+            rel_offset = 20 if pinned else (base_rel - count)
+            relevance = post.get('relevance', 50) + rel_offset
+            relevance += ref_relevance.get(post_id, 0)
+
+            relevance = min(100, relevance)
+            relevance = max(0, relevance)
+            attached_files.update(file_ids)
+            if post_t >= fresh_window or count < 20:
+                self.fresh_files.update(file_ids)
+                # Extract @span#hash from message
+                spans = re.findall(r'@span#(\w+)', message)
+                self.fresh_spans.update(spans)
+            if 0 == relevance:  # пост достаточно устарел, чтобы не показывать его в контексте LLM
+                continue
+            for ref_id in post_refs:
+                ref_relevance[ref_id] = ref_relevance.get(ref_id, 0) + relevance * 0.1  # добавление релевантности более старым постам
+
+            count += 1
+
+            content_blocks.append(ContentBlock(
+                content_text=message,
+                content_type=":post",
+                file_name=None,
+                timestamp=dt.strftime(g.SQL_TIMESTAMP + "Z"),
+                post_id=post_id,
+                user_id=post["user_id"],
+                relevance=math.floor(relevance)
+            ))
+        log.debug(" Относительная релевантность постов %s после сборки ", str(ref_relevance))
         return content_blocks
 
     def assemble_spans(self) -> list:

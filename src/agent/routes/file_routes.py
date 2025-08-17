@@ -1,6 +1,7 @@
 # /agent/routes/file_routes.py, updated 2025-07-26 19:00 EEST
-from fastapi import APIRouter, Request, UploadFile, File, Form, HTTPException, Query
-import time
+from fastapi import APIRouter, Request, Response, UploadFile, File, Form, HTTPException, Query
+from fastapi.responses import PlainTextResponse, JSONResponse
+import time, json
 from managers.db import Database
 import globals
 from lib.basic_logger import BasicLogger
@@ -43,6 +44,7 @@ async def update_file(request: Request, file: UploadFile = File(...), file_id: i
         globals.handle_exception("Ошибка в POST /chat/update_file", e)
         raise
 
+
 @router.post("/chat/move_file")
 async def move_file(request: Request):
     log.debug("Запрос POST /chat/move_file, IP=%s, Cookies=~%s", request.client.host, str(request.cookies))
@@ -65,6 +67,7 @@ async def move_file(request: Request):
         globals.handle_exception("Ошибка в POST /chat/move_file", e)
         raise
 
+
 @router.post("/chat/delete_file")
 async def delete_file(request: Request):
     log.debug("Запрос POST /chat/delete_file, IP=%s, Cookies=~%s", request.client.host, str(request.cookies))
@@ -82,19 +85,19 @@ async def delete_file(request: Request):
         globals.handle_exception("Ошибка в POST /chat/delete_file", e)
         raise
 
+
 @router.get("/chat/list_files")
 async def list_files(request: Request, project_id: int = Query(None)):
-    log.debug("Запрос GET /chat/list_files, IP=%s, Cookies=~%s, project_id=%s", request.client.host, str(request.cookies), str(project_id))
     try:
         user_id = globals.check_session(request)
         # Интерпретируем project_id <= 0 как запрос всех файлов
         effective_project_id = None if project_id is None or project_id <= 0 else project_id
         files = globals.file_manager.list_files(user_id, effective_project_id)
-        log.debug("Возвращено %d файлов для user_id=%d, project_id=%s", len(files), user_id, str(project_id))
         return files
     except Exception as e:
         globals.handle_exception("Ошибка в GET /chat/list_files", e)
         raise
+
 
 @router.get("/chat/file_contents")
 async def get_file_contents(request: Request, file_id: int = Query(...)):
@@ -105,8 +108,15 @@ async def get_file_contents(request: Request, file_id: int = Query(...)):
         if not file_data or file_data['content'] is None:
             log.warn("Файл file_id=%d не найден или не содержит данных", file_id)
             raise HTTPException(status_code=404, detail="File not found or no content")
-        log.debug("Возвращено содержимое файла file_id=%d для user_id=%d, content_length=%d", file_id, user_id, len(file_data['content']))
-        return {"content": file_data['content']}
+
+        file_name = str(file_data['file_name'])
+        content = file_data.get('content', '')
+        if file_name.lower().endswith('.json'):
+            log.debug("Возвращен парсинг JSON file_id=%d для user_id=%d, content_length=%d", file_id, user_id, len(file_data['content']))
+            return Response(json.loads(content), media_type="application/json")  # {"content": json.loads(content)}
+        else:
+            log.debug("Возвращено содержимое файла file_id=%d для user_id=%d, content_length=%d", file_id, user_id, len(file_data['content']))
+            return PlainTextResponse(content)   # поскольку это API, приходится изворачиваться
     except Exception as e:
         globals.handle_exception("Ошибка в GET /chat/file_contents", e)
         raise

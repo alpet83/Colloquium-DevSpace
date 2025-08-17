@@ -1,4 +1,4 @@
-/* /frontend/rtm/src/styles/chat.css, updated 2025-07-25 19:34 EEST */
+/* /frontend/rtm/src/styles/chat.css, updated 2025-07-27 11:45 EEST */
 .chat-container {
   flex-grow: 1;
   display: flex;
@@ -7,10 +7,16 @@
   min-width: 800px;
   background: #333;
 }
+.elapsed-time {  
+  align-self: flex-start;    
+  font-size: 0.9em;
+  margin-left: 10px;
+}
+
 @media (prefers-color-scheme: light) {
   .chat-container {
     background: #f0f0f0;
-  }
+  }  
 }
 .tabs {
   display: flex;
@@ -49,7 +55,6 @@
   margin: 0 10px 10px 10px;
   background: #222;
   padding: 10px;
-  border-radius: 5px;
 }
 @media (prefers-color-scheme: light) {
   .debug-logs {
@@ -79,6 +84,10 @@
 .agent-message {
   margin-left: 20px;
 }
+.reply-message {
+  margin-left: 20px;
+  border-left: 3px solid #888;
+}
 @media (prefers-color-scheme: light) {
   .message {
     background: #f0f0f0;
@@ -89,11 +98,24 @@
   .agent-message {
     margin-left: 20px;
   }
+  .reply-message {
+    margin-left: 20px;
+    border-left: 3px solid #666;
+  }
 }
 .message-header {
-  display: flex;
-  justify-content: flex-end;
+  display: flex;  
+  justify-content: space-between;
   width: 100%;
+}
+.message-title {
+  font-size: 0.8em;
+  color: #aaa;
+}
+@media (prefers-color-scheme: light) {
+  .message-title {
+    color: #666;
+  }
 }
 .message-content {
   width: 100%;
@@ -111,6 +133,7 @@
 }
 .message-actions {
   display: flex;
+  justify-self: end;
   gap: 5px;
 }
 .message-separator {
@@ -179,7 +202,7 @@ textarea {
 }
 @media (prefers-color-scheme: light) {
   input, textarea {
-    background: #fff;
+    background: white;
     color: #333;
     border: 1px solid #999;
   }
@@ -201,13 +224,12 @@ dialog {
 }
 dialog input, dialog textarea, dialog pre {
   width: 100%;
-  margin-bottom: 10px;
+  margin-bottom: inherit;
 }
 .file-preview {
   color: #d3d3d3;
   background: #222;
-  padding: 10px;
-  border-radius: 5px;
+  padding: 10px;  
   max-height: 60vh;
   overflow-y: auto;
   white-space: pre-wrap;
@@ -239,7 +261,7 @@ dialog input, dialog textarea, dialog pre {
 .code-patch, .shell_code, .stdout, .stderr, .mismatch, .quote, .traceback {
   background: #222;
   padding: 8px;
-  border-radius: 5px;
+  border-radius: 4px;
   font-family: monospace;
   white-space: pre-wrap;
   border: 1px solid;
@@ -317,6 +339,18 @@ dialog input, dialog textarea, dialog pre {
   display: inline-block;
   cursor: pointer;
 }
+
+.framed-code {
+  max-height: 800px; /* ~50 строк при font-size: 14px, line-height: 1.15 */
+  overflow-y: auto;
+  padding: 4px 6px;
+  border-radius: 2px;
+  font-family: monospace;
+  border: 1px solid #775;
+  display: inline-block;
+  cursor: text;
+}
+
 .file-link {
   background: #222;
   color: #1e90ff;
@@ -383,7 +417,6 @@ dialog input, dialog textarea, dialog pre {
     color: #333;
   }
 }
-
 .code-lines {
   border-collapse: collapse;
   border: 1px solid red;

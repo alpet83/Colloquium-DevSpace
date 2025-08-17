@@ -30,6 +30,7 @@ class PostManager:
                 "timestamp INTEGER",
                 "rql INTEGER",
                 "reply_to INTEGER",
+                "elapsed FLOAT",   # сколько секунд ответ "обдумывался" или обрабатывался
                 "FOREIGN KEY (chat_id) REFERENCES chats(id)",
                 "FOREIGN KEY (user_id) REFERENCES users(id)"
             ]
@@ -105,11 +106,11 @@ class PostManager:
             for quote_id in quote_ids:
                 row = g.post_processor.quotes_table.select_from(
                     columns=['quote_id', 'chat_id', 'user_id', 'content', 'timestamp'],
-                    conditions=[('quote_id', '=', quote_id)]
+                    conditions={'quote_id': quote_id}
                 )
                 if row:
                     user_row = self.users_table.select_row(
-                        conditions=[('user_id', '=', row[0][2])],
+                        conditions={'user_id': row[0][2]},
                         columns=['user_name']
                     )
                     user_name = user_row[0] if user_row else 'unknown'
@@ -127,8 +128,73 @@ class PostManager:
             log.excpt("Ошибка извлечения цитат ", e=e)
             return {}
 
-    def save_message(self, chat_id: int, user_id: int, message: str, rql: int = 0, reply_to: int = None) -> dict:
-        """Сохраняет сообщение в таблицу posts и возвращает post_id.
+    def agent_post(self, chat_id: int, message: str, rql: int = 1, reply_to: int = None, elapsed: float = 0):
+        self.add_post(chat_id, g.AGENT_UID, message, rql, reply_to, elapsed)
+
+    async def process_post(self, post: dict, allow_rep: bool):
+        message = post['message']
+        agent_message = None
+        chat_id = post['chat_id']
+        user_id = post['user_id']
+        post_id = post['post_id']
+        rql = post['rql']
+
+        # Проверяем, является ли пользователь LLM
+        user_row = self.users_table.select_row(
+            conditions={'user_id': user_id},
+            columns=['llm_class', 'user_name']
+        )
+        user_name = user_row[1] if user_row else 'unknown'
+        t_start = time.time()
+
+        # через пост-процессор не требуется пропускать лишь ответы агента
+        if chat_id != 2:
+            try:
+                pp = g.post_processor
+                result = await pp.process_response(chat_id, user_id, message, post_id)  # может занять много времени, если выполнять команды MCP
+                log.debug("Результат process_response: handled_cmds=%d, failed_cmds=%d, processed_msg=%s",
+                          result["handled_cmds"], result["failed_cmds"], result["processed_msg"][:50])
+                if isinstance(result, dict):
+                    message = result.get("processed_msg", message)
+                    agent_message = result.get("agent_reply")
+                    if result["handled_cmds"] == 0 and result["failed_cmds"] > 0:
+                        log.warn("post_processor: no commands handled, %d failed", result["failed_cmds"])
+                        agent_message = f"@{user_name} {agent_message or 'Unknown error'}"
+                else:
+                    raise ValueError("Unexpected process_response result type: %s" % type(result))
+            except Exception as e:
+                log.excpt("Ошибка обработки сообщения в post_processor", e=e)
+                agent_message = f"@{user_name} Error processing message: {str(e)}"
+
+        # Обновляем сообщение на processed_message
+        if message != post['message']:
+            self.edit_post(post_id, message, user_id)
+            log.debug("Обновлено сообщение post_id=%d с processed_message=%s", post_id, message[:50])
+
+        # Добавляем ответ агента, если есть
+        if agent_message:
+            elapsed = time.time() - t_start
+            agent_result = self.add_post(chat_id, 2, agent_message, rql, post_id, elapsed)
+            if agent_result.get("error"):
+                log.warn("Не удалось сохранить ответ агента: %s", agent_result["error"])
+            else:
+                agent_post_id = agent_result["post_id"]
+                log.debug("Добавлен ответ агента post_id=%d, chat_id=%d, rql=%d, reply_to=%s, message=%s",
+                          agent_post_id, chat_id, rql, str(post_id), agent_message[:50])
+
+        # Проверяем необходимость репликации
+        sr = False
+        if allow_rep:
+            sr = g.replication_manager.check_start_replication(chat_id, post_id, user_id, message, rql)
+
+        log.debug("Обработка сообщения %d в чате %d завершена %s",
+                  post_id, chat_id, 'с репликацией' if sr else 'без репликации')
+        return {"chat_id": chat_id, "user_id": user_id, "post_id": post_id,
+                "processed_msg": message, "agent_reply": agent_message,
+                "status": "ok"}
+
+    def add_post(self, chat_id: int, user_id: int, message: str, rql: int = 0, reply_to: int = None, elapsed: float = 0) -> dict:
+        """Добавляет сообщение, обрабатывает его через post_processor и сохраняет ответ агента, если есть.
 
         Args:
             chat_id (int): ID чата.
@@ -136,9 +202,11 @@ class PostManager:
             message (str): Текст сообщения.
             rql (int, optional): Уровень рекурсии диалога. Defaults to 0.
             reply_to (int, optional): ID поста, на который отвечает сообщение.
+            elapsed (float, optional): Время на синтез и обработку ответа
 
         Returns:
-            dict: {'status': 'ok', 'post_id': int} или {'error': str}
+            dict: {'status': 'ok', 'post_id': int, 'processed_msg': str, 'agent_reply': str | None}
+                  или {'error': str}
         """
         try:
             timestamp = int(time.time())
@@ -149,7 +217,8 @@ class PostManager:
                 'message': message,
                 'timestamp': timestamp,
                 'rql': rql,
-                'reply_to': reply_to
+                'reply_to': reply_to,
+                'elapsed': elapsed
             })
             post_id_row = self.posts_table.select_row(
                 columns=['last_insert_rowid()']
@@ -160,94 +229,34 @@ class PostManager:
             self.add_change(chat_id, post_id, "add")
             log.debug("Сохранено сообщение post_id=%d, chat_id=%d, user_id=%d, rql=%d, reply_to=%s, message=%s",
                       post_id, chat_id, user_id, rql, str(reply_to), message[:50])
-            return {"status": "ok", "post_id": post_id}
-        except Exception as e:
-            log.excpt("Ошибка сохранения сообщения для chat_id=%d, user_id=%d: ", chat_id, user_id, e=e)
-            return {"error": str(e)}
-
-    def agent_message(self, chat_id: int, message: str, rql: int = 1, reply_to: int = None):
-        self.add_message(chat_id, g.AGENT_UID, message, rql, reply_to)
-
-    def add_message(self, chat_id: int, user_id: int, message: str, rql: int = 0, reply_to: int = None) -> dict:
-        """Добавляет сообщение, обрабатывает его через post_processor и сохраняет ответ агента, если есть.
-
-        Args:
-            chat_id (int): ID чата.
-            user_id (int): ID пользователя.
-            message (str): Текст сообщения.
-            rql (int, optional): Уровень рекурсии диалога. Defaults to 0.
-            reply_to (int, optional): ID поста, на который отвечает сообщение.
-
-        Returns:
-            dict: {'status': 'ok', 'post_id': int, 'processed_msg': str, 'agent_reply': str | None}
-                  или {'error': str}
-        """
-        try:
-            # Сохраняем исходное сообщение
-            save_result = self.save_message(chat_id, user_id, message, rql, reply_to)
-            if save_result.get("error"):
-                return save_result
-            post_id = save_result["post_id"]
-
-            # Проверяем, является ли пользователь LLM
-            user_row = self.users_table.select_row(
-                conditions=[('user_id', '=', user_id)],
-                columns=['llm_class', 'user_name']
-            )
-            user_name = user_row[1] if user_row else 'unknown'
-
-            processed_message = message
-            agent_message = None
-
-            # через пост-процессор не требуется пропускать лишь ответы агента
-            if chat_id != 2:
-                try:
-                    pp = g.post_processor
-                    result = pp.process_response(chat_id, user_id, message, post_id)
-                    log.debug("Результат process_response: handled_cmds=%d, failed_cmds=%d, processed_msg=%s",
-                              result["handled_cmds"], result["failed_cmds"], result["processed_msg"][:50])
-                    if isinstance(result, dict):
-                        processed_message = result.get("processed_msg", message)
-                        agent_message = result.get("agent_reply")
-                        if result["handled_cmds"] == 0 and result["failed_cmds"] > 0:
-                            log.warn("post_processor: no commands handled, %d failed", result["failed_cmds"])
-                            agent_message = f"@{user_name} {agent_message or 'Unknown error'}"
-                    else:
-                        raise ValueError("Unexpected process_response result type: %s" % type(result))
-                except Exception as e:
-                    log.excpt("Ошибка обработки сообщения в post_processor", e=e)
-                    processed_message = message
-                    agent_message = f"@{user_name} Error processing message: {str(e)}"
-
-            # Обновляем сообщение на processed_message
-            if processed_message != message:
-                self.edit_post(post_id, processed_message, user_id)
-                log.debug("Обновлено сообщение post_id=%d с processed_message=%s", post_id, processed_message[:50])
-
-            # Добавляем ответ агента, если есть
-            if agent_message:
-                agent_result = self.save_message(chat_id, 2, agent_message, rql, post_id)
-                if agent_result.get("error"):
-                    log.warn("Не удалось сохранить ответ агента: %s", agent_result["error"])
-                else:
-                    agent_post_id = agent_result["post_id"]
-                    log.debug("Добавлен ответ агента post_id=%d, chat_id=%d, rql=%d, reply_to=%s, message=%s",
-                              agent_post_id, chat_id, rql, str(post_id), agent_message[:50])
-
-            # Проверяем необходимость репликации
-            sr = g.replication_manager.check_start_replication(chat_id, post_id, user_id, message, rql)
-            log.debug("Добавление сообщения %d в чат %d завершено %s",
-                      post_id, chat_id, 'с репликацией' if sr else 'без репликации')
-
-            return {
-                "status": "ok",
+            post = {
+                "chat_id": chat_id,
+                "user_id": user_id,
                 "post_id": post_id,
-                "processed_msg": processed_message,
-                "agent_reply": agent_message
+                "status": "ok",
+                "message": message,
+                "reply_to": reply_to,
+                "elapsed": elapsed,
+                "rql": rql
             }
+            return post
         except Exception as e:
             log.excpt("Ошибка добавления сообщения для chat_id=%d, user_id=%d: ", chat_id, user_id, e=e)
             return {"error": str(e)}
+
+    def latest_post(self, filters=None):
+        keys = ['id', 'chat_id', 'user_id', 'message', 'rql', 'reply_to']
+        row = self.posts_table.select_row(
+            columns=keys,
+            conditions=filters,
+            order_by="id DESC"
+        )
+        result = {}
+        if len(row) == len(keys):
+            for i, k in enumerate(keys):
+                result[k] = row[i]
+                result[i] = row[i]
+        return result
 
     def scan_history(self, chat_id: int, visited: set = None, before_id: int = None) -> dict:
         """Рекурсивно собирает историю постов для указанного chat_id, включая родительские чаты.
@@ -293,7 +302,7 @@ class PostManager:
         if before_id is not None:
             conditions.append(('id', '<=', before_id))
         rows = self.posts_table.select_from(
-            columns=['p.id', 'p.chat_id', 'p.user_id', 'p.message', 'p.timestamp', 'u.user_name', 'p.rql', 'p.reply_to'],
+            columns=['p.id', 'p.chat_id', 'p.user_id', 'p.message', 'p.timestamp', 'u.user_name', 'p.rql', 'p.reply_to', 'p.elapsed'],
             conditions=conditions,
             joins=[('users', 'u', 'p.user_id = u.user_id')],
             order_by='p.id'
@@ -309,6 +318,7 @@ class PostManager:
                 "user_name": row[5],
                 "rql": row[6],
                 "reply_to": row[7],
+                "elapsed": round(row[8], 1),
                 "action": "add"
             }
             post_ids.append(row[0])
@@ -397,7 +407,7 @@ class PostManager:
         """
         row = self.posts_table.select_from(
             columns=['id', 'chat_id', 'user_id', 'message', 'timestamp', 'rql', 'reply_to'],
-            conditions=[('id', '=', post_id)]
+            conditions={'id': post_id}
         )
         return {
             'id': row[0][0],
@@ -431,7 +441,7 @@ class PostManager:
             post_user_id, chat_id, rql = post[0]
             if post_user_id != user_id and self.user_manager.get_user_role(user_id) != 'admin':
                 log.info("Пользователь user_id=%d не имеет прав для редактирования post_id=%d", user_id, post_id)
-                error_result = self.save_message(
+                error_result = self.add_post(
                     chat_id, 2, f"Permission denied: User {user_id} cannot edit post_id={post_id} owned by user {post_user_id}",
                     rql, post_id
                 )

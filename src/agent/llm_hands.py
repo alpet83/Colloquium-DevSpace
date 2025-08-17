@@ -6,10 +6,12 @@ from processors.shell_code import ShellCodeProcessor
 from processors.file_processors import FileEditProcessor, FileReplaceProcessor, FileMoveProcessor, FileUndoProcessor
 from processors.entity_processor import LookupSpanProcessor, LookupEntityProcessor, ReplaceSpanProcessor
 from processors.patch_processor import CodePatchProcessor
+from processors.project_scan import ProjectScanProcessor
 
 log = globals.get_logger("llm_hands")
 
-def process_message(text, timestamp, user_name: str, rql: int = 0) -> dict:
+
+async def process_message(text, timestamp, user_name: str, rql: int = 0) -> dict:
     """Обрабатывает сообщение, применяя процессоры для специальных тегов.
 
     Args:
@@ -41,7 +43,8 @@ def process_message(text, timestamp, user_name: str, rql: int = 0) -> dict:
         ShellCodeProcessor(),
         LookupSpanProcessor(),
         LookupEntityProcessor(),
-        ReplaceSpanProcessor()
+        ReplaceSpanProcessor(),
+        ProjectScanProcessor()
     ]
     log.info("Инициализировано %d процессоров для обработки сообщения", len(processors))
 
@@ -57,7 +60,7 @@ def process_message(text, timestamp, user_name: str, rql: int = 0) -> dict:
     have_tag = re.search(tag_pattern, command_text, re.DOTALL)
     if have_tag:
         for processor in processors:
-            result = processor.process(command_text, user_name)
+            result = await processor.process(command_text, user_name)
             processed_msg = result["processed_message"]
             if processed_msg:
                 command_text = processed_msg

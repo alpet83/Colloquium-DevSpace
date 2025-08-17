@@ -1,5 +1,6 @@
-// /frontend/rtm/src/utils/chat_actions.js, updated 2025-07-22 18:00 EEST
+/* /frontend/rtm/src/utils/chat_actions.js, updated 2025-07-26 12:37 EEST */
 import { log_msg, log_error } from './debugging'
+import { lang_class } from './chat_format'
 
 export function handleModal(component, modalRef, open, stateUpdates = {}, callback = null) {
   log_msg('ACTION', `Received modalRef: ${modalRef}`)
@@ -43,9 +44,10 @@ export async function sendMessage(component, event) {
     finalMessage += ` @attached_file#${component.fileStore.pendingAttachment.file_id}`
   }
   try {
-    log_msg('CHAT', `Attempting to send message: ${finalMessage}`)
-    await component.chatStore.sendMessage(finalMessage)
+    component.last_post = finalMessage
     component.newMessage = ''
+    log_msg('CHAT', `Saved message to last_post: ${finalMessage}`)
+    await component.chatStore.sendMessage(finalMessage)
     component.fileStore.clearAttachment()
     component.chatStore.status.status = 'free'
     log_msg('CHAT', 'Reset status to free after action: send message')
@@ -69,7 +71,7 @@ export async function editPost(component) {
   }
   if (component.chatStore.status.status === 'busy') {
     log_msg('CHAT', 'Редактирование заблокировано: идёт обработка запроса', component.chatStore.status)
-    component.chatStore.chatError = 'Редактирование заблокировано: идёт обработка запроса'
+    component.chatStore.chatError = 'Редактирование заблокирована: идёт обработка запроса'
     component.debugLogs.push({
       type: 'warn',
       message: `Редактирование заблокировано: идёт обработка запроса ${component.chatStore.status.actor || 'unknown'} (${component.chatStore.status.elapsed || 0} секунд)`,
@@ -121,10 +123,19 @@ export async function showFilePreview(component, fileId) {
     })
     log_msg('FILE', `Fetching file contents for file_id: ${fileId}`)
     if (res.ok) {
-      const data = await res.json()
-      if (data.content) {
-        component.filePreviewContent = data.content
-        handleModal(component, 'filePreviewModal', true)
+      const text = await res.text()
+      if (text) {
+        component.filePreviewContent = text
+        handleModal(component, 'filePreviewModal', true)      
+        const codeElement = document.getElementById('file-preview-code')
+        if (codeElement && window.hljs) {
+          let lc = lang_class(component.fileStore.files, fileId)                  
+          codeElement.className = `framed-code ${lc}`
+          codeElement.removeAttribute('data-highlighted')
+          window.hljs.highlightElement(codeElement)
+          log_msg('UI', `Highlighted code preview for file_id: ${fileId} with class: ${lc}`)
+        }
+
         log_msg('ACTION', 'Action executed: show file preview')
       } else {
         log_error(component, new Error(`No content found for file_id: ${fileId}`), 'fetch file contents')
@@ -151,4 +162,4 @@ export function handleSelectFile(component, fileId) {
     component.autoResize({ target: component.$refs.messageInput }, 'messageInput')
   })
   log_msg('ACTION', 'Action executed: handle select file')
-} 
+}

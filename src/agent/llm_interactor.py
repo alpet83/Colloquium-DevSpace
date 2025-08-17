@@ -126,7 +126,7 @@ class LLMInteractor(ContextAssembler):
                      str(stats_file), chat_id, len(stats))
         except Exception as e:
             g.handle_exception(f"Не удалось записать статистику контекста в {stats_file}", e)
-            g.post_manager.add_message(chat_id, 2, f"Не удалось записать статистику контекста для {llm_name}: {str(e)}")
+            g.post_manager.add_post(chat_id, 2, f"Не удалось записать статистику контекста для {llm_name}: {str(e)}")
 
     def _write_chat_index(self, chat_id: int):
         """Сохраняет индекс чата в /app/projects/.chat-meta/{chat_id}-index.json и регистрирует в БД.
@@ -146,7 +146,7 @@ class LLMInteractor(ContextAssembler):
                 log.error("Не удалось зарегистрировать %s", file_name)
         except Exception as e:
             log.excpt("Не удалось сохранить индекс для chat_id=%d", chat_id, e=e)
-            g.post_manager.add_message(
+            g.post_manager.add_post(
                 chat_id, 2, f"Не удалось сохранить индекс для {file_name}: {str(e)}"
             )
 
@@ -227,7 +227,7 @@ class LLMInteractor(ContextAssembler):
                      str(context_file), actor.user_id, len(context))
         except Exception as e:
             err = f"Не удалось сохранить контекст для {actor.user_name}: {str(e)}"
-            g.post_manager.add_message(ci.chat_id, 2, err, rql=rql)
+            g.post_manager.add_post(ci.chat_id, 2, err, rql=rql)
             g.handle_exception(err, e)
         sent_tokens = estimate_tokens(context)
         if sent_tokens > tokens_limit:
@@ -280,7 +280,7 @@ class LLMInteractor(ContextAssembler):
         except Exception as e:
             error_msg = f"Ошибка LLM для {actor.user_name}: {str(e)}"
             g.handle_exception(error_msg, e)
-            g.post_manager.add_message(
+            g.post_manager.add_post(
                 ci.chat_id, 2, error_msg, rql=rql if rql >= 2 else None
             )
             return f"LLMException {e}"

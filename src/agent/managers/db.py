@@ -69,6 +69,7 @@ class Database:
                       query[:50] + "..." if len(query) > 50 else query, str(params), str(e))
             raise
 
+
 class DataTable:
     def __init__(self, table_name: str, template: list):
         self.db = Database.get_database()

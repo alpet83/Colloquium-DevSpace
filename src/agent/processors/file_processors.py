@@ -14,7 +14,7 @@ class FileEditProcessor(BlockProcessor):
     def __init__(self):
         super().__init__('code_file')
 
-    def handle_block(self, attrs: dict, block_code: str) -> dict:
+    async def handle_block(self, attrs: dict, block_code: str) -> dict:
         """Обрабатывает блок <code_file> для создания или обновления файла.
 
         Args:
