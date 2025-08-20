@@ -4,6 +4,7 @@ import { log_msg, log_error } from '../utils/debugging'
 import { makeRequest } from '../utils/requests'
 import mitt from '../utils/mitt'
 
+
 export const useFileStore = defineStore('files', {
   state: () => ({
     files: [],
@@ -90,6 +91,6 @@ export const useFileStore = defineStore('files', {
     clearAttachment() {
       this.pendingAttachment = null;
       log_msg('FILE', 'Cleared pending attachment');
-    }
+    } 
   }
 })

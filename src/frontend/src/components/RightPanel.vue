@@ -108,8 +108,7 @@ export default defineComponent({
     filteredFiles() {
       // log_msg('FILE', 'Computing filteredFiles, fileStore.files:', JSON.stringify(this.fileStore.files, null, 2), 'selectedProject:', this.selectedProject)
       if (!this.selectedProject) {
-        return this.fileStore.files
-          .filter(file => file.project_id > 0) // Исключаем файлы с project_id=0
+        return this.fileStore.files          
           .map(file => ({
             ...file,
             file_name: file.file_name.startsWith('/') ? file.file_name.slice(1) : file.file_name

@@ -179,10 +179,12 @@ class DataTable:
                         if isinstance(cond, tuple) and len(cond) == 3:
                             key, op, value = cond
                             if op == 'IN' and isinstance(value, (list, tuple)):
-                                placeholders = ', '.join([f':{key}_{i}' for i in range(len(value))])
-                                conditions_list.append(f"p.{key} IN ({placeholders})")
+                                pc = []
                                 for i, val in enumerate(value):
-                                    params[f"{key}_{i}"] = val
+                                    ik = f"{key}_{i}"
+                                    params[ik] = val
+                                    pc.append(f':{ik}')
+                                conditions_list.append(f"p.{key} IN ({', '.join(pc)})")
                             else:
                                 conditions_list.append(f"p.{key} {op} :{key}")
                                 params[key] = value

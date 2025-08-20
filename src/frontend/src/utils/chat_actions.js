@@ -149,6 +149,30 @@ export async function showFilePreview(component, fileId) {
   }
 }
 
+export async function insertTextAtCursor(component, text) {
+  let cursorPos = 0
+  const textarea = component.$refs.messageInput
+    if (textarea) {
+      const msg = component.newMessage || ''
+      cursorPos = textarea.selectionStart || 0
+      const textBefore = msg.substring(0, cursorPos)
+      const textAfter = msg.substring(cursorPos)
+      component.newMessage = `${textBefore} ${text} ${textAfter}`      
+      textarea.value = component.newMessage
+      component.$nextTick(() => {
+        component.autoResize({ target: textarea }, 'messageInput')
+      })
+      
+      textarea.focus()      
+      cursorPos = textBefore.length + text.length + 2 // +2 for the spaces added      
+      textarea.setSelectionRange(cursorPos, cursorPos)      
+    } else {
+      component.newMessage += ` ${text} `
+      component.$refs.messageInput?.focus()
+    }
+    log_msg('ACTION', 'completed insertTextAtCursor %d: %s', cursorPos, text)
+}
+
 export function handleSelectFile(component, fileId) {
   log_msg('ACTION', 'Triggered handleSelectFile')
   if (!fileId) {
@@ -156,10 +180,15 @@ export function handleSelectFile(component, fileId) {
     component.fileStore.chatError = 'Invalid file selection'
     return
   }
-  component.newMessage += ` @attached_file#${fileId}`
-  component.$refs.messageInput?.focus()
-  component.$nextTick(() => {
-    component.autoResize({ target: component.$refs.messageInput }, 'messageInput')
-  })
-  log_msg('ACTION', 'Action executed: handle select file')
+  insertTextAtCursor(component, `@attached_file#${fileId}`)
+}
+
+export function handleSelectDir(component, dirPath) {
+  log_msg('ACTION', 'Triggered handleSelectDir')
+  if (!dirPath) {
+    log_error(component, new Error('Invalid dirPath received'), 'select dir')
+    component.fileStore.chatError = 'Invalid directory selection'
+    return
+  }
+  insertTextAtCursor(component, `@attach_dir#${dirPath}`)
 }

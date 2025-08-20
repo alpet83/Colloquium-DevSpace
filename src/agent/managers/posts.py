@@ -309,6 +309,7 @@ class PostManager:
         )
         for row in rows:
             pid = row[0]
+            elps = round(row[8], 1) if row[8] else 0
             history[pid] = {
                 "id": pid,
                 "chat_id": row[1],
@@ -318,7 +319,7 @@ class PostManager:
                 "user_name": row[5],
                 "rql": row[6],
                 "reply_to": row[7],
-                "elapsed": round(row[8], 1),
+                "elapsed": elps,
                 "action": "add"
             }
             post_ids.append(row[0])

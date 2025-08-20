@@ -167,7 +167,7 @@ class FileManager:
         file_name = str(file_name).lstrip("@").lstrip("/")
         if len(file_name) > 300:
             raise ValueError(f"Слишком длинное имя файла {len(file_name)}")
-        file_id = self.exists(file_name, project_id)
+        file_id = self.exists(file_name)
         if file_id:
             return file_id
         if timestamp is None:
@@ -359,7 +359,8 @@ class FileManager:
                 log.debug("Удалён файл с диска: %s", str(file_path))
             self.unlink(file_id)
 
-    def write_file(self, file_name, content, project_id=None):
+    @staticmethod
+    def write_file(file_name, content, project_id=None):
         # assert file_name.startswith('@'), "Using write_file not for a link"
         safe_path = _qfn(file_name, project_id)
         log.debug("Creating directory for file: %s", safe_path.parent)
@@ -386,22 +387,18 @@ class FileManager:
         log.debug("Записано в файл %s, %d / %d", file_name, wb, len(content))
         return wb
 
-    def list_files(self, user_id: int, project_id=None):
+    def list_files(self, project_id=None, sql_filter=None, as_map: bool = False):
         self._dedup(project_id)
-        if project_id is None:
-            # log.debug("Запрошены все зарегистрированные файлы для user_id=%d", user_id)
-            conditions = {}
-        else:
-            # log.debug("Запрошены файлы для project_id=%d, user_id=%d", project_id, user_id)
-            conditions = {'project_id': project_id}
-        query = 'SELECT id, file_name, ts, project_id FROM attached_files'
-        if conditions:
-            query += ' WHERE project_id = :project_id'
-        # log.debug("Выполняется SQL-запрос: %s, conditions=%s", query, str(conditions))
-        rows = self.db.fetch_all(query, conditions)
-        # log.debug("Получено %d строк из attached_files", len(rows))
-        files = []
-        deleted = []
+        conditions = []
+        if project_id is not None:
+            conditions.append(('project_id', '=', project_id))
+        if sql_filter:
+            conditions.append(sql_filter)
+
+        rows = self.files_table.select_from(columns=['id', 'file_name', 'ts', 'project_id'],
+                                            conditions=conditions)
+        files = {}
+        orphaned = []
         for row in rows:
             file_id, file_name, ts, project_id = row
             clean_file_name = file_name.lstrip('@')
@@ -410,11 +407,13 @@ class FileManager:
                 if not file_path.exists():
                     log.warn("Имеется отсутствующая ссылка: id=%3d, project_id=%2d, qfn=%s",
                              file_id, project_id, str(file_path))
-                    deleted.append(file_id)
-                else:
-                    files.append({'id': file_id, 'file_name': clean_file_name, 'ts': ts, 'project_id': project_id})
-            else:
-                files.append({'id': file_id, 'file_name': clean_file_name, 'ts': ts, 'project_id': project_id})
-        if deleted:
-            log.warn("Имеются отсутствующие файлы в attached_files: %s", deleted)
-        return files
+                    orphaned.append(file_id)
+                    continue
+            files[file_id] = {'id': file_id, 'file_name': clean_file_name, 'ts': ts, 'project_id': project_id}
+        if orphaned:
+            log.warn("Имеются отсутствующие файлы в attached_files: %s", orphaned)
+        if as_map:
+            return files
+        else:
+            return list(files.values())
+

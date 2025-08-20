@@ -109,7 +109,7 @@
   import { useFileStore } from '../stores/files'
   import { useAuthStore } from '../stores/auth'
   import { log_msg, log_error, set_show_logs } from '../utils/debugging'
-  import { handleModal, sendMessage, editPost, confirmFileUpload, showFilePreview, handleSelectFile } from '../utils/chat_actions'
+  import { handleModal, sendMessage, editPost, confirmFileUpload, showFilePreview, handleSelectFile, handleSelectDir } from '../utils/chat_actions'
   import { formatDateTime } from '../utils/common'
   import { formatMessage, reformatMessages, checkAwaitedFiles } from '../utils/chat_format'
   
@@ -152,6 +152,7 @@
     },
     mounted() {
       this.startPolling()
+      this.mitt.on('select-dir', (dirPath) => this.handleSelectDir(dirPath))
       this.mitt.on('select-file', (fileId) => this.handleSelectFile(fileId))
       this.mitt.on('files-updated', () => reformatMessages(this))
       this.$nextTick(() => {
@@ -165,6 +166,7 @@
     },
     beforeUnmount() {
       this.stopPolling()
+      this.mitt.off('select-dir')
       this.mitt.off('select-file')
       this.mitt.off('files-updated')
       if (this.backendLogInterval) {
@@ -308,10 +310,14 @@
       },
       showFilePreview(fileId) {
         log_msg('ACTION', 'Called showFilePreview:', fileId)
-        showFilePreview(this, fileId)
+        showFilePreview(this, fileId)      
+      },       
+      handleSelectDir(dirPath) {
+        log_msg('ACTION', 'Called handleSelectDir: %s', dirPath)
+        handleSelectDir(this, dirPath);
       },
       handleSelectFile(fileId) {
-        log_msg('ACTION', 'Called handleSelectFile:', fileId)
+        log_msg('ACTION', 'Called handleSelectFile: %d', fileId)
         handleSelectFile(this, fileId)
       }
     }

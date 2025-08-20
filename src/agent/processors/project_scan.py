@@ -32,7 +32,7 @@ class ProjectScanProcessor(BlockProcessor):
 
             proj_man = g.project_manager
             # Получаем все файлы из attached_files
-            files = g.file_manager.list_files(user_name, project_id=proj_man.project_id)  # поиск в активном проекте
+            files = g.file_manager.list_files(project_id=proj_man.project_id)  # поиск в активном проекте
             results = []
             for file in files:
                 file_id = file['id']
