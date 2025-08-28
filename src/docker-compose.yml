@@ -10,7 +10,7 @@ services:
       - ./projects:/app/projects
       - ./agent:/app/agent
       - ./tests:/app/tests
-      - ./docs:/app/docs
+      - ../docs:/app/docs
     networks:
       - devspace-net
     depends_on:
