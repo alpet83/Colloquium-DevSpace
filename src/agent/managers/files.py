@@ -406,7 +406,7 @@ class FileManager:
                 file_path = _qfn(clean_file_name, project_id)
                 if not file_path.exists():
                     log.warn("Имеется отсутствующая ссылка: id=%3d, project_id=%2d, qfn=%s",
-                             file_id, project_id, str(file_path))
+                             file_id or -1, project_id or -1, str(file_path))
                     orphaned.append(file_id)
                     continue
             files[file_id] = {'id': file_id, 'file_name': clean_file_name, 'ts': ts, 'project_id': project_id}

@@ -32,5 +32,5 @@ fi
 # Запуск dev-сервера
 echo "Запуск npm run dev" >> $LOG
 npm install
-npm run dev --prefix /app/frontend -- --host 0.0.0.0 --port 8088 >>$LOG 2>> $ERRS
+npm run dev --prefix /app/frontend -- --host 0.0.0.0 --port 8008 >>$LOG 2>> $ERRS
 echo `date `" Finished " >> $LOG

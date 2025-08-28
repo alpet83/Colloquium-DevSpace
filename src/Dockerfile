@@ -2,9 +2,6 @@ FROM rust:1.87-slim
 
 RUN apt update
 RUN apt -y install inetutils-traceroute nano net-tools curl
-# RUN traceroute vds.alpet.me
-# Проверка интернета (curl -v для деталей)
-# RUN curl -v https://google.com || exit 1
 
 # Создание venv и pip install (если deb include pip deps; иначе добавьте pip deb)
 RUN apt install -y python3 python3-pip python3-venv

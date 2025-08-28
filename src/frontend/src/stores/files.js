@@ -11,7 +11,7 @@ export const useFileStore = defineStore('files', {
     pendingAttachment: null,
     chatError: '',
     backendError: false,
-    apiUrl: document.location.origin + '/api',
+    apiUrl: './api',
     pendingRequests: new Map(),
     lastRequestTimes: new Map(),
     minUpdateDelay: new Map([

@@ -11,7 +11,7 @@ export const useAuthStore = defineStore('auth', {
     isCheckingSession: false,
     userRole: null,
     userId: null,
-    apiUrl: import.meta.env.VITE_API_URL || 'http://vps.vpn:8008/api'
+    apiUrl: import.meta.env.VITE_API_URL || './api'
   }),
   actions: {
     async checkSession() {
@@ -52,8 +52,7 @@ export const useAuthStore = defineStore('auth', {
           this.loginError = data.error || 'Session error'
         }
       } catch (e) {
-        console.error('Session check failed:', e)
-        this.backendError = true
+        console.error('Session check failed:', e)        
       } finally {
         this.isCheckingSession = false
       }

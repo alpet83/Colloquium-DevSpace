@@ -4,9 +4,10 @@ import binascii
 import os
 from .db import Database, DataTable
 from lib.basic_logger import BasicLogger
-import globals
+import globals as g
+import secrets, string
 
-log = globals.get_logger("userman")
+log = g.get_logger("userman")
 
 class UserManager:
     def __init__(self):
@@ -33,7 +34,8 @@ class UserManager:
         )[0]
         if count == 0:
             salt = os.urandom(16)
-            password = "colloquium"
+            alphabet = string.ascii_letters + string.digits
+            password = "!" + ''.join(secrets.choice(alphabet) for i in range(10))
             server_hash = hashlib.sha256(salt + password.encode()).hexdigest()
             salt_hex = binascii.hexlify(salt).decode()
             self.users_table.insert_into({
@@ -43,7 +45,7 @@ class UserManager:
                 "password_hash": server_hash,
                 "salt": salt_hex
             })
-            log.info("Создан пользователь admin с паролем %s", "colloquium")
+            log.warn("Создан пользователь admin с временным паролем %s", password)
         count = self.users_table.select_row(
             columns=["COUNT(*)"],
             conditions={"user_name": "agent"}

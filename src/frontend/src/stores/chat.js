@@ -12,7 +12,7 @@ export const useChatStore = defineStore('chat', {
     newChatParentMessageId: null,
     chatError: '',
     backendError: false,
-    apiUrl: import.meta.env.VITE_API_URL || 'http://vps.vpn:8008/api',
+    apiUrl: import.meta.env.VITE_API_URL || './api',
     waitChanges: false,
     need_full_history: false,
     stats: { tokens: null, num_sources_used: null },

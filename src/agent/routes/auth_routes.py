@@ -1,5 +1,6 @@
 # /agent/routes/auth_routes.py, updated 2025-07-18 14:28 EEST
-from fastapi import APIRouter, Request, Response, HTTPException
+from fastapi import APIRouter, Request, HTTPException
+from fastapi.responses import JSONResponse
 from managers.db import Database
 import globals
 import uuid
@@ -30,9 +31,10 @@ async def login(request: Request):
             {'session_id': session_id, 'user_id': user_id}
         )
         log.debug("Создана сессия session_id=%s для user_id=%d", session_id, user_id)
-        response = Response(content="Login successful")
+        response = JSONResponse(content="Login successful")
         response.set_cookie(key="session_id", value=session_id, httponly=True)
         return response
+
     except HTTPException as e:
         log.error("HTTP ошибка в POST /login: %s", str(e))
         raise
@@ -54,7 +56,7 @@ async def logout(request: Request):
             {'session_id': session_id}
         )
         log.debug("Удалена сессия session_id=%s", session_id)
-        response = Response(content="Logout successful")
+        response = JSONResponse(content="Logout successful")
         response.delete_cookie(key="session_id")
         return response
     except HTTPException as e:

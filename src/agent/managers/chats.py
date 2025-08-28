@@ -51,18 +51,31 @@ class ChatManager:
         self.switch_events = {}  # Хранилище событий переключения чата: {f"{user_id}:{chat_id}": asyncio.Event}
 
     @staticmethod
-    def active_chat(user) -> int:
+    def active_chat(user, sid=None) -> int:
         # Проверяем active_chat в sessions_table
         user_id = user
         if isinstance(user, str):
             user_id = g.user_manager.get_user_id_by_name(user)
+        cond = {'user_id': int(user_id)}
+        if sid is not None:
+            cond['session_id'] = sid  # для будущей поддержки мульти-сессий
+
         row = g.sessions_table.select_row(
             columns=['session_id', 'active_chat'],
-            conditions={'user_id': int(user_id)} )
+            conditions=cond)
         if not row:
             log.error("No session record for user_id %d", user_id)
             return 0
         return row[1] if row and row[1] is not None else None
+
+    @staticmethod
+    def select_chat(session_id: int, user_id: int, chat_id: int):
+        g.sessions_table.insert_or_replace({
+            'session_id': session_id,
+            'user_id': user_id,
+            'active_chat': chat_id
+        })
+        log.debug("Выбран активный чат id=%d для session_id=%s, user_id=%d", chat_id, session_id, user_id)
 
     def chat_status(self, chat_id: int) -> dict:
         busy = self.chats_busy.get(chat_id, {})

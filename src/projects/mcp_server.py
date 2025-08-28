@@ -1,5 +1,5 @@
-# /mcp_server.py, updated 2025-07-19 13:15 EEST
-from flask import Flask, request, Response
+# /mcp_server.py, updated 2025-08-17
+
 import os
 import json
 import re
@@ -9,18 +9,26 @@ import toml
 import socket
 import git
 import atexit
-import lib.globals as g
+import asyncio
+import globals as g
 from lib.execute_commands import execute
 from lib.basic_logger import BasicLogger
+from quart import Quart, request, Response
 
 
-app = Flask(__name__)
+def tss():
+    return time.strftime('[%Y-%m-%d %H:%M:%S]')
+
+
+app = Quart(__name__)
+
 
 PROJECTS_DIR = "/app/projects"
 CONFIG_PATH = "/app/data/mcp_config.toml"
 SECRET_TOKEN = g.MCP_AUTH_TOKEN
 LOG_FILE = "/app/logs/mcp_errors.log"
 log = BasicLogger("mcp_server", "mcp-server")
+
 
 def server_init():
     log_dir = "/app/logs"
@@ -39,9 +47,12 @@ def server_init():
 
     os.system("chown agent -R /app/projects")
     log.info("Установлены права для пользователя agent на /app/projects")
+    print(tss() + "Server initialization finished...")
+
 
 def calculate_md5(content):
     return hashlib.md5(content.encode('utf-8')).hexdigest()
+
 
 def is_admin_ip():
     client_ip = request.remote_addr
@@ -55,74 +66,41 @@ def is_admin_ip():
             return False
     return False
 
+
 @app.route('/exec_commands', methods=['POST'])
-def exec_commands():
+async def exec_commands():
     if not is_admin_ip() and request.headers.get('Authorization') != f"Bearer {SECRET_TOKEN}":
         log.error("Неавторизованный доступ: неверный или отсутствует токен")
         return Response("Unauthorized: Invalid or missing token", status=401, mimetype='text/plain')
 
-    data = request.get_json()
-    if not data or 'command' not in data or 'user_inputs' not in data or 'project_name' not in data:
-        log.error("Отсутствуют command, user_inputs или project_name")
-        return Response("Missing command, user_inputs or project_name", status=400, mimetype='text/plain')
+    data = await request.get_json()
+    if not data or ('command' not in data) or ('project_name' not in data):
+        params = json.dumps(data)
+        log.error("Отсутствуют cmd или project_name в параметрах: %s %s", str(type(data)), params)
+        return Response(f"ERROR: Missing cmd or project_name in {params} ", status=400, mimetype='text/plain')
 
-    command = data['command']
-    user_inputs = data['user_inputs']
+    cmd = data['command']
     project_name = data['project_name']
-    timeout = data.get('timeout', 300)
-
-    if not project_name or not isinstance(project_name, str):
-        log.error("Некорректное project_name: %s", str(project_name))
-        return Response("Invalid or missing project_name", status=400, mimetype='text/plain')
-
+    user_inputs = data.get('user_inputs', [])
     project_dir = os.path.join(PROJECTS_DIR, project_name)
-    try:
-        os.makedirs(project_dir, exist_ok=True)
-    except Exception as e:
-        log.excpt(f"Ошибка создания директории {project_dir}: {e}", exc_info=(type(e), e, e.__traceback__))
-        return Response(f"Failed to create project directory: {e}", status=500, mimetype='text/plain')
-
-    result = execute(command, user_inputs, "mcp_server", cwd=project_dir, timeout=timeout)
+    print(tss() + f" starting {cmd} on project {project_name}... ")
+    result = await execute(cmd, user_inputs, 'mcp_server', cwd=project_dir)
 
     timestamp = int(time.time())
     status = "Success" if result["status"] == "success" else "Failed"
-    log.info(f"Команда {command} для {project_name}: {status}")
+    log.info(f"Команда {cmd} для {project_name}: {status}")
 
     headers = {"X-Timestamp": str(timestamp), "X-Status": status}
-    return Response(f"#post_{timestamp}: Результат команды: {result['message']}", headers=headers,
-                    mimetype='text/plain')
-
-@app.route('/run_test', methods=['GET'])
-def run_test():
-    if not is_admin_ip() and request.headers.get('Authorization') != f"Bearer {SECRET_TOKEN}":
-        log.error("Неавторизованный доступ: неверный или отсутствует токен")
-        return Response("Unauthorized: Invalid or missing token", status=401, mimetype='text/plain')
-
-    project_name = request.args.get('project_name')
-    test_name = request.args.get('test_name')
-    if not project_name or not test_name:
-        log.error("Отсутствуют project_name или test_name")
-        return Response("Missing project_name or test_name", status=400, mimetype='text/plain')
-
-    project_dir = os.path.join(PROJECTS_DIR, project_name)
-    cmd = f"cargo test --test {test_name}"
-    result = execute(cmd, [], "mcp_server", cwd=project_dir)
-
-    timestamp = int(time.time())
-    status = "Success" if result["status"] == "success" else "Failed"
-    log.info(f"Тест {test_name} для {project_name}: {status}")
-
-    headers = {"X-Timestamp": str(timestamp), "X-Status": status}
-    return Response(f"#post_{timestamp}: Результат теста: {result['message']}", headers=headers,
+    return Response(f"#post_{timestamp}: Результат выполнения команды: {result['message']}", headers=headers,
                     mimetype='text/plain')
 
 @app.route('/commit', methods=['POST'])
-def commit():
+async def commit():
     if not is_admin_ip() and request.headers.get('Authorization') != f"Bearer {SECRET_TOKEN}":
         log.error("Неавторизованный доступ: неверный или отсутствует токен")
         return Response("Unauthorized: Invalid or missing token", status=401, mimetype='text/plain')
 
-    data = request.get_json()
+    data = await request.get_json()
     if not data or 'project_name' not in data or 'msg' not in data:
         log.error("Отсутствуют project_name или msg")
         return Response("Missing project_name or msg", status=400, mimetype='text/plain')
@@ -141,15 +119,18 @@ def commit():
     headers = {"X-Timestamp": str(timestamp)}
     return Response(f"#post_{timestamp}: Коммит выполнен: {msg}", headers=headers, status=200, mimetype='text/plain')
 
+
 @app.route('/ping')
-def ping():
+async def ping():
     return "pong"
+
 
 def shutdown():
     log.info("Сервер остановлен")
+
 
 atexit.register(shutdown)
 
 if __name__ == "__main__":
     server_init()
-    app.run(host="0.0.0.0", port=8084)
+    asyncio.run(app.run_task(host="0.0.0.0", port=8084))

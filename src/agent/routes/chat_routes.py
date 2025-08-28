@@ -62,6 +62,7 @@ async def get_chat(request: Request, chat_id: int, wait_changes: int = 0):
     try:
         # NOLOG!: постоянное логирование запрещено из-за флуда
         user_id = check_session(request)
+        session_id = request.cookies.get("session_id")
         status = {'status': "nope"}
         if wait_changes:
             max_wait = 15
@@ -76,12 +77,19 @@ async def get_chat(request: Request, chat_id: int, wait_changes: int = 0):
                     log.debug(" Ожидание сокращено, поскольку чат занят пользователем %s ", status['actor'])
                     max_wait = 1
                 active = g.chat_manager.active_chat(user_id)
+                if active is None:
+                    active = 0
+
+                if active <= 0 < chat_id:  # автоматическая активация чата, если не выбран.
+                    active = chat_id
+                    g.chat_manager.select_chat(session_id, user_id, chat_id)
+
                 history = g.post_manager.get_history(chat_id, wait_changes == 1)
                 if history != {"chat_history": "no changes"}:
                     quotes = g.post_manager.get_quotes(history)
                     return {"posts": history, "chat_id": chat_id, "quotes": quotes, "status": status}
                 if active != chat_id:
-                    log.debug("Chat switch detected for user_id=%d, chat_id=%d, active=%d", user_id, chat_id, active)
+                    log.debug("Chat switch detected for user_id=%d, chat_id=%d, active=%d", user_id or -1, chat_id or -1, active or 0)
                     return {"chat_id": active, "posts": {"chat_history": "chat switch"}, "status": status}
                 await asyncio.sleep(0.1)
             return {"chat_id": chat_id, "posts": {"chat_history": "no changes"}, "quotes": {}, "status": status, "wait_loops": _loops, "elapsed": "%.1f" % _elps}
@@ -99,19 +107,14 @@ async def notify_chat_switch(request: Request):
     log.debug("Запрос POST /chat/notify_switch, IP=%s, Cookies=~%s", request.client.host, str(request.cookies))
     try:
         user_id = check_session(request)
+        session_id = request.cookies.get("session_id")
         data = await request.json()
         chat_id = data.get('chat_id')
         if not chat_id:
             log.info("Неверный параметр chat_id=%s для IP=%s", str(chat_id) if chat_id is not None else "None", request.client.host)
             raise HTTPException(status_code=400, detail="Missing chat_id")
-        session_id = request.cookies.get("session_id")
-        if session_id:
-            g.sessions_table.insert_or_replace({
-                'session_id': session_id,
-                'user_id': user_id,
-                'active_chat': chat_id
-            })
-            log.debug("Обновлён active_chat=%d для session_id=%s, user_id=%d", chat_id, session_id, user_id)
+
+        g.chat_manager.select_chat(session_id, user_id, chat_id)
         changes = g.post_manager.get_changes(chat_id)
         log.debug("Уведомление о смене чата chat_id=%d для user_id=%d, changes=~%s", chat_id, user_id, str(changes))
         return {"chat_history": "chat switch"}

@@ -41,12 +41,14 @@ SQL_TIMESTAMP6 = "%Y-%m-%d %H:%M:%S.%f"
 
 loggers = {}
 
-sessions_table = None
+sessions_table = None  # will be assumed DataTable object
+
 
 def get_logger(name, stdout=None):
     if name not in loggers:
         loggers[name] = BasicLogger(name, name, stdout)
     return loggers[name]
+
 
 def check_session(request: Request) -> int:
     """Проверяет сессию и возвращает user_id или вызывает HTTPException."""

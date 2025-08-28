@@ -9,9 +9,11 @@ VOLUME /app/logs
 # Установка Vue CLI
 RUN npm install -g @vue/cli
 RUN apt update && apt -y install nano inetutils-ping traceroute
-# Экспозит порта
-EXPOSE 8088
 
+RUN npm install -g @vue/cli-init
+RUN npm install mitt
+COPY frontend/rtm/start.sh /app/
 
 # Запуск
-CMD ["sh", "-c", "/app/frontend/start.sh"]
+CMD ["sh", "-c", "/app/start.sh"]
+
