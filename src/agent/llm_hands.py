@@ -1,14 +1,14 @@
 # /app/agent/llm_hands.py, updated 2025-07-27 15:30 EEST
 import re
-import globals
+import globals as g
 from processors.block_processor import CommandProcessor, ProcessResult
 from processors.shell_code import ShellCodeProcessor
-from processors.file_processors import FileEditProcessor, FileReplaceProcessor, FileMoveProcessor, FileUndoProcessor
-from processors.entity_processor import LookupSpanProcessor, LookupEntityProcessor, ReplaceSpanProcessor
+import processors.file_processors
+import processors.entity_processor
 from processors.patch_processor import CodePatchProcessor
 from processors.project_scan import ProjectScanProcessor
 
-log = globals.get_logger("llm_hands")
+log = g.get_logger("llm_hands")
 
 
 async def process_message(text, timestamp, user_name: str, rql: int = 0) -> dict:
@@ -33,22 +33,18 @@ async def process_message(text, timestamp, user_name: str, rql: int = 0) -> dict
         return {"handled_cmds": 0, "failed_cmds": 1, "processed_msg": text,
                 "agent_reply": f"@{user_name or 'Unknown'} <stdout>Error: Invalid input type</stdout>"}
 
-    processors = [
+    ps_list = [
         CommandProcessor(),
-        FileEditProcessor(),
         CodePatchProcessor(),
-        FileMoveProcessor(),
-        FileUndoProcessor(),
-        FileReplaceProcessor(),
         ShellCodeProcessor(),
-        LookupSpanProcessor(),
-        LookupEntityProcessor(),
-        ReplaceSpanProcessor(),
         ProjectScanProcessor()
     ]
-    log.info("Инициализировано %d процессоров для обработки сообщения", len(processors))
+    ps_list.extend(processors.file_processors.get_exported())
+    ps_list.extend(processors.entity_processor.get_exported())
 
-    tag_pattern = r'<(' + '|'.join(re.escape(processor.tag) for processor in processors) + r')\b'
+    log.info("Инициализировано %d процессоров для обработки сообщения", len(ps_list))
+
+    tag_pattern = r'<(' + '|'.join(re.escape(processor.tag) for processor in ps_list) + r')\b'
     log.debug("Сформирован динамический паттерн для тегов: %s", tag_pattern)
 
     processed_msg = text
@@ -59,7 +55,7 @@ async def process_message(text, timestamp, user_name: str, rql: int = 0) -> dict
     command_text = text.replace('@agent', '', 1).strip()
     have_tag = re.search(tag_pattern, command_text, re.DOTALL)
     if have_tag:
-        for processor in processors:
+        for processor in ps_list:
             result = await processor.process(command_text, user_name)
             processed_msg = result["processed_message"]
             if processed_msg:

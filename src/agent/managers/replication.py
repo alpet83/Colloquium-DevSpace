@@ -195,7 +195,11 @@ class ReplicationManager(LLMInteractor):
                 if agent_reply:
                     log.debug("Добавлен ответ агента для chat_id=%d: %s, проверка на репликацию", ci.chat_id, agent_reply[:50])
                     agent_post = g.post_manager.latest_post({'chat_id': ci.chat_id, 'user_id': g.AGENT_UID})
-                    await self._broadcast(ci.users, ci.chat_id, ci.exclude_id, rql=rql + 1, post_id=agent_post['post_id'])
+                    if isinstance(agent_post, dict) and agent_post.get('post_id'):
+                        await self._broadcast(ci.users, ci.chat_id, ci.exclude_id, rql=rql + 1, post_id=agent_post.get('post_id'))
+                    else:
+                        log.error("latest_post returned %s, can't broadcast response to LLM", str(agent_post))
+
             else:
                 log.warn("Ответ от LLM не получен для user_id=%d, rql=%d: %s", actor.user_id, rql, str(original_response))
                 g.post_manager.agent_post(

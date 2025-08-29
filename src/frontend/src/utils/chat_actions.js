@@ -127,16 +127,19 @@ export async function showFilePreview(component, fileId) {
       if (text) {
         component.filePreviewContent = text
         handleModal(component, 'filePreviewModal', true)      
-        const codeElement = document.getElementById('file-preview-code')
-        if (codeElement && window.hljs) {
+        const codeElement = document.getElementById('file-preview-code')  // <code id="file-preview-code">
+        if (codeElement && window.hljs) {          
           let lc = lang_class(component.fileStore.files, fileId)                  
-          codeElement.className = `framed-code ${lc}`
-          codeElement.removeAttribute('data-highlighted')
-          window.hljs.highlightElement(codeElement)
+          codeElement.className = `framed-code ${lc}`          
+          codeElement.removeAttribute('data-highlighted')          
+          window.hljs.highlightElement(codeElement)               
           log_msg('UI', `Highlighted code preview for file_id: ${fileId} with class: ${lc}`)
         }
-
         log_msg('ACTION', 'Action executed: show file preview')
+        info = document.getElementById('file-preview-info')
+        if (info) {
+          info.innerHTML = `Showing preview for file_id: ${fileId}`
+        }
       } else {
         log_error(component, new Error(`No content found for file_id: ${fileId}`), 'fetch file contents')
       }

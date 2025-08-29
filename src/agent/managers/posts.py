@@ -1,4 +1,5 @@
 # /app/agent/managers/posts.py, updated 2025-07-27 14:00 EEST
+import json
 import time
 import re
 import asyncio
@@ -252,6 +253,10 @@ class PostManager:
             order_by="id DESC"
         )
         result = {}
+        if not row:
+            log.error("latest_posts: Нет сообщений для ограничения %s ", json.dumps(filters))
+            return result
+
         if len(row) == len(keys):
             for i, k in enumerate(keys):
                 result[k] = row[i]

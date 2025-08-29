@@ -36,8 +36,8 @@
     </dialog>
     <dialog ref="filePreviewModal" id="filePreviewModal" class="file-preview-modal">
       <h3>Предпросмотр файла</h3>
-      <div class="file-preview"><code id="file-preview-code" class="framed-code">{{ filePreviewContent }}</code></div>
-      <button @click="doModal('filePreviewModal', false)">Закрыть</button>
+      <div class="file-preview"><code id="file-preview-code" class="framed-code" @click="handleCodeSelection">{{ filePreviewContent }}</code></div>
+      <button @click="doModal('filePreviewModal', false)">Закрыть</button><span id="file-preview-info">Showing preview </span>
     </dialog>
     <p v-if="chatStore.chatError || fileStore.chatError || authStore.backendError" class="error">
       {{ chatStore.chatError || fileStore.chatError || authStore.backendError }}
@@ -113,6 +113,18 @@
   import { formatDateTime } from '../utils/common'
   import { formatMessage, reformatMessages, checkAwaitedFiles } from '../utils/chat_format'
   
+  function lineFromOffset(lines, offset) {
+    let line = 1;
+    for (let i = 0; i < lines.length; i++) {
+      if (offset <= lines[i].length) {
+        return line;
+      }
+      offset -= (lines[i].length + 1); // +1 for \n
+      line++;
+    }
+    return line;
+  }
+
   export default defineComponent({
     name: 'ChatContainer',
     data() {
@@ -319,7 +331,31 @@
       handleSelectFile(fileId) {
         log_msg('ACTION', 'Called handleSelectFile: %d', fileId)
         handleSelectFile(this, fileId)
-      }
+      },
+      handleCodeSelection(event) {
+        const selection = window.getSelection();
+        if (!selection.rangeCount) return;
+        const range = selection.getRangeAt(0);
+        // const codeElement = document.getElementById('file-preview-code');
+        const selectedText = range.toString();
+        const text = this.filePreviewContent;
+        const lines = text.split('\n');
+        const startPos = text.indexOf(selectedText);
+        const endPos = startPos + selectedText.length;
+        let startLine = lineFromOffset(lines, startPos);
+        let endLine = lineFromOffset(lines, endPos);        
+
+        // Update file-preview-info
+        const infoElement = document.getElementById('file-preview-info');
+        if (startLine === endLine) {
+          
+          infoElement.textContent = `Line ${startLine}, chars ${startPos}-${endPos}`;
+        } else {
+          infoElement.textContent = `Lines ${startLine}-${endLine}`;
+        }
+
+        log_msg('UI', `Selected code lines: ${startLine}-${endLine}`);
+      }    
     }
   })
 </script>

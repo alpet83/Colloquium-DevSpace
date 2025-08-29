@@ -204,3 +204,7 @@ class LookupEntityProcessor(SpanProcessor):
 class ReplaceSpanProcessor(SpanProcessor):
     def __init__(self):
         super().__init__('replace_span')
+
+
+def get_exported() -> list:
+    return [LookupSpanProcessor(), LookupEntityProcessor(), ReplaceSpanProcessor()]
