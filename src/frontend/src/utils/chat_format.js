@@ -1,6 +1,7 @@
 //frontend/rtm/src/utils/chat_format.js, updated 2025-07-27 12:45 EEST
 import { log_msg, log_error } from './debugging'
 import { formatDateTime } from '../utils/common'
+import { marked } from 'https://cdn.jsdelivr.net/npm/marked@16.2.0/lib/marked.esm.js'
 
 export function escapeHtml(text) {
   const map = {
@@ -222,6 +223,13 @@ export function formatMessage(message, userName, timestamp, quotes, files, postI
     return result
   })
 
+  // Convert Markdown to HTML
+  try {
+    formatted = marked.parse(formatted, { sanitize: true, breaks: true })
+  } catch (error) {
+    log_error(null, error, 'markdown parsing')
+    formatted = escapeHtml(formatted) // Fallback to escaped text
+  }
   return formatted
 }
 

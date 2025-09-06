@@ -74,15 +74,21 @@ async def execute(shell_command: str, user_inputs: list, user_name: str, cwd: st
         log_dir = os.path.dirname(STDOUT_LOG_FILE)
         if not os.path.exists(log_dir):
             os.makedirs(log_dir)
+        extra_cmds = ''
+
+        # cwd = '/app/projects'
+        for env_file in ['.bashrc', '.profile']:
+            if os.path.exists(f"{cwd}/{env_file}"):
+                extra_cmds += f"source  {cwd}/{env_file}\n"
         # Создаём временный файл cmds.sh
         with open(script, 'w') as f:
-            f.write(f"#!/bin/bash\n{shell_command}\n")
+            f.write(f"#!/bin/bash\n{extra_cmds}\n{shell_command}\n")
         os.chmod(script, 0o755)
         os.chown(script, pwd.getpwnam('agent').pw_uid, -1)
         log.debug("Создан скрипт %s с владельцем agent", script)
 
         # Запускаем команду
-        cmd = ['su', 'agent', '-c', f'/app/projects/cmds.sh']
+        cmd = ['su', 'agent', '-c', f'{cwd}/cmds.sh']
         process = subprocess.Popen(
             cmd,
             cwd=cwd,

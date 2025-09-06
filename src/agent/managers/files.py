@@ -61,8 +61,8 @@ class FileManager:
                 )
                 log.debug("Добавлен префикс @ для ссылки: id=%d, file_name=%s", file_id, file_name)
                 file_name = f"@{file_name}"
-            if is_link and not self.link_valid(file_id) and project_id > 0:
-                log.warn("Для проекта %3d, @%5d: %s  более не существует на диске", project_id, file_id, file_name)
+            if is_link and not self.link_valid(file_id) and project_id is not None:
+                log.warn("Для проекта %3d, @%5d: %s  более не существует на диске", int(project_id), file_id, file_name)
 
     def _dedup(self, project_id: int = None):
         conditions = {'project_id': project_id} if project_id is not None else {}

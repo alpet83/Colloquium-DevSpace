@@ -199,10 +199,12 @@ class ProjectManager:
             log.debug("Сканирование файлов проекта в %s", project_dir)
             files = []
             for file_path in project_dir.rglob('*'):
-                if file_path.is_file() and not any(part.startswith('.') for part in file_path.parts):
+                # and not any(part.startswith('.') for part in file_path.parts)
+                if file_path.is_file():
                     relative_path = str(file_path.relative_to(project_dir)).replace('\\', '/')
+                    name = file_path.name   # for specific supported files like .env, .profile, .bashrc
                     extension = '.' + file_path.suffix.lower().lstrip('.') if file_path.suffix else ''
-                    if not SandwichPack.supported_type(extension):
+                    if not SandwichPack.supported_type(extension) and not SandwichPack.supported_type(name):
                         continue
                     files.append({
                         'file_name': relative_path,

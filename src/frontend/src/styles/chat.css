@@ -124,7 +124,7 @@
   margin: 0;
   flex-grow: 1;
   color: #eee;
-  white-space: pre-wrap;
+  white-space: normal;
 }
 @media (prefers-color-scheme: light) {
   .message pre {
@@ -341,7 +341,7 @@ dialog input, dialog textarea, dialog pre {
 }
 
 .framed-code {
-  max-height: 800px; /* ~50 строк при font-size: 14px, line-height: 1.15 */
+  max-height: 58vh; 
   overflow-y: auto;
   padding: 4px 6px;
   border-radius: 2px;
@@ -427,8 +427,32 @@ dialog input, dialog textarea, dialog pre {
   padding: 4px;
   color: #eee;
 }
+
+.hljs-ln-numbers {
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    -khtml-user-select: none;
+    -moz-user-select: none;
+    -ms-user-select: none;
+    user-select: none;
+
+    text-align: center;
+    color: #ccc;
+    border-right: 1px solid #CCC;
+    vertical-align: top;
+    padding-right: 5px;
+
+    /* your custom style here */
+}
+
+.hljs-ln-code {
+    padding-left: 10px;
+}
+
 @media (prefers-color-scheme: light) {
   .code-lines th, .code-lines td {
     color: #333;
   }
 }
+
+
