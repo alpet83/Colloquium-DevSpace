@@ -66,7 +66,7 @@ async def execute(shell_command: str, user_inputs: list, user_name: str, cwd: st
 
     log.debug("Выполнение команды: %s, user_inputs=%s, timeout=%d, cwd=%s",
               shell_command[:50], user_inputs, timeout, cwd)
-    script = '/app/projects/cmds.sh'
+    script = f'{cwd}/cmds.sh'
     msg = ''
     process = None
     try:
@@ -88,7 +88,7 @@ async def execute(shell_command: str, user_inputs: list, user_name: str, cwd: st
         log.debug("Создан скрипт %s с владельцем agent", script)
 
         # Запускаем команду
-        cmd = ['su', 'agent', '-c', f'{cwd}/cmds.sh']
+        cmd = ['su', 'agent', '-c', script]
         process = subprocess.Popen(
             cmd,
             cwd=cwd,

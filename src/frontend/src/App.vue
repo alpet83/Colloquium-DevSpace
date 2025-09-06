@@ -46,9 +46,11 @@ export default defineComponent({
 </script>
 
 <style>
-body {
+html, body {
   margin: 0;
+  height: 100%;
   background: #222;
+  overflow: hidden;
 }
 @media (prefers-color-scheme: light) {
   body {
@@ -57,8 +59,7 @@ body {
 }
 .app-container {
   display: flex;
-  flex-direction: column;
-  height: 95vh;
+  flex-direction: column;  
   background: #333;
 }
 @media (prefers-color-scheme: light) {
@@ -82,13 +83,8 @@ body {
   flex: 1;
   min-width: 800px;
 }
-.right-panel {
-  flex: 0 0 300px;
-  min-width: 30px;
-  max-width: 300px;
-  overflow-y: auto;
-  background: #333;
-}
+
+
 @media (prefers-color-scheme: light) {
   .right-panel {
     background: #f0f0f0;

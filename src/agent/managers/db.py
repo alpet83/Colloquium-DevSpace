@@ -119,7 +119,7 @@ class DataTable:
             insert_type = "INSERT OR IGNORE" if ignore else "INSERT"
             query = f"{insert_type} INTO {self.table_name} ({fields}) VALUES ({placeholders})"
             self.db.execute(query, values)
-            log.debug("Вставлено в %s: ~%s", self.table_name, str(values))
+            # log.debug("Вставлено в %s: %s", self.table_name, str(values))
             return self.db.fetch_one(f"SELECT last_insert_rowid()")[0]
         except Exception as e:
             log.excpt("Не удалось вставить в %s: %s", self.table_name, str(e))
@@ -131,7 +131,7 @@ class DataTable:
             placeholders = ", ".join([f":{key}" for key in values.keys()])
             query = f"INSERT OR REPLACE INTO {self.table_name} ({fields}) VALUES ({placeholders})"
             self.db.execute(query, values)
-            log.debug("Вставлено или заменено в %s: ~%s", self.table_name, str(values))
+            # log.debug("Вставлено или заменено в %s: %s", self.table_name, str(values))
             return self.db.fetch_one(f"SELECT last_insert_rowid()")[0]
         except Exception as e:
             log.excpt("Не удалось вставить или заменить в %s: %s", self.table_name, str(e))

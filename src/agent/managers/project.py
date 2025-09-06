@@ -1,5 +1,6 @@
 # /agent/managers/project.py, updated 2025-07-26 17:00 EEST
 import os
+import re
 from pathlib import Path
 from .db import Database, DataTable
 from lib.sandwich_pack import SandwichPack
@@ -192,17 +193,36 @@ class ProjectManager:
             return []
 
         try:
+            ignored_count = 0
             project_dir = self.projects_dir / project_name
             if not project_dir.exists():
                 log.warn("Директория проекта %s не существует", project_name)
                 return []
             log.debug("Сканирование файлов проекта в %s", project_dir)
             files = []
+            ignore_file = project_dir / '.scan_ignore.txt'
+            ignore_patterns = []
+            if ignore_file.exists():
+                with ignore_file.open('r') as f:
+                    ignore_patterns = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+                log.debug("Загружены %d паттернов из .scan_ignore.txt для %s", len(ignore_patterns), project_name)
+
             for file_path in project_dir.rglob('*'):
-                # and not any(part.startswith('.') for part in file_path.parts)
                 if file_path.is_file():
                     relative_path = str(file_path.relative_to(project_dir)).replace('\\', '/')
-                    name = file_path.name   # for specific supported files like .env, .profile, .bashrc
+                    ignore = False
+                    for pattern in ignore_patterns:
+                        try:
+                            if re.search(pattern, relative_path):
+                                ignore = True
+                                break
+                        except re.error as e:
+                            log.error("Некорректный regex паттерн '%s' в .scan_ignore.txt: %s", pattern, str(e))
+                            continue
+                    if ignore:
+                        ignored_count += 1
+                        continue
+                    name = file_path.name  # for specific supported files like .env, .profile, .bashrc
                     extension = '.' + file_path.suffix.lower().lstrip('.') if file_path.suffix else ''
                     if not SandwichPack.supported_type(extension) and not SandwichPack.supported_type(name):
                         continue
@@ -215,7 +235,7 @@ class ProjectManager:
                     reg_path = Path(project_name) / relative_path
                     if self.project_name == project_name:
                         globals.file_manager.add_file(reg_path, None, file_mod, self.project_id)
-            log.debug("Найдено %d поддерживаемых файлов в проекте %s", len(files), project_name)
+            log.debug("Найдено %d поддерживаемых файлов в проекте %s, пропущено из-за фильтрации %d", len(files), project_name, ignored_count)
             return files
         except Exception as e:
             log.excpt("Ошибка сканирования файлов проекта %s: %s", project_name, str(e))

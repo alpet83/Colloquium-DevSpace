@@ -79,9 +79,10 @@ export default defineComponent({
 </script>
 
 <style>
-.file-tree-container {
-  padding: 10px;
+.file-tree-container {  
+  padding: 10px;  
 }
+
 ul {
   list-style: none;
   padding: 0;

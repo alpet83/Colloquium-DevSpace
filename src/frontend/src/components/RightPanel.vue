@@ -11,8 +11,8 @@
         <option value="">Все файлы</option>
         <option v-for="project in projects" :value="project.id" :key="project.id">{{ project.project_name }}</option>
       </select>
-      <div class="search-settings">
-        <h3>Настройки поиска</h3>
+      <div class="search-settings" :class="{ collapsed: !isDisplayedSS }">
+        <h3><u @click="toggleDisplaySS">Настройки поиска {{ isDisplayedSS ? '' : '>>' }}</u></h3>        
         <label>Режим поиска:</label>
         <select v-model="searchSettings.mode">
           <option value="off">Отключён</option>
@@ -22,13 +22,19 @@
         <label>Источники:</label>
         <table class="sources" width="100%">
           <tr>
-            <td><input type="checkbox" v-model="searchSettings.sources" value="web" /> Web</td>
-            <td><input type="checkbox" v-model="searchSettings.sources" value="x" /> X</td>
-            <td><input type="checkbox" v-model="searchSettings.sources" value="news" /> News</td>
+            <td>Web</td>
+            <td>X</td>
+            <td>News</td>
+            <td>Макс.</td>
           </tr>
-        </table>
-        <label>Макс. источников:</label>
-        <input type="number" v-model="searchSettings.max_search_results" min="1" max="50" />
+          <tr>
+            <td><input type="checkbox" v-model="searchSettings.sources" value="web" /></td>
+            <td><input type="checkbox" v-model="searchSettings.sources" value="x" /></td>
+            <td><input type="checkbox" v-model="searchSettings.sources" value="news" /></td>
+            <td><input title="Макс. количество результатов" type="number" v-model="searchSettings.max_search_results" min="1" max="50"  />&nbsp;</td>
+          </tr>
+        </table>       
+        
         <button @click="saveSearchSettings">Сохранить</button>
       </div>
       <dialog ref="createProjectModal">
@@ -291,18 +297,27 @@ export default defineComponent({
     toggleCollapse() {
       this.isCollapsed = !this.isCollapsed
       log_msg('UI', 'Right panel collapsed:', this.isCollapsed)
+    },
+    toggleDisplaySS() {
+      this.isDisplayedSS = !this.isDisplayedSS
     }
   }
 })
 </script>
 
 <style>
+
 .right-panel {
-  width: 300px;
+  display: flex;
+  width: 330px;
+  height: 100vh;
   padding: 10px;
   background: #333;
   transition: width 0.3s;
+  overflow: revert;  
+  flex-direction: column;
 }
+
 .right-panel.collapsed {
   width: 30px;
 }
@@ -327,6 +342,10 @@ export default defineComponent({
     color: #333;
   }
 }
+.panel-content {
+  height: 98vh;
+}
+
 .right-panel .panel-content {
   display: flex;
   flex-direction: column;
@@ -334,9 +353,11 @@ export default defineComponent({
 .right-panel.collapsed .panel-content {
   display: none;
 }
+
+ 
 .right-panel select, .right-panel button:not(.toggle-btn) {
-  display: block;
-  width: 100%;
+  display: inline-block;
+  width: 120pt;
   margin: 10px 0;
   padding: 5px;
 }
@@ -366,8 +387,10 @@ export default defineComponent({
   margin-bottom: 10px;
 }
 .file-tree {
+  flex: 1 1 auto;
   margin-top: 10px;
-  color: #eee;
+  color: #eee;  
+  overflow: auto;    
 }
 @media (prefers-color-scheme: light) {
   .file-tree {
@@ -386,6 +409,7 @@ export default defineComponent({
 }
 .search-settings {
   margin-top: 20px;
+  flex: 0 0 auto;
 }
 .search-settings h3 {
   display: block;
@@ -402,12 +426,24 @@ export default defineComponent({
     color: #333;
   }
 }
-.search-settings select, .search-settings input[type="number"] {
-  width: 100%;
+
+.search-settings.collapsed {
+  height: 30px;
+  overflow: hidden;
+  position: relative;
+}
+
+.search-settings select {
+  width: 90pt;
+  padding: 5px;
+}
+
+.search-settings input[type="number"] {
+  width: 40px;
   padding: 5px;
 }
 .search-settings .sources {
-  width: 100%;
+  width: 80%;
   color: #cccc01;
 }
 .search-settings .sources td {
@@ -418,6 +454,7 @@ export default defineComponent({
 .search-settings .sources input[type="checkbox"] {
   margin: 0 5px 0 0;
   width: auto;
+  display: inline-block;
   vertical-align: middle;
 }
 .search-settings .sources label {

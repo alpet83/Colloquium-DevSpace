@@ -5,6 +5,7 @@
   flex-direction: column;
   justify-content: flex-end;
   min-width: 800px;
+  height: 99vh;
   background: #333;
 }
 .elapsed-time {  
@@ -105,8 +106,10 @@
 }
 .message-header {
   display: flex;  
-  justify-content: space-between;
+  justify-content: space-between;  
   width: 100%;
+  border-top: solid 1px #444;
+  white-space: nowrap;
 }
 .message-title {
   font-size: 0.8em;
@@ -120,14 +123,13 @@
 .message-content {
   width: 100%;
 }
-.message pre {
+.message div {
   margin: 0;
   flex-grow: 1;
-  color: #eee;
-  white-space: normal;
+  color: #eee;  
 }
 @media (prefers-color-scheme: light) {
-  .message pre {
+  .message div {
     color: #333;
   }
 }

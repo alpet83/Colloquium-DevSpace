@@ -43,7 +43,7 @@
           let current = projectId ? projectMap.get(projectId) || { project_name: parts[0], project_id: projectId, nodes: {} } : globalFiles;
 
           let node = current.nodes;
-          let parent = null
+          let parent = null;
           let path = '';
           for (let i = 0; i < parts.length - 1; i++) {
             const part = parts[i];
@@ -62,8 +62,29 @@
           }
         });
 
-        projectMap.forEach(project => trees.push(project));
+        // Sort nodes by type: directories first, then files
+        const sortNodes = (nodes) => {
+          const sorted = Object.entries(nodes).sort(([, a], [, b]) => {
+            if (a.type === 'directory' && b.type === 'file') return -1;
+            if (a.type === 'file' && b.type === 'directory') return 1;
+            return 0;
+          });
+          const result = {};
+          sorted.forEach(([name, node]) => {
+            result[name] = node;
+            if (node.type === 'directory') {
+              node.children = sortNodes(node.children);
+            }
+          });
+          return result;
+        };
+
+        projectMap.forEach(project => {
+          project.nodes = sortNodes(project.nodes);
+          trees.push(project);
+        });
         if (Object.keys(globalFiles.nodes).length > 0) {
+          globalFiles.nodes = sortNodes(globalFiles.nodes);
           trees.push(globalFiles);
         }
 
@@ -78,7 +99,7 @@
 
 <style>
   .file-manager {
-    width: 100%;
+    width: 100%;    
     padding: 10px;
     background: #333;
   }

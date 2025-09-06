@@ -46,22 +46,23 @@
       <div v-for="(msg, index) in formattedMessages" :key="msg.id"
            :class="['message', { 'admin-message': msg.user_id === 1, 'agent-message': msg.user_id === 2, 'reply-message': msg.reply_to }]"
            :id="'post_' + msg.id">
+
         <div class="message-header">
           <span class="message-title">{{ msg.user_name }} #[{{ msg.id }}] ({{ formatDateTime(msg.timestamp) }})
             <span v-if="msg.elapsed > 1" class="elapsed-time">&nbsp;думал {{ msg.elapsed.toFixed(1) }} секунд</span>
           </span>
           
-          <div v-if="authStore.userId === msg.user_id || authStore.userRole === 'admin'" class="message-actions">
+          <span v-if="authStore.userId === msg.user_id || authStore.userRole === 'admin'" class="message-actions">
             <button class="edit-post"
                     @click="doModal('editPostModal', true, { editMessageId: msg.id, editMessageContent: msg.message },
                     (comp) => { const textarea = comp.$refs.editPostModal.querySelector('textarea');
                     if (textarea) comp.autoResize({ target: textarea }, 'editMessageContent') })">✎</button>
             <button class="delete-post"
                     @click="chatStore.deletePost(msg.id, msg.user_id, authStore.userId, authStore.userRole)">X</button>
-          </div>
+          </span>
         </div>
         <div class="message-content">
-          <pre v-html="msg.formatted"></pre>
+          <div v-html="msg.formatted"></div>
         </div>
         <hr v-if="index < formattedMessages.length - 1" class="message-separator" />
       </div>

@@ -130,7 +130,7 @@ class PostManager:
             return {}
 
     def agent_post(self, chat_id: int, message: str, rql: int = 1, reply_to: int = None, elapsed: float = 0):
-        self.add_post(chat_id, g.AGENT_UID, message, rql, reply_to, elapsed)
+        return self.add_post(chat_id, g.AGENT_UID, message, rql, reply_to, elapsed)
 
     async def process_post(self, post: dict, allow_rep: bool):
         message = post['message']
