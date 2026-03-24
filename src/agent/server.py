@@ -105,6 +105,16 @@ def server_init():
         globals.chat_manager = ChatManager()
         globals.post_manager = PostManager(globals.user_manager)
         globals.project_manager = ProjectManager()
+        # Auto-load first project as default so processors work after restart
+        try:
+            first = globals.project_manager.projects_table.select_from(
+                columns=['id'], limit=1
+            )
+            if first:
+                globals.project_manager = ProjectManager(first[0][0])
+                log.info("Авто-загружен проект id=%d как дефолтный", first[0][0])
+        except Exception as _e:
+            log.warn("Не удалось авто-загрузить проект: %s", str(_e))
         globals.file_manager = FileManager()
         dbg = os.getenv("DEBUG_MODE", "0").lower()
         log.debug("ENV DEBUG_MODE=%s", dbg)

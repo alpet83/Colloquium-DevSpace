@@ -127,3 +127,31 @@ async def get_file_contents(request: Request, file_id: int = Query(...)):
     except Exception as e:
         g.handle_exception("Ошибка в GET /chat/file_contents", e)
         raise
+
+
+@router.get("/chat/index")
+async def get_chat_index(request: Request, chat_id: int = Query(...)):
+    """Returns the rich entity index (functions, classes, methods with file_id and line ranges)
+    built from the last LLM context assembly for this chat.
+    Format: sandwiches_index.jsl — see 'templates' field for column layout.
+    Returns 404 if no LLM response has been generated for this chat yet.
+    """
+    log.debug("Запрос GET /chat/index, IP=%s, chat_id=%d", request.client.host, chat_id)
+    try:
+        g.check_session(request)
+        fm = g.file_manager
+        file_id = fm.find(f".chat-meta/{chat_id}-index.json", project_id=0)
+        if not file_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No index for chat_id={chat_id}. Send a message first to build context."
+            )
+        file_data = fm.get_file(file_id)
+        if not file_data or not file_data.get('content'):
+            raise HTTPException(status_code=404, detail="Index file missing or empty")
+        return json.loads(file_data['content'])
+    except HTTPException:
+        raise
+    except Exception as e:
+        g.handle_exception("Ошибка в GET /chat/index", e)
+        raise

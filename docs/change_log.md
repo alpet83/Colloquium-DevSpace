@@ -1,5 +1,50 @@
 # Change Log
 
+## TODO / Known Issues
+
+### Per-session project isolation (priority: high)
+**Problem:** `g.project_manager` is a single global object shared across all users/sessions.
+`POST /project/select` replaces it globally → one user switching projects affects all other concurrent users ("quantum effects").
+After container restart `project_id=None` — nobody restores it, so `shell_code`, `code_file`, `code_patch` all fail until someone calls `/project/select` again.
+
+**Root cause trace:**
+- `routes/project_routes.py` line ~127: `g.project_manager = ProjectManager(project_id)` — global mutation
+- `managers/posts.py` `process_post()` reads `g.project_manager.project_name` — whatever was last set globally
+- `managers/sessions` table has `active_chat` but **no** `active_project`
+- `chats` table has **no** `project_id` column
+
+**Correct fix:**
+1. Add `project_id INTEGER` to `sessions` table (migration)
+2. `POST /project/select` saves to session row instead of mutating global
+3. `process_post(chat_id, user_id)` reads `project_id` from session row and constructs a **local** `ProjectManager(project_id)` passed as context — never mutates `g.project_manager`
+4. `g.project_manager` becomes a fallback/default only (project_id=1 or None)
+
+**Workaround until fixed:** call `POST /project/select {"project_id": 1}` after every container restart.
+*Partial fix applied 2026-03-24:* `server.py` auto-loads first project from DB on startup.
+
+---
+
+### File index consistency: DB file_id vs spack_agent index (priority: high)
+**Problem:** Two parallel namespaces for the same files:
+- `attached_files` table in SQLite → `file_id` (integer PK) — what agent, `code_patch`, `undo` use
+- `spack_agent` / sandwich-pack → sequential index numbers in `.jsl` sandwiches — what LLM context sees
+
+If a Copilot session uses `cq_list_files` to get DB IDs and tries to reference files by spack index numbers (or vice-versa), the result is undefined behaviour / wrong file patched.
+
+**Rule:** within one session, use **only one** identifier space. Since `code_patch` and `undo` require DB `file_id`, that is the canonical ID for MCP tool operations.
+
+**Correct fix:** expose the server-side index (the one built by `context_assembler.py` when preparing LLM context) as a REST endpoint:
+```
+GET /api/project/file_index?project_id=N
+```
+Returns: `[{"file_id": int, "file_name": str, "index_num": int, "tokens": int, ...}]`
+
+This way the MCP tool, LLM agents, and `cq_list_files` all see the same unified index with both ID and index_num in one response — no ambiguity.
+
+**Affected files:** `routes/project_routes.py`, `context_assembler.py`, `copilot_mcp_tool.py` (`cq_list_files` tool description)
+
+---
+
 ## Recent Changes (2025-07-20)
 ### File Preview
 - Added support for viewing file contents in the frontend by clicking @attach#<file_id> or @attached_file#<file_id> in ChatContainer.vue.

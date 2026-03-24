@@ -37,7 +37,24 @@ class ProjectScanProcessor(BlockProcessor):
             for file in files:
                 file_id = file['id']
                 file_name = file['file_name']
-                content = g.file_manager.get_file(file_id)['content']
+                try:
+                    file_data = g.file_manager.get_file(file_id)
+                except (UnicodeDecodeError, Exception) as e:
+                    log.debug("Skipping file %s (file_id=%d): %s", file_name, file_id, e)
+                    continue
+                if not file_data:
+                    continue
+                raw = file_data['content']
+                if raw is None:
+                    continue
+                if isinstance(raw, bytes):
+                    try:
+                        content = raw.decode('utf-8')
+                    except UnicodeDecodeError:
+                        log.debug("Skipping binary file %s (file_id=%d)", file_name, file_id)
+                        continue
+                else:
+                    content = raw
                 lines = content.splitlines()
                 matched_lines = []
                 for i, line in enumerate(lines, 1):

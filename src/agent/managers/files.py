@@ -140,8 +140,12 @@ class FileManager:
             if not file_path.exists():
                 log.warn("Реальный файл %s не существует", str(file_path))
                 return None
-            with file_path.open('r', encoding='utf-8') as f:
-                content = f.read()
+            try:
+                with file_path.open('r', encoding='utf-8') as f:
+                    content = f.read()
+            except UnicodeDecodeError:
+                log.debug("Skipping binary file %s (file_id=%d)", file_name, file_id)
+                return None
 
             if content is None:
                 log.error("Ошибка считывания реального файла %s", file_name)
@@ -416,4 +420,42 @@ class FileManager:
             return files
         else:
             return list(files.values())
+
+    def file_index(self, project_id: int = None, modified_since: int = None, file_ids: list = None, include_size: bool = False) -> list:
+        """Return lightweight file index (no content). Supports three combinable filters:
+        - project_id: restrict to one project
+        - modified_since: Unix timestamp, return only files with ts >= value
+        - file_ids: list of specific IDs to return
+        - include_size: if True, stat() each file for size_bytes (slower on Docker FS)
+        """
+        clauses = ['1=1']
+        params = {}
+        if project_id is not None:
+            clauses.append('project_id = :project_id')
+            params['project_id'] = project_id
+        if modified_since is not None:
+            clauses.append('ts >= :modified_since')
+            params['modified_since'] = modified_since
+        if file_ids:
+            safe_ids = ','.join(str(int(i)) for i in file_ids)  # int cast prevents injection
+            clauses.append(f'id IN ({safe_ids})')
+        query = (
+            f"SELECT id, file_name, ts, project_id FROM attached_files "
+            f"WHERE {' AND '.join(clauses)} ORDER BY file_name"
+        )
+        rows = self.db.fetch_all(query, params)
+        result = []
+        for row in rows:
+            file_id, file_name, ts, proj_id = row
+            clean_name = file_name.lstrip('@')
+            entry = {'id': file_id, 'file_name': clean_name, 'ts': ts, 'project_id': proj_id}
+            if include_size and file_name.startswith('@'):
+                try:
+                    fp = _qfn(clean_name, proj_id)
+                    if fp.exists():
+                        entry['size_bytes'] = fp.stat().st_size
+                except Exception:
+                    pass
+            result.append(entry)
+        return result
 

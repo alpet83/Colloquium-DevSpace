@@ -1,8 +1,11 @@
 # /agent/routes/project_routes.py, updated 2025-07-18 14:28 EEST
-from fastapi import APIRouter, Request, HTTPException
+from fastapi import APIRouter, Request, HTTPException, Query
 from managers.db import Database
 from managers.project import ProjectManager
+from context_assembler import ContextAssembler
+from lib.sandwich_pack import SandwichPack
 import globals as g
+import json
 from lib.basic_logger import BasicLogger
 
 router = APIRouter()
@@ -134,3 +137,94 @@ async def select_project(request: Request):
         raise
     except Exception as e:
         g.handle_exception("Ошибка сервера в POST /project/select: ", e)
+
+
+@router.get("/project/file_index")
+async def file_index(
+    request: Request,
+    project_id: int = Query(None),
+    modified_since: int = Query(None),
+    file_ids: str = Query(None),
+    include_size: int = Query(0),
+):
+    """Lightweight file index with optional filters.
+
+    Selectors (all optional, combinable):
+      project_id     — restrict to one project
+      modified_since — Unix timestamp; return only files with ts >= value
+      file_ids       — comma-separated DB file IDs, e.g. '42,57,103'
+      include_size   — set to 1 to include size_bytes (slower: stat() per file)
+    """
+    db = Database.get_database()
+    try:
+        session_id = request.cookies.get("session_id")
+        if not session_id:
+            raise HTTPException(status_code=401, detail="No session")
+        user_id = db.fetch_one(
+            'SELECT user_id FROM sessions WHERE session_id = :session_id',
+            {'session_id': session_id}
+        )
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid session")
+        project_id = None if not project_id or project_id <= 0 else project_id
+        ids = [int(x.strip()) for x in file_ids.split(',')] if file_ids else None
+        result = g.file_manager.file_index(project_id, modified_since, ids, include_size=bool(include_size))
+        log.debug(
+            "GET /project/file_index: project_id=%s modified_since=%s file_ids=%s include_size=%s → %d entries",
+            project_id, modified_since, file_ids, include_size, len(result)
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        g.handle_exception("Ошибка в GET /project/file_index", e)
+        raise
+
+
+@router.get("/project/code_index")
+async def code_index(
+    request: Request,
+    project_id: int = Query(...),
+):
+    """Build and return the rich entity index for a project on demand.
+
+    Runs context assembly (assemble_files → SandwichPack.pack) without any
+    LLM interaction. Returns the sandwiches_index.jsl format JSON with 'entities'
+    (functions, classes, methods) and 'filelist', keyed by file_id.
+    """
+    try:
+        g.check_session(request)
+        # Resolve project_name from DB
+        pm = ProjectManager(project_id)
+        pm.load()
+        if pm.project_name is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+        project_name = pm.project_name
+
+        # Get all file IDs for the project
+        file_entries = g.file_manager.file_index(project_id)
+        if not file_entries:
+            raise HTTPException(status_code=404, detail=f"No files in project {project_id}")
+        file_ids_set = {entry['id'] for entry in file_entries}
+
+        # Build ContentBlock list (same pipeline as LLM context assembly)
+        assembler = ContextAssembler()
+        file_map = {}
+        blocks = assembler.assemble_files(file_ids_set, file_map)
+        if not blocks:
+            raise HTTPException(status_code=404, detail="No supported files to index in project")
+
+        # Pack → index only (no token limit, compression to get entities)
+        packer = SandwichPack(project_name, max_size=10_000_000, compression=True)
+        result = packer.pack(blocks)
+
+        log.debug(
+            "GET /project/code_index: project_id=%d, project_name=%s, files=%d, blocks=%d, entities=%d",
+            project_id, project_name, len(file_ids_set), len(blocks), len(packer.entities)
+        )
+        return json.loads(result['index'])
+    except HTTPException:
+        raise
+    except Exception as e:
+        g.handle_exception("Ошибка в GET /project/code_index", e)
+        raise
