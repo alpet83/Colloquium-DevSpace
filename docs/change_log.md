@@ -1,5 +1,32 @@
 # Change Log
 
+## Recent Changes (2026-03-25)
+### PostgreSQL migration hardening
+- Fixed `GET /project/code_index` crash path for PostgreSQL:
+  - `HAVING count > 1` replaced with `HAVING COUNT(*) > 1` in file dedup query.
+  - Protected code index debug logging from `None` entities.
+- Fixed insert persistence bug in PostgreSQL path:
+  - `Database.fetch_one()` now commits after DML with `RETURNING`, preventing silent rollback on connection close.
+- Fixed chat and post runtime regressions after migration:
+  - Improved `create_chat` error handling and logging type safety.
+  - Added composite primary-key support in `DataTable.insert_or_replace` (required by `llm_context(actor_id, chat_id)`).
+  - Fixed nullable `file_id` handling in `FileManager.add_file` for `ON CONFLICT DO NOTHING` inserts.
+- Synced PostgreSQL identity sequences to `MAX(id)+1` and automated this step in migrator to prevent `duplicate key` errors.
+
+### MCP smoke validation
+- Verified MCP end-to-end after migration:
+  - `cq_list_projects`, `cq_select_project`, `cq_list_files` (all/filtered/include_size), chat create/send/wait/history.
+  - LLM reply path validated via mentions (`@gpt5n`, `@gpt5c`).
+
+### PostgreSQL backup operations
+- Added backup script: `src/postgres/backup_postgres.sh`.
+  - Uses `PGPASSWORD_FILE` secret fallback.
+  - Creates custom-format dump (`.dump`) and verifies it via `pg_restore --list`.
+  - Supports optional retention with `RETENTION_DAYS`.
+- Updated core image/runtime for backups:
+  - Added `postgresql-client` in `Dockerfile.core`.
+  - Mounted `./secrets:/run/secrets:ro` into `colloquium-core` in `docker-compose.yml`.
+
 ## TODO / Known Issues
 
 ### Per-session project isolation (priority: high)

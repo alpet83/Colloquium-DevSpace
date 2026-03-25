@@ -69,7 +69,7 @@ class FileManager:
         query = 'SELECT COUNT(*) as count, file_name, project_id FROM attached_files'
         if conditions:
             query += ' WHERE project_id = :project_id'
-        query += ' GROUP BY file_name, project_id HAVING count > 1'
+        query += ' GROUP BY file_name, project_id HAVING COUNT(*) > 1'
         duplicates = self.db.fetch_all(query, conditions)
         for count, file_name, proj_id in duplicates:
             file_ids = self.db.fetch_all(
@@ -171,7 +171,7 @@ class FileManager:
         file_name = str(file_name).lstrip("@").lstrip("/")
         if len(file_name) > 300:
             raise ValueError(f"Слишком длинное имя файла {len(file_name)}")
-        file_id = self.exists(file_name)
+        file_id = self.exists(file_name, project_id=project_id)
         if file_id:
             return file_id
         if timestamp is None:
@@ -184,7 +184,10 @@ class FileManager:
             timestamp = _mod_time(file_name, project_id)
 
         file_id = self._add_link(file_name, project_id, timestamp)
-        log.debug("Добавлен файл id=%d, file_name=%s, project_id=%s", file_id, file_name, str(project_id))
+        if file_id is None:
+            # On PostgreSQL with conflict-ignore, insert may return None; reuse existing link id.
+            file_id = self.find(file_name, project_id=project_id)
+        log.debug("Добавлен файл id=%s, file_name=%s, project_id=%s", str(file_id), file_name, str(project_id))
         return file_id
 
     def _add_link(self, file_name: str, project_id: int, timestamp):

@@ -43,11 +43,13 @@ class ReplicationManager(LLMInteractor):
             list: Список объектов ChatActor.
         """
         actors = []
-        rows = self.db.fetch_all('SELECT user_id, user_name, llm_class, llm_token FROM users')
+        rows = self.db.fetch_all('SELECT user_id, user_name, llm_class, llm_token, llm_reasoning_eff FROM users')
         log.debug("Загружено %d актёров из таблицы users: ~C95%s~C00", len(rows),
                   str([(row[0], row[1]) for row in rows]))
         for row in rows:
-            actor = ChatActor(row[0], row[1], row[2], row[3], g.post_manager)
+            actor = ChatActor(row[0], row[1], row[2], row[3],
+                              reasoning_eff=row[4] or "medium",
+                              post_manager=g.post_manager)
             actors.append(actor)
         return actors
 

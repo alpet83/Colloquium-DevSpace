@@ -34,6 +34,8 @@ async def create_chat(request: Request):
         description = data.get('description', 'New Chat')
         parent_msg_id = data.get('parent_msg_id')
         chat_id = g.chat_manager.create_chat(description, user_id, parent_msg_id)
+        if not isinstance(chat_id, int):
+            raise HTTPException(status_code=500, detail="Chat creation failed")
         log.debug("Создан чат chat_id=%d для user_id=%d", chat_id, user_id)
         return {"chat_id": chat_id}
     except Exception as e:

@@ -1,4 +1,26 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: cqds-postgres
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=postgres
+      - POSTGRES_PASSWORD=${DB_ROOT_PASSWD:?DB_ROOT_PASSWD is required}
+      - POSTGRES_ROOT_PASSWORD=${DB_ROOT_PASSWD:?DB_ROOT_PASSWD is required}
+      - POSTGRES_ROOT_PASSWORD_FILE=/run/secrets/cqds_db_password
+    volumes:
+      - ./data/pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./secrets:/run/secrets:ro
+    networks:
+      - devspace-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
   colloquium-core:
     build:
       context: .
@@ -11,13 +33,27 @@ services:
       - ./agent:/app/agent
       - ./tests:/app/tests
       - ../docs:/app/docs
+      - ./postgres:/app/postgres:ro
+      - ./secrets:/run/secrets:ro
     networks:
       - devspace-net
     depends_on:
-      - mcp-sandbox
+      mcp-sandbox:
+        condition: service_started
+      postgres:
+        condition: service_healthy
     environment:
       - PYTHONUNBUFFERED=1
       - DEBUG_MODE=True
+      - SQLITE_PATH=/app/data/multichat.db
+      - PGHOST=postgres
+      - PGPORT=5432
+      - PGUSER=cqds
+      - PGPASSWORD=${DB_ROOT_PASSWD:-}
+      - PGPASSWORD_FILE=/run/secrets/cqds_db_password
+      - PGDATABASE=cqds
+    command: >
+      sh -c "python /app/postgres/migrate_sqlite_to_postgres.py && python3 /app/agent/server.py"
     restart: on-failure
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/docs"]

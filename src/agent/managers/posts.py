@@ -212,7 +212,7 @@ class PostManager:
         try:
             timestamp = int(time.time())
             message = message.strip()
-            self.posts_table.insert_into({
+            post_id = self.posts_table.insert_into({
                 'chat_id': chat_id,
                 'user_id': user_id,
                 'message': message,
@@ -221,12 +221,8 @@ class PostManager:
                 'reply_to': reply_to,
                 'elapsed': elapsed
             })
-            post_id_row = self.posts_table.select_row(
-                columns=['last_insert_rowid()']
-            )
-            post_id = post_id_row[0] if post_id_row else None
             if post_id is None:
-                raise ValueError("Failed to retrieve last_insert_rowid()")
+                raise ValueError("Failed to retrieve inserted post id")
             self.add_change(chat_id, post_id, "add")
             log.debug("Сохранено сообщение post_id=%d, chat_id=%d, user_id=%d, rql=%d, reply_to=%s, message=%s",
                       post_id, chat_id, user_id, rql, str(reply_to), message[:50])

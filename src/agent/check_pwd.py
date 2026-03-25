@@ -1,15 +1,13 @@
 import hashlib
 import binascii
-import sqlite3
+from managers.db import Database
 
 password = "colloqium"
 client_hash = hashlib.sha256(password.encode()).hexdigest()
 print(f"Client hash: {client_hash}")
 
-conn = sqlite3.connect('/app/data/multichat.db')
-cur = conn.cursor()
-cur.execute("SELECT password_hash, salt FROM users WHERE user_name = 'admin'")
-row = cur.fetchone()
+db = Database.get_database()
+row = db.fetch_one("SELECT password_hash, salt FROM users WHERE user_name = :user_name", {"user_name": "admin"})
 if row:
     stored_hash, salt_hex = row
     salt = binascii.unhexlify(salt_hex)
@@ -19,4 +17,3 @@ if row:
     print(f"Match: {server_hash == stored_hash}")
 else:
     print("User 'admin' not found")
-conn.close()

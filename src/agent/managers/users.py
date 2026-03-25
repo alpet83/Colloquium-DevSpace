@@ -21,6 +21,7 @@ class UserManager:
                 "llm_token TEXT",
                 "tokens_limit INTEGER DEFAULT 131072",
                 "tokens_cost FLOAT",  # Стоимость за 1 млн. токенов
+                "llm_reasoning_eff TEXT DEFAULT 'medium'",  # low / medium / high / none
                 "password_hash TEXT",
                 "salt TEXT"
             ]
@@ -123,3 +124,10 @@ class UserManager:
             return 131072, 0.0
         tokens_limit, tokens_cost = row
         return tokens_limit or 131072, tokens_cost or 0.0
+
+    def get_user_reasoning_eff(self, user_id) -> str:
+        row = self.users_table.select_row(
+            columns=["llm_reasoning_eff"],
+            conditions={"user_id": user_id}
+        )
+        return row[0] if row and row[0] else "medium"

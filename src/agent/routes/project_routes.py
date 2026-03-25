@@ -217,10 +217,11 @@ async def code_index(
         # Pack → index only (no token limit, compression to get entities)
         packer = SandwichPack(project_name, max_size=10_000_000, compression=True)
         result = packer.pack(blocks)
+        entities_count = len(packer.entities) if packer.entities is not None else 0
 
         log.debug(
             "GET /project/code_index: project_id=%d, project_name=%s, files=%d, blocks=%d, entities=%d",
-            project_id, project_name, len(file_ids_set), len(blocks), len(packer.entities)
+            project_id, project_name, len(file_ids_set), len(blocks), entities_count
         )
         return json.loads(result['index'])
     except HTTPException:

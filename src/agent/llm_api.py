@@ -222,14 +222,19 @@ class XAIConnection(LLMConnection):
         self.name = "xAI"
         self.base_url = "https://api.x.ai/v1"
         self.search_sources = ["web", "x", "news"]
+        eff = config.get("reasoning_eff")
+        if eff and eff != "none" and "non-reasoning" not in self.model.lower():
+            self.model_params["reasoning"] = {"effort": eff}
 
 
 class OpenAIConnection(LLMConnection):
     def __init__(self, config: dict):
         super().__init__(config)
         self.name = "OpenAI"
-        self.model_params["reasoning_effort"] = "low"  # fast by default
         self.base_url = "https://api.openai.com/v1"
+        eff = config.get("reasoning_eff", "low")  # default low (fast) for OpenAI o-series
+        if eff and eff != "none":
+            self.model_params["reasoning_effort"] = eff
 
 
 class OpenRouterConnection(LLMConnection):
@@ -238,4 +243,8 @@ class OpenRouterConnection(LLMConnection):
         self.model = self.model.split(':')[-1]  # MATTER: llm_class have prefix 'openrouter:', need ignore it
         self.name = "OpenRouter"
         self.base_url = "https://openrouter.ai/api/v1"
+        eff = config.get("reasoning_eff")
+        # Keep conservative: add reasoning only for OpenAI models on OpenRouter.
+        if eff and eff != "none" and self.model.startswith("openai/"):
+            self.model_params["reasoning"] = {"effort": eff}
 

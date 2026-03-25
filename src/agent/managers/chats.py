@@ -151,11 +151,11 @@ class ChatManager:
                     'parent_msg_id': parent_msg_id
                 }
             )
-            log.debug("Создан чат chat_id=%d для user_id=%d", chat_id, user_id)
+            log.debug("Создан чат chat_id=%s для user_id=%d", str(chat_id), user_id)
             return chat_id
         except Exception as e:
             log.excpt("Ошибка создания чата для user_id=%d: ", user_id, e=e)
-            return {"error": str(e)}
+            raise
 
     def delete_chat(self, chat_id, user_id: int):
         try:

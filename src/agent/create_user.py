@@ -16,40 +16,40 @@ import hashlib
 import binascii
 import os
 import sys
-import sqlite3
-
-CHAT_DB = "/app/data/multichat.db"
+from managers.db import Database
 
 
-def create_user(username: str, password: str, db_path: str = CHAT_DB) -> bool:
+def _db():
+    return Database.get_database()
+
+
+def create_user(username: str, password: str) -> bool:
     salt = os.urandom(16)
     salt_hex = binascii.hexlify(salt).decode()
     server_hash = hashlib.sha256(salt + password.encode()).hexdigest()
 
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    cur.execute("SELECT user_id FROM users WHERE user_name = ?", (username,))
-    if cur.fetchone():
+    db = _db()
+    exists = db.fetch_one("SELECT user_id FROM users WHERE user_name = :user_name", {"user_name": username})
+    if exists:
         print(f"WARN: Пользователь '{username}' уже существует, пропуск")
-        conn.close()
         return False
-    cur.execute(
-        "INSERT INTO users (user_name, password_hash, salt) VALUES (?, ?, ?)",
-        (username, server_hash, salt_hex),
+
+    db.execute(
+        "INSERT INTO users (user_name, password_hash, salt) VALUES (:user_name, :password_hash, :salt)",
+        {
+            "user_name": username,
+            "password_hash": server_hash,
+            "salt": salt_hex,
+        },
     )
-    conn.commit()
     print(f"OK: Создан пользователь '{username}'")
-    conn.close()
     return True
 
 
-def delete_user(username: str, db_path: str = CHAT_DB) -> bool:
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM users WHERE user_name = ?", (username,))
-    deleted = cur.rowcount
-    conn.commit()
-    conn.close()
+def delete_user(username: str) -> bool:
+    db = _db()
+    result = db.execute("DELETE FROM users WHERE user_name = :user_name", {"user_name": username})
+    deleted = result.rowcount
     if deleted:
         print(f"OK: Пользователь '{username}' удалён")
         return True
@@ -58,12 +58,9 @@ def delete_user(username: str, db_path: str = CHAT_DB) -> bool:
         return False
 
 
-def list_users(db_path: str = CHAT_DB) -> None:
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, user_name FROM users ORDER BY user_id")
-    rows = cur.fetchall()
-    conn.close()
+def list_users() -> None:
+    db = _db()
+    rows = db.fetch_all("SELECT user_id, user_name FROM users ORDER BY user_id")
     if not rows:
         print("Пользователей нет")
         return
