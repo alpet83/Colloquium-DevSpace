@@ -13,16 +13,16 @@ db = Database.get_database()
 
 @router.post("/chat/upload_file")
 async def upload_file(request: Request, file: UploadFile = File(...), chat_id: int = Form(...), file_name: str = Form(...), project_id: int = Form(None)):
-    log.debug("Запрос POST /chat/upload_file, IP=%s, Cookies=~%s, project_id=%s", request.client.host, str(request.cookies), str(project_id))
+    log.debug(g.with_session_tag(request, "Запрос POST /chat/upload_file, IP=%s, Cookies=~%s, project_id=%s"), request.client.host, str(request.cookies), str(project_id))
     try:
         user_id = g.check_session(request)
         content = await file.read()
         timestamp = int(time.time())
         file_id = g.file_manager.add_file(file_name, content, timestamp, project_id)
         if not file_id:
-            log.error("Не удалось добавить файл file_name=%s, project_id=%s", file_name, str(project_id))
+            log.error(g.with_session_tag(request, "Не удалось добавить файл file_name=%s, project_id=%s"), file_name, str(project_id))
             raise HTTPException(status_code=500, detail="Failed to add file")
-        log.debug("Файл загружен для chat_id=%d, user_id=%d, file_name=%s, project_id=%s, file_id=%d",
+        log.debug(g.with_session_tag(request, "Файл загружен для chat_id=%d, user_id=%d, file_name=%s, project_id=%s, file_id=%d"),
                   chat_id, user_id, file_name, str(project_id), file_id)
         return {"status": "ok", "file_id": file_id}
     except Exception as e:
@@ -31,13 +31,13 @@ async def upload_file(request: Request, file: UploadFile = File(...), chat_id: i
 
 @router.post("/chat/update_file")
 async def update_file(request: Request, file: UploadFile = File(...), file_id: int = Form(...), project_id: int = Form(None)):
-    log.debug("Запрос POST /chat/update_file, IP=%s, Cookies=~%s, project_id=%s", request.client.host, str(request.cookies), str(project_id))
+    log.debug(g.with_session_tag(request, "Запрос POST /chat/update_file, IP=%s, Cookies=~%s, project_id=%s"), request.client.host, str(request.cookies), str(project_id))
     try:
         user_id = g.check_session(request)
         content = await file.read()
         timestamp = int(time.time())
         g.file_manager.update_file(file_id, content, timestamp, project_id)
-        log.debug("Файл file_id=%d обновлён для user_id=%d, project_id=%s",
+        log.debug(g.with_session_tag(request, "Файл file_id=%d обновлён для user_id=%d, project_id=%s"),
                   file_id, user_id, str(project_id))
         return {"status": "ok", "file_id": file_id}
     except Exception as e:
@@ -47,7 +47,7 @@ async def update_file(request: Request, file: UploadFile = File(...), file_id: i
 
 @router.post("/chat/move_file")
 async def move_file(request: Request):
-    log.debug("Запрос POST /chat/move_file, IP=%s, Cookies=~%s", request.client.host, str(request.cookies))
+    log.debug(g.with_session_tag(request, "Запрос POST /chat/move_file, IP=%s, Cookies=~%s"), request.client.host, str(request.cookies))
     try:
         user_id = g.check_session(request)
         data = await request.json()
@@ -55,13 +55,13 @@ async def move_file(request: Request):
         new_name = data.get('new_name')
         project_id = data.get('project_id')
         if not file_id or not new_name:
-            log.info("Неверные параметры file_id=%s, new_name=%s для IP=%s", str(file_id), str(new_name), request.client.host)
+            log.info(g.with_session_tag(request, "Неверные параметры file_id=%s, new_name=%s для IP=%s"), str(file_id), str(new_name), request.client.host)
             raise HTTPException(status_code=400, detail="Missing file_id or new_name")
         result = g.file_manager.move_file(file_id, new_name, project_id)
         if result <= 0:
-            log.error("Не удалось переименовать файл file_id=%d, new_name=%s, project_id=%s", file_id, new_name, str(project_id))
+            log.error(g.with_session_tag(request, "Не удалось переименовать файл file_id=%d, new_name=%s, project_id=%s"), file_id, new_name, str(project_id))
             raise HTTPException(status_code=500, detail=f"Failed to move file: code {result}")
-        log.debug("Файл file_id=%d переименован в %s для user_id=%d, project_id=%s", file_id, new_name, user_id, str(project_id))
+        log.debug(g.with_session_tag(request, "Файл file_id=%d переименован в %s для user_id=%d, project_id=%s"), file_id, new_name, user_id, str(project_id))
         return {"status": "ok", "file_id": file_id}
     except Exception as e:
         g.handle_exception("Ошибка в POST /chat/move_file", e)
@@ -70,16 +70,16 @@ async def move_file(request: Request):
 
 @router.post("/chat/delete_file")
 async def delete_file(request: Request):
-    log.debug("Запрос POST /chat/delete_file, IP=%s, Cookies=~%s", request.client.host, str(request.cookies))
+    log.debug(g.with_session_tag(request, "Запрос POST /chat/delete_file, IP=%s, Cookies=~%s"), request.client.host, str(request.cookies))
     try:
         user_id = g.check_session(request)
         data = await request.json()
         file_id = data.get('file_id')
         if not file_id:
-            log.info("Неверный параметр file_id=%s для IP=%s", str(file_id), request.client.host)
+            log.info(g.with_session_tag(request, "Неверный параметр file_id=%s для IP=%s"), str(file_id), request.client.host)
             raise HTTPException(status_code=400, detail="Missing file_id")
         g.file_manager.unlink(file_id)
-        log.debug("Файл file_id=%d удалён для user_id=%d", file_id, user_id)
+        log.debug(g.with_session_tag(request, "Файл file_id=%d удалён для user_id=%d"), file_id, user_id)
         return {"status": "ok"}
     except Exception as e:
         g.handle_exception("Ошибка в POST /chat/delete_file", e)
@@ -95,7 +95,7 @@ async def list_files(request: Request, project_id: int = Query(None)):
         files = fm.list_files(project_id, as_map=True)
         if project_id is not None:
             common = fm.list_files(sql_filter=('file_name', 'LIKE', '@.chat-meta%'), as_map=True)  # always list common index files
-            log.debug("Common files: %s", str(common))
+            log.debug(g.with_session_tag(request, "Common files: %s"), str(common))
             files.update(common)
         assert isinstance(files, dict)
         files = list(files.values())
@@ -108,21 +108,21 @@ async def list_files(request: Request, project_id: int = Query(None)):
 
 @router.get("/chat/file_contents")
 async def get_file_contents(request: Request, file_id: int = Query(...)):
-    log.debug("Запрос GET /chat/file_contents, IP=%s, Cookies=~%s, file_id=%d", request.client.host, str(request.cookies), file_id)
+    log.debug(g.with_session_tag(request, "Запрос GET /chat/file_contents, IP=%s, Cookies=~%s, file_id=%d"), request.client.host, str(request.cookies), file_id)
     try:
         user_id = g.check_session(request)
         file_data = g.file_manager.get_file(file_id)
         if not file_data or file_data['content'] is None:
-            log.warn("Файл file_id=%d не найден или не содержит данных", file_id)
+            log.warn(g.with_session_tag(request, "Файл file_id=%d не найден или не содержит данных"), file_id)
             raise HTTPException(status_code=404, detail="File not found or no content")
 
         file_name = str(file_data['file_name'])
         content = file_data.get('content', '')
         if file_name.lower().endswith('.json'):
-            log.debug("Возвращен парсинг JSON file_id=%d для user_id=%d, content_length=%d", file_id, user_id, len(file_data['content']))
-            return Response(json.loads(content), media_type="application/json")  # {"content": json.loads(content)}
+            log.debug(g.with_session_tag(request, "Возвращен парсинг JSON file_id=%d для user_id=%d, content_length=%d"), file_id, user_id, len(file_data['content']))
+            return Response(content, media_type="application/json")
         else:
-            log.debug("Возвращено содержимое файла file_id=%d для user_id=%d, content_length=%d", file_id, user_id, len(file_data['content']))
+            log.debug(g.with_session_tag(request, "Возвращено содержимое файла file_id=%d для user_id=%d, content_length=%d"), file_id, user_id, len(file_data['content']))
             return PlainTextResponse(content)   # поскольку это API, приходится изворачиваться
     except Exception as e:
         g.handle_exception("Ошибка в GET /chat/file_contents", e)
@@ -136,7 +136,7 @@ async def get_chat_index(request: Request, chat_id: int = Query(...)):
     Format: sandwiches_index.jsl — see 'templates' field for column layout.
     Returns 404 if no LLM response has been generated for this chat yet.
     """
-    log.debug("Запрос GET /chat/index, IP=%s, chat_id=%d", request.client.host, chat_id)
+    log.debug(g.with_session_tag(request, "Запрос GET /chat/index, IP=%s, chat_id=%d"), request.client.host, chat_id)
     try:
         g.check_session(request)
         fm = g.file_manager

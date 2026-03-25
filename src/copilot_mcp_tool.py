@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 import textwrap
 from typing import Any
 
@@ -45,6 +46,7 @@ class ColloquiumClient:
             timeout=30.0,
         )
         self._logged_in = False
+        self._sync_timeout: int = 0
 
     async def _ensure_login(self) -> None:
         if self._logged_in:
@@ -110,7 +112,7 @@ class ColloquiumClient:
         return resp.json()
 
     async def select_project(self, project_id: int) -> dict:
-        """Set the active project context on the server (global, until fixed)."""
+        """Set the active project context for the current authenticated session."""
         await self._ensure_login()
         resp = await self._client.post(
             "/api/project/select",
@@ -150,6 +152,92 @@ class ColloquiumClient:
         """Build and return the rich entity index for a project on demand via /api/project/code_index."""
         await self._ensure_login()
         resp = await self._client.get("/api/project/code_index", params={"project_id": project_id})
+        resp.raise_for_status()
+        return resp.json()
+
+    async def read_file(self, file_id: int) -> str:
+        """Fetch raw file contents by DB file_id via /api/chat/file_contents."""
+        await self._ensure_login()
+        resp = await self._client.get(
+            "/api/chat/file_contents",
+            params={"file_id": file_id},
+        )
+        resp.raise_for_status()
+        ct = resp.headers.get("content-type", "")
+        if "application/json" in ct:
+            return json.dumps(resp.json(), ensure_ascii=False, indent=2)
+        return resp.text
+
+    async def exec_command(
+        self, project_id: int, command: str, timeout: int = 30
+    ) -> dict:
+        """Execute a shell command in a project sandbox via /api/project/exec."""
+        await self._ensure_login()
+        resp = await self._client.post(
+            "/api/project/exec",
+            json={"project_id": project_id, "command": command, "timeout": timeout},
+            timeout=httpx.Timeout(timeout + 15.0),
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def smart_grep(
+        self,
+        project_id: int,
+        query: str,
+        mode: str = "code",
+        profile: str = "all",
+        time_strict: str | None = None,
+        is_regex: bool = False,
+        case_sensitive: bool = False,
+        max_results: int = 100,
+        context_lines: int = 0,
+        include_glob: list[str] | None = None,
+    ) -> dict:
+        """Search occurrences in project file sets via /api/project/smart_grep."""
+        await self._ensure_login()
+        payload: dict[str, Any] = {
+            "project_id": project_id,
+            "query": query,
+            "mode": mode,
+            "profile": profile,
+            "is_regex": is_regex,
+            "case_sensitive": case_sensitive,
+            "max_results": max_results,
+            "context_lines": context_lines,
+        }
+        if time_strict:
+            payload["time_strict"] = time_strict
+        if include_glob:
+            payload["include_glob"] = include_glob
+        resp = await self._client.post("/api/project/smart_grep", json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def replace_file(
+        self,
+        project_id: int,
+        file_id: int,
+        old: str,
+        new: str,
+        is_regex: bool = False,
+        case_sensitive: bool = True,
+        max_replacements: int = 0,
+    ) -> dict:
+        """Replace text in one file via /api/project/replace."""
+        await self._ensure_login()
+        resp = await self._client.post(
+            "/api/project/replace",
+            json={
+                "project_id": project_id,
+                "file_id": file_id,
+                "old": old,
+                "new": new,
+                "is_regex": is_regex,
+                "case_sensitive": case_sensitive,
+                "max_replacements": max_replacements,
+            },
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -405,6 +493,135 @@ TOOLS: list[Tool] = [
             "required": ["project_id"],
         },
     ),
+    Tool(
+        name="cq_read_file",
+        description=(
+            "Read the contents of a project file directly by its DB file_id. "
+            "Returns raw text (or formatted JSON for .json files). "
+            "Use cq_list_files or cq_get_code_index to look up file_ids. "
+            "Direct HTTP call — no LLM or chat round-trip required."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "file_id": {
+                    "type": "integer",
+                    "description": "DB file_id from cq_list_files or cq_get_code_index filelist.",
+                },
+            },
+            "required": ["file_id"],
+        },
+    ),
+    Tool(
+        name="cq_exec",
+        description=(
+            "Execute a shell command in a project's working directory and return stdout/stderr immediately. "
+            "Direct call — no LLM or chat round-trip required. "
+            "Use cq_list_projects to find project_id. "
+            "Returns {status, output, project}. Max timeout 300s."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "integer",
+                    "description": "Project ID (from cq_list_projects).",
+                },
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to execute (bash).",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Max execution time in seconds (1-300, default 30).",
+                    "default": 30,
+                },
+            },
+            "required": ["project_id", "command"],
+        },
+    ),
+    Tool(
+        name="cq_set_sync_mode",
+        description=(
+            "Enable or disable synchronous mode for cq_send_message. "
+            "When enabled (timeout > 0), cq_send_message automatically waits for the AI reply "
+            "up to 'timeout' seconds — eliminating the need for a separate cq_wait_reply call. "
+            "Set timeout=0 to disable (default). Recommended: timeout=60 for typical LLM responses."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "timeout": {
+                    "type": "integer",
+                    "description": "Seconds to wait for reply after send (0 = off, max 300).",
+                    "default": 0,
+                },
+            },
+            "required": ["timeout"],
+        },
+    ),
+    Tool(
+        name="cq_smart_grep",
+        description=(
+            "Search text or regex in predefined project file sets (code/logs/docs/all) in one direct call. "
+            "Useful for fast code/log analysis without LLM chat loop."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "integer", "description": "Project ID."},
+                "query": {"type": "string", "description": "Text or regex pattern to find."},
+                "mode": {
+                    "type": "string",
+                    "description": "File set preset: code | logs | docs | all (default: code).",
+                    "default": "code",
+                },
+                "profile": {
+                    "type": "string",
+                    "description": "Focus profile: all | backend | frontend | docs | infra | tests | logs (default: all).",
+                    "default": "all",
+                },
+                "time_strict": {
+                    "type": "string",
+                    "description": "Optional time filter, e.g. 'mtime>2026-03-25', 'mtime>=2026-03-25 21:00', 'ctime>1711390800'.",
+                },
+                "is_regex": {"type": "boolean", "description": "Interpret query as regex.", "default": False},
+                "case_sensitive": {"type": "boolean", "description": "Case-sensitive search.", "default": False},
+                "max_results": {"type": "integer", "description": "Maximum returned matches (1..500).", "default": 100},
+                "context_lines": {"type": "integer", "description": "Context lines before/after match (0..3).", "default": 0},
+                "include_glob": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional extra path globs to narrow search, e.g. ['src/**/*.py'].",
+                },
+            },
+            "required": ["project_id", "query"],
+        },
+    ),
+    Tool(
+        name="cq_replace",
+        description=(
+            "Replace text in one file directly by file_id, with optional regex mode. "
+            "No chat/LLM round-trip; safe for targeted mechanical edits."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "integer", "description": "Project ID."},
+                "file_id": {"type": "integer", "description": "DB file_id in the selected project."},
+                "old": {"type": "string", "description": "Old text or regex pattern."},
+                "new": {"type": "string", "description": "Replacement text."},
+                "is_regex": {"type": "boolean", "description": "Interpret old as regex.", "default": False},
+                "case_sensitive": {"type": "boolean", "description": "Case-sensitive matching.", "default": True},
+                "max_replacements": {
+                    "type": "integer",
+                    "description": "Limit number of replacements (0 = all).",
+                    "default": 0,
+                },
+            },
+            "required": ["project_id", "file_id", "old", "new"],
+        },
+    ),
 ]
 
 
@@ -442,6 +659,17 @@ async def run_server(client: ColloquiumClient) -> None:
                 chat_id = int(arguments["chat_id"])
                 message = str(arguments["message"])
                 await client.post_message(chat_id, message)
+                if client._sync_timeout > 0:
+                    deadline = time.monotonic() + client._sync_timeout
+                    while time.monotonic() < deadline:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        resp = await client.get_reply(chat_id, wait=True, timeout=min(remaining, 15.0))
+                        hist = resp.get("chat_history", "") if isinstance(resp, dict) else ""
+                        if hist not in ("no changes", "chat switch"):
+                            return _json_text(resp)
+                    return _text(f"Message sent to chat_id={chat_id} (sync: no reply in {client._sync_timeout}s)")
                 return _text(f"Message sent to chat_id={chat_id}")
 
             # ---- wait reply ----
@@ -516,6 +744,74 @@ async def run_server(client: ColloquiumClient) -> None:
                 project_id = int(arguments["project_id"])
                 index = await client.get_code_index(project_id)
                 return _json_text(index)
+
+            # ---- read file ----
+            elif name == "cq_read_file":
+                file_id = int(arguments["file_id"])
+                content = await client.read_file(file_id)
+                return _text(content)
+
+            # ---- exec command ----
+            elif name == "cq_exec":
+                project_id = int(arguments["project_id"])
+                command = str(arguments["command"])
+                timeout = int(arguments.get("timeout", 30))
+                result = await client.exec_command(project_id, command, timeout)
+                return _json_text(result)
+
+            # ---- set sync mode ----
+            elif name == "cq_set_sync_mode":
+                timeout = max(0, min(int(arguments.get("timeout", 0)), 300))
+                client._sync_timeout = timeout
+                if timeout > 0:
+                    return _text(f"Sync mode ON: cq_send_message will wait up to {timeout}s for AI reply.")
+                return _text("Sync mode OFF: cq_send_message returns immediately.")
+
+            # ---- smart grep ----
+            elif name == "cq_smart_grep":
+                project_id = int(arguments["project_id"])
+                query = str(arguments["query"])
+                mode = str(arguments.get("mode", "code"))
+                profile = str(arguments.get("profile", "all"))
+                time_strict = arguments.get("time_strict")
+                is_regex = bool(arguments.get("is_regex", False))
+                case_sensitive = bool(arguments.get("case_sensitive", False))
+                max_results = int(arguments.get("max_results", 100))
+                context_lines = int(arguments.get("context_lines", 0))
+                include_glob = arguments.get("include_glob")
+                result = await client.smart_grep(
+                    project_id=project_id,
+                    query=query,
+                    mode=mode,
+                    profile=profile,
+                    time_strict=str(time_strict) if time_strict is not None else None,
+                    is_regex=is_regex,
+                    case_sensitive=case_sensitive,
+                    max_results=max_results,
+                    context_lines=context_lines,
+                    include_glob=include_glob,
+                )
+                return _json_text(result)
+
+            # ---- replace in file ----
+            elif name == "cq_replace":
+                project_id = int(arguments["project_id"])
+                file_id = int(arguments["file_id"])
+                old = str(arguments["old"])
+                new = str(arguments["new"])
+                is_regex = bool(arguments.get("is_regex", False))
+                case_sensitive = bool(arguments.get("case_sensitive", True))
+                max_replacements = int(arguments.get("max_replacements", 0))
+                result = await client.replace_file(
+                    project_id=project_id,
+                    file_id=file_id,
+                    old=old,
+                    new=new,
+                    is_regex=is_regex,
+                    case_sensitive=case_sensitive,
+                    max_replacements=max_replacements,
+                )
+                return _json_text(result)
 
             else:
                 return _text(f"Unknown tool: {name}")

@@ -5,6 +5,7 @@ from pathlib import Path
 from lib.sandwich_pack import SandwichPack, estimate_tokens
 from context_assembler import ContextAssembler
 from managers.db import DataTable
+from managers.project import ProjectManager
 from chat_actor import ChatActor
 import globals as g
 import os
@@ -185,7 +186,9 @@ class LLMInteractor(ContextAssembler):
         last_post_id = 0
         log.debug("Упаковка %d блоков контента для rql=%d", len(ci.blocks), rql)
         try:
-            proj_man = g.project_manager
+            sid_project = g.chat_manager.active_project(actor.user_id)
+            self.active_project_id = sid_project
+            proj_man = ProjectManager.get(sid_project) if sid_project else g.project_manager
             project_name = proj_man.project_name
             packer = SandwichPack(project_name, max_size=1_000_000, compression=True)
             result = packer.pack(ci.blocks, users=ci.users)
@@ -276,6 +279,8 @@ class LLMInteractor(ContextAssembler):
                 response = await conn.call()
             if response:
                 usage = response.get('usage', {})
+                if not isinstance(usage, dict):
+                    usage = {}
                 used_tokens = usage.get('prompt_tokens', 0)
                 output_tokens = usage.get('completion_tokens', 0)
                 sources_used = usage.get('num_sources_used', 0)

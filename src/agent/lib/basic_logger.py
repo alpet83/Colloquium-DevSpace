@@ -8,6 +8,7 @@ import logging
 import traceback
 from datetime import datetime, timedelta
 from lib.esctext import colorize_msg, format_color, format_uncolor
+from lib.session_context import get_session_id
 
 class BasicLogger:
     # Уровни логирования
@@ -197,6 +198,19 @@ class BasicLogger:
     def _pr_time(self):
         return time.time()
 
+    def _format_session_id(self) -> str:
+        """
+        Get session_id from context and format with dark blue color.
+        Returns formatted string like '~C34abc123~C00 ' or empty string.
+        """
+        session_id = get_session_id()
+        if session_id:
+            # ~C34 = dark blue; ~C00 = reset color
+            # Truncate to 8 chars for readability, add space after for separation
+            sid_short = session_id[:8] if len(session_id) > 8 else session_id
+            return f"~C34{sid_short}~C00 "
+        return ""
+
     def _format_backtrace(self):
         return "".join(traceback.format_stack(limit=5)).strip()
 
@@ -250,18 +264,22 @@ class BasicLogger:
 
     def debug(self, fmt, *args):
         if self.verbosity >= self.DEBUG:
-            self.log_msg(f"~C93#DBG:~C00 {fmt}", *args, echo=logging.debug)
+            session_prefix = self._format_session_id()
+            self.log_msg(f"{session_prefix}~C93#DBG:~C00 {fmt}", *args, echo=logging.debug)
 
     def warn(self, fmt, *args):
         if self.verbosity >= self.WARN:
-            self.log_msg(f"~C31#WARN:~C00 {fmt}", *args, echo=logging.warning)
+            session_prefix = self._format_session_id()
+            self.log_msg(f"{session_prefix}~C31#WARN:~C00 {fmt}", *args, echo=logging.warning)
 
     def info(self, fmt, *args):
         if self.verbosity >= self.INFO:
-            self.log_msg(f"~C95#INFO:~C00 {fmt}", *args, echo=logging.info)
+            session_prefix = self._format_session_id()
+            self.log_msg(f"{session_prefix}~C95#INFO:~C00 {fmt}", *args, echo=logging.info)
 
     def error(self, fmt, *args):
-        self.log_msg(f"~C91#ERROR:~C00 {fmt}", *args, echo=logging.error)
+        session_prefix = self._format_session_id()
+        self.log_msg(f"{session_prefix}~C91#ERROR:~C00 {fmt}", *args, echo=logging.error)
 
     def excpt(self, fmt, *args, e=None, exc_info=None):
         if isinstance(e, Exception) and exc_info is None:
@@ -269,5 +287,6 @@ class BasicLogger:
         elif exc_info is None and e is None:
             self.error("expt: не указан параметр объекта исключения: %s", str(e))
         backtrace = "".join(traceback.format_exception(*exc_info)) if exc_info else self._format_backtrace()
-        self.log_msg(f"~C91#EXCEPTION:~C00 {fmt}", *args, echo=logging.error)
-        self.log_msg("~C31#TRACEBACK:~C00\n %s", backtrace)
+        session_prefix = self._format_session_id()
+        self.log_msg(f"{session_prefix}~C91#EXCEPTION:~C00 {fmt}", *args, echo=logging.error)
+        self.log_msg(f"{session_prefix}~C31#TRACEBACK:~C00\n %s", backtrace)

@@ -77,6 +77,29 @@ class ChatManager:
         })
         log.debug("Выбран активный чат id=%d для session_id=%s, user_id=%d", chat_id, session_id, user_id)
 
+    @staticmethod
+    def active_project(user_id, session_id=None) -> int | None:
+        uid = user_id
+        if isinstance(user_id, str):
+            uid = g.user_manager.get_user_id_by_name(user_id)
+        cond = {'user_id': int(uid)}
+        if session_id is not None:
+            cond['session_id'] = session_id
+        row = g.sessions_table.select_row(
+            columns=['active_project'],
+            conditions=cond)
+        return row[0] if row and row[0] is not None else None
+
+    @staticmethod
+    def select_project(session_id: str, user_id: int, project_id: int | None):
+        g.sessions_table.insert_or_replace({
+            'session_id': session_id,
+            'user_id': user_id,
+            'active_project': project_id
+        })
+        log.debug("Выбран активный проект id=%s для session_id=%s, user_id=%d",
+                  str(project_id), session_id, user_id)
+
     def chat_status(self, chat_id: int) -> dict:
         busy = self.chats_busy.get(chat_id, {})
         now = datetime.utcnow().timestamp()

@@ -1,5 +1,7 @@
 # /app/agent/llm_hands.py, updated 2025-07-27 15:30 EEST
 import re
+import os
+import asyncio
 import globals as g
 from processors.block_processor import CommandProcessor, ProcessResult
 from processors.shell_code import ShellCodeProcessor
@@ -11,7 +13,15 @@ from processors.project_scan import ProjectScanProcessor
 log = g.get_logger("llm_hands")
 
 
-async def process_message(text, timestamp, user_name: str, rql: int = 0) -> dict:
+def _env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+        return value if value > 0 else default
+    except Exception:
+        return default
+
+
+async def process_message(text, timestamp, user_name: str, rql: int = 0, project_id: int = None) -> dict:
     """Обрабатывает сообщение, применяя процессоры для специальных тегов.
 
     Args:
@@ -54,9 +64,20 @@ async def process_message(text, timestamp, user_name: str, rql: int = 0) -> dict
     failed_cmds = 0
     command_text = text.replace('@agent', '', 1).strip()
     have_tag = re.search(tag_pattern, command_text, re.DOTALL)
+    tag_timeout = _env_int("CQDS_TAG_TIMEOUT_SEC", 90)
     if have_tag:
         for processor in ps_list:
-            result = await processor.process(command_text, user_name)
+            try:
+                result = await asyncio.wait_for(
+                    processor.process(command_text, user_name, project_id=project_id),
+                    timeout=tag_timeout,
+                )
+            except asyncio.TimeoutError:
+                failed_cmds += 1
+                tmsg = f"@{user_name or 'Unknown'} <stdout>Timeout: processor <{processor.tag}> exceeded {tag_timeout}s</stdout>"
+                agent_reply.append(tmsg)
+                log.warn("Timeout in processor tag=%s after %ds", processor.tag, tag_timeout)
+                continue
             processed_msg = result["processed_message"]
             if processed_msg:
                 command_text = processed_msg

@@ -7,6 +7,7 @@ import hashlib
 import time
 import globals as g
 from pathlib import Path
+from managers.project import ProjectManager
 
 MCP_URL = "http://mcp-sandbox:8084"
 log = globals.get_logger("llm_proc")
@@ -58,7 +59,7 @@ class BlockProcessor:
         self.tag = tag
         self.replace = True
 
-    async def process(self, post_message: str, user_name: str = '@self'):
+    async def process(self, post_message: str, user_name: str = '@self', project_id: int = None):
         pattern = fr'<{self.tag}(?:\s+([^>]+))?>\s*([\s\S\n\r]*?)\s*</{self.tag}>'
         matches = list(re.finditer(pattern, post_message, flags=re.DOTALL))
         count = len(matches)
@@ -79,6 +80,8 @@ class BlockProcessor:
             try:
                 if attrs.get('user_name', None) is None:
                     attrs['user_name'] = user_name
+                if project_id is not None and 'project_id' not in attrs:
+                    attrs['project_id'] = project_id
                 result = await self.handle_block(attrs, block_code)
             except ProcessorError as e:
                 failed_cmds += 1
@@ -125,9 +128,10 @@ class BlockProcessor:
             log.error("Неверный формат file_id: %s", file_id)
             raise ProcessorError("Error: Invalid file_id format", user_name)
 
-    def get_file_data(self, file_id, user_name) -> tuple:
-        project_manager = globals.project_manager
-        project_id = project_manager.project_id if project_manager and hasattr(project_manager, 'project_id') else None
+    def get_file_data(self, file_id, user_name, project_id=None) -> tuple:
+        if project_id is None:
+            pm = globals.project_manager
+            project_id = pm.project_id if pm and hasattr(pm, 'project_id') else None
         if project_id is None:
             log.error("Нет активного проекта для обработки %s", self.tag)
             raise ProcessorError("Error: No active project selected", user_name)
@@ -188,7 +192,7 @@ class CommandProcessor(BlockProcessor):
         tokens = block_code.split(' ')
         command = tokens[0].lower() if tokens else ''
         command = command.strip()
-        proj_name = getattr(g.project_manager, "project_name", "default")
+        proj_name = getattr(ProjectManager.get(attrs.get('project_id') or getattr(globals.project_manager, 'project_id', None)), "project_name", "default")
         user_name = attrs.get('user_name', 'Unknown')
         tail = ' '.join(tokens[1:])
         log.debug("Обработка команды: %s с параметрами %s", command or "None", tail[:50])

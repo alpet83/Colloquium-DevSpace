@@ -3,6 +3,7 @@ import re, os
 import json
 import globals as g
 import hashlib
+from managers.project import ProjectManager
 from datetime import datetime
 from processors.block_processor import BlockProcessor, res_error, res_success, ProcessorError
 
@@ -36,9 +37,10 @@ class SpanProcessor(BlockProcessor):
         self.attrs = None
 
     def _load_file(self, file_id: int):
-        file_name, source, project_id = self.get_file_data(file_id, self.user_name)
+        pid = self.attrs.get('project_id') if isinstance(self.attrs, dict) else None
+        file_name, source, project_id = self.get_file_data(file_id, self.user_name, pid)
         self.file_lines = [''] + source.splitlines(keepends=True)
-        qfn = g.project_manager.locate_file(file_name, project_id)
+        qfn = ProjectManager.get(project_id).locate_file(file_name, project_id)
         mt = os.path.getmtime(qfn)
         self.file_mod_ts = datetime.utcfromtimestamp(mt).strftime(g.SQL_TIMESTAMP)
         return self.file_lines

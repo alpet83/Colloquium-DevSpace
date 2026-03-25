@@ -63,7 +63,7 @@ class LLMConnection:
             return self._process_result(result, http_status=code)
         else:
             return {"text": f"<llm_error>{_class} API Error: {e}\nhttp_status: {code}</llm_error>",
-                    "usage": 0,
+                    "usage": {},
                     "search_results": []}
 
     async def call(self) -> dict:
@@ -240,7 +240,8 @@ class OpenAIConnection(LLMConnection):
 class OpenRouterConnection(LLMConnection):
     def __init__(self, config: dict):
         super().__init__(config)
-        self.model = self.model.split(':')[-1]  # MATTER: llm_class have prefix 'openrouter:', need ignore it
+        model_value = (self.model or "").strip()
+        self.model = model_value[len("openrouter:"):] if model_value.lower().startswith("openrouter:") else model_value
         self.name = "OpenRouter"
         self.base_url = "https://openrouter.ai/api/v1"
         eff = config.get("reasoning_eff")

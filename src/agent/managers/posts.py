@@ -2,6 +2,7 @@
 import json
 import time
 import re
+import os
 import asyncio
 from managers.db import Database, DataTable
 import globals as g
@@ -139,6 +140,7 @@ class PostManager:
         user_id = post['user_id']
         post_id = post['post_id']
         rql = post['rql']
+        session_id = post.get('session_id')
 
         # Проверяем, является ли пользователь LLM
         user_row = self.users_table.select_row(
@@ -148,11 +150,20 @@ class PostManager:
         user_name = user_row[1] if user_row else 'unknown'
         t_start = time.time()
 
+        # Определяем активный проект строго в контексте текущей сессии.
+        project_id = g.chat_manager.active_project(user_id, session_id=session_id) if session_id else None
+        if project_id is None:
+            project_id = getattr(g.project_manager, 'project_id', None)
+
         # через пост-процессор не требуется пропускать лишь ответы агента
         if chat_id != 2:
             try:
                 pp = g.post_processor
-                result = await pp.process_response(chat_id, user_id, message, post_id)  # может занять много времени, если выполнять команды MCP
+                process_timeout = int(os.getenv("CQDS_POST_PROCESS_TIMEOUT_SEC", "240"))
+                result = await asyncio.wait_for(
+                    pp.process_response(chat_id, user_id, message, post_id, project_id=project_id),
+                    timeout=process_timeout,
+                )  # может занять много времени, если выполнять команды MCP
                 log.debug("Результат process_response: handled_cmds=%d, failed_cmds=%d, processed_msg=%s",
                           result["handled_cmds"], result["failed_cmds"], result["processed_msg"][:50])
                 if isinstance(result, dict):
@@ -163,6 +174,9 @@ class PostManager:
                         agent_message = f"@{user_name} {agent_message or 'Unknown error'}"
                 else:
                     raise ValueError("Unexpected process_response result type: %s" % type(result))
+            except asyncio.TimeoutError:
+                log.warn("Timeout in post_processor for chat_id=%d, user_id=%d", chat_id, user_id)
+                agent_message = f"@{user_name} Timeout: message processing exceeded configured limit"
             except Exception as e:
                 log.excpt("Ошибка обработки сообщения в post_processor", e=e)
                 agent_message = f"@{user_name} Error processing message: {str(e)}"
@@ -194,7 +208,8 @@ class PostManager:
                 "processed_msg": message, "agent_reply": agent_message,
                 "status": "ok"}
 
-    def add_post(self, chat_id: int, user_id: int, message: str, rql: int = 0, reply_to: int = None, elapsed: float = 0) -> dict:
+    def add_post(self, chat_id: int, user_id: int, message: str, rql: int = 0, reply_to: int = None,
+                 elapsed: float = 0, session_id: str | None = None) -> dict:
         """Добавляет сообщение, обрабатывает его через post_processor и сохраняет ответ агента, если есть.
 
         Args:
@@ -234,7 +249,8 @@ class PostManager:
                 "message": message,
                 "reply_to": reply_to,
                 "elapsed": elapsed,
-                "rql": rql
+                "rql": rql,
+                "session_id": session_id
             }
             return post
         except Exception as e:

@@ -49,7 +49,6 @@ services:
       - PGHOST=postgres
       - PGPORT=5432
       - PGUSER=cqds
-      - PGPASSWORD=${DB_ROOT_PASSWD:-}
       - PGPASSWORD_FILE=/run/secrets/cqds_db_password
       - PGDATABASE=cqds
     command: >

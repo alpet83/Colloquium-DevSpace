@@ -1,6 +1,7 @@
 import re
 import aiohttp
 import globals
+from managers.project import ProjectManager
 from lib.execute_commands import execute
 from processors.block_processor import BlockProcessor, res_error, res_success, MCP_URL
 
@@ -22,8 +23,9 @@ class ShellCodeProcessor(BlockProcessor):
 
         timeout = int(attrs.get('timeout', 300))
         mcp = attrs.get('mcp', 'true').lower() == 'true'
-        project_manager = globals.project_manager
-        project_name = project_manager.project_name if project_manager and hasattr(project_manager, 'project_name') else None
+        proj_id = attrs.get('project_id', None)
+        pm = ProjectManager.get(proj_id) if proj_id else globals.project_manager
+        project_name = pm.project_name if pm and hasattr(pm, 'project_name') else None
 
         if mcp and not project_name:
             log.error("Отсутствует project_name для MCP команды")

@@ -1,5 +1,7 @@
 # /agent/managers/post_processor.py, updated 2025-07-27 09:44 EEST
 import re
+import os
+import asyncio
 from datetime import datetime
 import globals as g
 from managers.chats import ChatLocker
@@ -9,11 +11,24 @@ from llm_hands import process_message
 log = g.get_logger("postproc")
 
 
-async def _hands_work(chat_id, user_id: int, response: str):
+async def _hands_work(chat_id, user_id: int, response: str, project_id: int = None):
     # Проверяем команды для llm_hands
     user_name = g.user_manager.get_user_name(user_id)
+    hands_timeout = int(os.getenv("CQDS_HANDS_TIMEOUT_SEC", "180"))
     with ChatLocker(chat_id, 'agent'):
-        hands_response = await process_message(response, int(datetime.utcnow().timestamp()), user_name)
+        try:
+            hands_response = await asyncio.wait_for(
+                process_message(response, int(datetime.utcnow().timestamp()), user_name, project_id=project_id),
+                timeout=hands_timeout,
+            )
+        except asyncio.TimeoutError:
+            log.warn("Timeout in llm_hands for chat_id=%d user_id=%d after %ds", chat_id, user_id, hands_timeout)
+            return {
+                "handled_cmds": 0,
+                "failed_cmds": 1,
+                "processed_msg": response,
+                "agent_reply": f"@{user_name} Timeout: hands processing exceeded {hands_timeout}s"
+            }
         if hands_response and (hands_response["handled_cmds"] > 0 or hands_response["failed_cmds"] > 0):
             log.debug("llm_hands response: handled_cmds=%d, failed_cmds=%d, processed_msg=%s, agent_reply=%s",
                       hands_response["handled_cmds"], hands_response["failed_cmds"],
@@ -38,7 +53,7 @@ class PostProcessor:
         )
         log.debug("Инициализирован PostProcessor с таблицей quotes")
 
-    async def process_response(self, chat_id: int, user_id: int, response: str, post_id: int = None) -> dict:
+    async def process_response(self, chat_id: int, user_id: int, response: str, post_id: int = None, project_id: int = None) -> dict:
         """Обрабатывает ответ LLM, извлекая цитаты, команды редактирования, файлы и патчи, вызывая llm_hands."""
         log.debug("Обработка ответа для chat_id=%d, user_id=%d, post_id=%s, response_type=%s, response=%s",
                   chat_id, user_id, str(post_id) if post_id is not None else "None", type(response), response[:50])
@@ -119,7 +134,7 @@ class PostProcessor:
         processed_response = re.sub(r'<quote>(.*?)</quote>', save_quote, response, flags=re.DOTALL)
         processed_response = re.sub(r'@quote#(\d+)', replace_quote_ref, processed_response)
 
-        hr = await _hands_work(chat_id, user_id, response)
+        hr = await _hands_work(chat_id, user_id, response, project_id=project_id)
         if isinstance(hr, dict):
             log.debug("Hands returns fields %s", str(hr.keys()))
             processed_response = hr.get('processed_msg') or processed_response

@@ -48,6 +48,15 @@ app.add_middleware(
 
 
 @app.middleware("http")
+async def session_context_middleware(request: Request, call_next):
+    """Store short session tag in request.state for request-scoped logging."""
+    session_id = request.cookies.get('session_id')
+    request.state.session_tag = str(session_id)[:8] if session_id else ""
+    response = await call_next(request)
+    return response
+
+
+@app.middleware("http")
 async def log_requests_and_exceptions(request: Request, call_next):
     # NO_LOG: NEVER LOG HERE, NEVER AGAIN, IS PROHIBITED!
     try:
@@ -94,7 +103,8 @@ def server_init():
                                            template=[
                                                'session_id TEXT PRIMARY KEY',
                                                'user_id INTEGER',
-                                               'active_chat INTEGER'
+                                               'active_chat INTEGER',
+                                               'active_project INTEGER'
                                            ]
                                            )
 

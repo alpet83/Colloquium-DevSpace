@@ -13,7 +13,8 @@ log = globals.get_logger("fileman")
 
 def _qfn(file_name, project_id: int):
     file_name = str(file_name).lstrip("@").lstrip("/")
-    return globals.project_manager.locate_file(file_name, project_id)
+    pm = ProjectManager.get(project_id) if project_id is not None else globals.project_manager
+    return pm.locate_file(file_name, project_id)
 
 
 def _mod_time(file_name: str, project_id: int):
@@ -291,12 +292,6 @@ class FileManager:
             log.debug("Удалена запись файла id=%d через unlink", file_id)
 
     def backup_file(self, file_id: int):
-        proj_man = globals.project_manager
-        proj_dir = proj_man.projects_dir
-        if proj_dir is None:
-            log.warn("Попытка бэкапа без выбранного проекта")
-            return None
-
         row = self.files_table.select_row(
             conditions={'id': file_id},
             columns=['file_name', 'content', 'project_id'])
@@ -308,6 +303,11 @@ class FileManager:
             file_name, content, project_id = row
         except ValueError as e:
             log.error("Ошибка распаковки результата запроса в backup_file: id=%d, row=%s, error=%s", file_id, str(row), str(e))
+            return None
+        proj_man = ProjectManager.get(project_id) if project_id is not None else globals.project_manager
+        proj_dir = proj_man.projects_dir
+        if proj_dir is None:
+            log.warn("Попытка бэкапа без выбранного проекта")
             return None
         if not content and not file_name.startswith('@'):
             log.warn("Файл id=%d не является ссылкой, бэкап невозможен", file_id)

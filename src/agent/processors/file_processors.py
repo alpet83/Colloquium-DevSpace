@@ -5,6 +5,7 @@ import globals as g
 from datetime import datetime
 from pathlib import Path
 from processors.block_processor import BlockProcessor, res_error, res_success, ProcessorError
+from managers.project import ProjectManager
 
 log = g.get_logger("llm_proc")
 
@@ -31,7 +32,8 @@ class FileEditProcessor(BlockProcessor):
             return res_error(user_name, "Error: Missing file name")
 
         log.debug("Обработка code_file: file_name=%s, content_length=%d", file_name, len(block_code))
-        proj_man = g.project_manager
+        proj_id_attr = attrs.get('project_id', None)
+        proj_man = ProjectManager.get(proj_id_attr) if proj_id_attr else g.project_manager
         project_id = proj_man.project_id if proj_man and hasattr(proj_man, 'project_id') else None
         if project_id is None:
             log.error("Нет активного проекта для обработки code_file")
@@ -108,8 +110,8 @@ class FileUndoProcessor(BlockProcessor):
                 raise ProcessorError("Error: Invalid time_back format", user_name)
 
             log.debug("Processing undo for file_id=%d, time_back=%d", file_id, time_back)
-            file_name, source, project_id = self.get_file_data(file_id, user_name)
-            proj_man = g.project_manager
+            file_name, source, project_id = self.get_file_data(file_id, user_name, attrs.get('project_id'))
+            proj_man = ProjectManager.get(project_id) if project_id else g.project_manager
             if proj_man.projects_dir is None:
                 raise ProcessorError("Error: No project selected for undo file", user_name)
             proj_dir = str(proj_man.projects_dir)
@@ -231,8 +233,8 @@ class FileMoveProcessor(BlockProcessor):
             log.debug("Processing move_file: file_id=%d, new_name=%s, overwrite=%s",
                       file_id, new_name, overwrite)
 
-            file_name, _, project_id = self.get_file_data(file_id, user_name)
-            proj_man = g.project_manager
+            file_name, _, project_id = self.get_file_data(file_id, user_name, attrs.get('project_id'))
+            proj_man = ProjectManager.get(project_id) if project_id else g.project_manager
             if proj_man.projects_dir is None:
                 raise ProcessorError("Error: No project selected for move file", user_name)
             project_name = proj_man.project_name

@@ -50,6 +50,29 @@ def get_logger(name, stdout=None):
     return loggers[name]
 
 
+def request_session_tag(request: Request) -> str:
+    """Return short session tag (8 chars) for request-bound logging."""
+    if request is None:
+        return ""
+    state = getattr(request, 'state', None)
+    if state is not None:
+        tag = getattr(state, 'session_tag', None)
+        if tag:
+            return str(tag)
+    session_id = request.cookies.get("session_id") if request.cookies else None
+    if not session_id:
+        return ""
+    return str(session_id)[:8]
+
+
+def with_session_tag(request: Request, fmt: str) -> str:
+    """Prefix log format with dark-blue short session tag, if available."""
+    tag = request_session_tag(request)
+    if not tag:
+        return fmt
+    return f"~C34{tag}~C00 {fmt}"
+
+
 def check_session(request: Request) -> int:
     """Проверяет сессию и возвращает user_id или вызывает HTTPException."""
     log = get_logger('session')
