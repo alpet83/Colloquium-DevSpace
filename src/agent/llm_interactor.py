@@ -22,7 +22,28 @@ class ContextInput:
         self.debug_mode = False
 
 
-def _load_pre_prompt() -> str:
+def _normalize_user_name(user_name: str) -> str:
+    if not user_name:
+        return "user"
+
+    # Handle common visually-confusable characters in nicknames.
+    alias = user_name.replace("с", "c").replace("С", "c")
+    alias = alias.lower().strip()
+    normalized = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in alias)
+    normalized = normalized.strip("._-")
+    return normalized or "user"
+
+
+def _resolve_pre_prompt_path(user_name: str = None) -> str:
+    if user_name:
+        normalized = _normalize_user_name(user_name)
+        user_path = f"/app/docs/llm_pre_prompt-{normalized}.md"
+        if os.path.exists(user_path):
+            return user_path
+    return g.PRE_PROMPT_PATH
+
+
+def _load_pre_prompt(user_name: str = None) -> tuple[str, str]:
     """Загружает пре-промпт из файла.
 
     Returns:
@@ -32,12 +53,14 @@ def _load_pre_prompt() -> str:
         FileNotFoundError: Если файл пре-промпта не найден.
     """
     try:
-        with open(g.PRE_PROMPT_PATH, 'r', encoding='utf-8-sig') as f:
+        pre_prompt_path = _resolve_pre_prompt_path(user_name)
+        with open(pre_prompt_path, 'r', encoding='utf-8-sig') as f:
             pre_prompt = f.read()
-        log.debug("Загружен пре-промпт из %s", g.PRE_PROMPT_PATH)
-        return pre_prompt
+        log.debug("Загружен пре-промпт из %s", pre_prompt_path)
+        return pre_prompt, pre_prompt_path
     except FileNotFoundError as e:
-        g.handle_exception("Файл пре-промпта %s не найден" % g.PRE_PROMPT_PATH, e=e)
+        missing = _resolve_pre_prompt_path(user_name)
+        g.handle_exception("Файл пре-промпта %s не найден" % missing, e=e)
         raise
 
 
@@ -47,7 +70,7 @@ class LLMInteractor(ContextAssembler):
         """Инициализирует LLMInteractor с загрузкой пре-промпта и настройкой таблицы llm_usage."""
         super().__init__()
         self.debug_mode = debug_mode
-        self.pre_prompt = _load_pre_prompt()
+        self.pre_prompt, self.pre_prompt_path = _load_pre_prompt()
         self.last_sandwich_idx = None
         self.entities_idx = {}   # index per chat
         self.tokens_limit = 131072
@@ -81,7 +104,7 @@ class LLMInteractor(ContextAssembler):
         stats.append({
             "block_type": ":pre_prompt",
             "block_id": "N/A",
-            "file_name": g.PRE_PROMPT_PATH,
+            "file_name": self.pre_prompt_path,
             "tokens": pre_prompt_tokens
         })
         index_tokens = estimate_tokens(index_json)
@@ -214,6 +237,7 @@ class LLMInteractor(ContextAssembler):
             str: Ответ LLM или сообщение об ошибке.
         """
         actor = ci.actor
+        self.pre_prompt, self.pre_prompt_path = _load_pre_prompt(actor.user_name)
         tokens_limit, tokens_cost = g.user_manager.get_user_token_limits(actor.user_id)
         context = self.build_context(ci, rql)
         if not context:

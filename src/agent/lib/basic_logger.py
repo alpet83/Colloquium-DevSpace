@@ -117,11 +117,17 @@ class BasicLogger:
             os.unlink(path)
             return False
 
-        if os.path.exists(syml):
-            exist = os.readlink(syml) if os.path.islink(syml) else syml
+        if os.path.lexists(syml):
+            try:
+                exist = os.readlink(syml) if os.path.islink(syml) else syml
+            except OSError:
+                exist = syml
             if os.path.isfile(path) or path != exist:
                 logging.info("%s => %s", syml, exist)
-                os.unlink(syml)
+                try:
+                    os.unlink(syml)
+                except FileNotFoundError:
+                    pass
             else:
                 return True
 
@@ -129,7 +135,7 @@ class BasicLogger:
         attempts = 0
         while attempts < 5:
             try:
-                if os.path.exists(syml):
+                if os.path.lexists(syml):
                     os.unlink(syml)
                 os.symlink(path, syml)
                 if os.readlink(syml) == path:

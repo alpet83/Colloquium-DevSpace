@@ -116,9 +116,10 @@ def server_init():
         except Exception as _e:
             log.warn("Не удалось авто-загрузить проект: %s", str(_e))
         globals.file_manager = FileManager()
-        dbg = os.getenv("DEBUG_MODE", "0").lower()
-        log.debug("ENV DEBUG_MODE=%s", dbg)
-        globals.replication_manager = ReplicationManager(debug_mode=(dbg != "0"))
+        dbg = os.getenv("DEBUG_MODE", "0").strip().lower()
+        debug_enabled = dbg in ("1", "true", "yes", "on")
+        log.debug("ENV DEBUG_MODE=%s parsed=%s", dbg, str(debug_enabled))
+        globals.replication_manager = ReplicationManager(debug_mode=debug_enabled)
         log.info("Менеджеры инициализированы")
         log.info("Установка прав для пользователя agent на /app/projects")
         os.system("chown agent -R /app/projects")
