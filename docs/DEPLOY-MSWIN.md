@@ -1,5 +1,29 @@
 # Colloquium DevSpace — Инструкция по развёртыванию (Windows)
 
+## Рекомендуемый путь: автоматический деплой
+
+Базовый и рекомендуемый сценарий: запуск PowerShell-скрипта автоматики из `Colloquium-DevSpace/scripts`.
+
+```powershell
+cd X:\GitHub\Colloquium-DevSpace
+powershell -ExecutionPolicy Bypass -File .\scripts\deploy-cqds.ps1 \
+  -TargetDir "X:\opt\docker\cqds" \
+  -MainRepo "X:\GitHub\Colloquium-DevSpace" \
+  -SandwichRepo "X:\GitHub\Sandwich-pack" \
+  -NonInteractive \
+  -GeneratePassword \
+  -StopExisting
+```
+
+Что делает автоматика:
+- синхронизирует файлы из двух репозиториев;
+- поднимает PostgreSQL, приводит роль/пароль `cqds` к актуальному secret;
+- гарантирует bootstrap-схему (создаёт таблицы, если это первый запуск без backup);
+- при наличии backup может предложить restore;
+- после запуска печатает фрагмент `colloquium_core.log` со строкой временного пароля `admin` (если он был сгенерирован).
+
+Если автоматика не сработала на вашей машине, используйте ручной сценарий ниже (эта инструкция остаётся fallback-путём).
+
 Проект использует **два репозитория**:
 - **Основной**: `X:\GitHub\Colloquium-DevSpace` (платформа, ядро сервера)
 - **Зависимость**: `X:\GitHub\Sandwich-pack` (библиотека для анализа кода и чат-данных)
@@ -151,6 +175,10 @@ INFO:uvicorn.error:Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
 ```
 
 ### 4.2 Получить пароль администратора
+
+Если запускали автоматический скрипт, этот фрагмент уже выводится в конце деплоя.
+Ниже команда для ручной проверки:
+
 ```powershell
 cd X:\opt\docker\cqds
 docker compose exec colloquium-core cat /app/logs/userman.log
