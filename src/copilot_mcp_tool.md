@@ -11,18 +11,18 @@ MCP-сервер (`copilot_mcp_tool.py`) транслирует инструме
 Пакеты должны быть установлены в том же Python, что указан в `mcp.json`:
 
 ```powershell
-C:\Apps\Python3\python.exe -m pip install httpx mcp
+python.exe -m pip install httpx mcp
 ```
 
 Проверка:
 ```powershell
-C:\Apps\Python3\python.exe -c "import httpx, mcp; print('ok')"
+python.exe -c "import httpx, mcp; print('ok')"
 ```
 
 ### 2. Запущенный Colloquium-DevSpace
 
 ```powershell
-cd P:\GitHub\Colloquium-DevSpace\src
+cd X:\docker\cqds
 docker compose up -d
 ```
 
@@ -36,6 +36,10 @@ docker compose up -d
 > (admin, разработчики) работают со своими сессиями в браузере.
 > MCP-инструмент использует тот же механизм аутентификации программно — это правильная архитектура.
 
+> **Каталог `logs` в контейнере**: пробрасываемый каталог `logs` часто используется не только для логов ядра,
+> но и для журналов непосредственно разрабатываемых проектов (backend/frontend workers, интеграционные скрипты, dev-сервисы).
+> Поэтому стратегия диагностики должна учитывать проектные логи как основной источник сигналов.
+
 На первом запуске автоматически создаётся пользователь `admin` с **случайным паролем** — он выводится в лог контейнера:
 
 ```powershell
@@ -45,29 +49,38 @@ docker logs colloquium-core 2>&1 | Select-String "admin"
 
 ---
 
-## Создание пользователя `copilot`
+## Сервисный пользователь `copilot`
+
+`copilot` должен рассматриваться как постоянный сервисный пользователь для MCP-tool.
+Его не нужно создавать и удалять перед каждым запуском VS Code или перезапуском контейнера.
+
+Базовая стратегия:
+
+- `copilot` создаётся один раз на инсталляцию или после полной потери БД
+- дальше этот пользователь считается резидентным и переиспользуется всеми локальными запусками MCP-tool
+- удаление `copilot` допускается только как аварийная операция: компрометация, пересборка auth-схемы, очистка тестового стенда
 
 Административный скрипт `agent/create_user.py` уже примонтирован в контейнер как `/app/agent/create_user.py`.
 
 ```powershell
-# Создать пользователя copilot с паролем devspace
+# Если пользователя ещё нет — создать один раз
 docker exec colloquium-core python3 /app/agent/create_user.py copilot devspace
 
-# Создать с другим паролем
+# Если нужен другой пароль при первичной настройке
 docker exec colloquium-core python3 /app/agent/create_user.py copilot мой_пароль
 
 # Список всех пользователей
 docker exec colloquium-core python3 /app/agent/create_user.py --list
-
-# Удалить пользователя
-docker exec colloquium-core python3 /app/agent/create_user.py --delete copilot
 ```
 
-Смена пароля — удали и создай заново:
+Проверка существования `copilot`:
 ```powershell
-docker exec colloquium-core python3 /app/agent/create_user.py --delete copilot
-docker exec colloquium-core python3 /app/agent/create_user.py copilot новый_пароль
+docker exec colloquium-core python3 /app/agent/create_user.py --list
+# Если copilot уже есть в списке — ничего пересоздавать не нужно
 ```
+
+Пока отдельная смена пароля не автоматизирована, аварийная ротация может выполняться через удаление и повторное создание,
+но это именно исключение, а не штатный сценарий ежедневной работы.
 
 ---
 
@@ -77,9 +90,9 @@ docker exec colloquium-core python3 /app/agent/create_user.py copilot новый
 
 ```json
 "colloquium": {
-  "command": "C:\\Apps\\Python3\\python.exe",
+  "command": "X:\\Python3\\python.exe",
   "args": [
-    "P:\\GitHub\\Colloquium-DevSpace\\src\\copilot_mcp_tool.py",
+    "X:\\docker\\cqds\\copilot_mcp_tool.py",
     "--url",  "http://localhost:8008",
     "--username", "copilot"
   ],
@@ -87,7 +100,36 @@ docker exec colloquium-core python3 /app/agent/create_user.py copilot новый
 }
 ```
 
-Пароль по умолчанию `devspace`. Чтобы задать другой — через аргумент или переменную окружения:
+Предпочтительный локальный вариант: пароль хранится в отдельном файле рядом с `copilot_mcp_tool.py`
+или в другом защищённом месте на хосте.
+
+### Рекомендуемый вариант: sidecar secret
+
+Создай файл `X:\docker\cqds\copilot_mcp_tool.secret`, в котором находится только пароль, без JSON и без лишних строк:
+
+```text
+мой_пароль
+```
+
+После этого `copilot_mcp_tool.py` подхватит пароль автоматически, даже если в `mcp.json` пароль не указан.
+
+### Явное указание файла секрета
+
+Если секрет лежит не рядом со скриптом, можно передать путь через `env`:
+
+```json
+"env": { "COLLOQUIUM_PASSWORD_FILE": "X:\\secrets\\copilot_password.txt" }
+```
+
+или через аргументы:
+
+```json
+"args": [..., "--password-file", "X:\\secrets\\copilot_password.txt"]
+```
+
+### Прямой пароль
+
+Если файловый секрет пока не используется, пароль можно передать напрямую через аргумент или переменную окружения:
 
 ```json
 "args": [..., "--password", "мой_пароль"]
@@ -99,96 +141,140 @@ docker exec colloquium-core python3 /app/agent/create_user.py copilot новый
 "env": { "COLLOQUIUM_PASSWORD": "мой_пароль" }
 ```
 
-> Не коммить пароль в git. Предпочтительный вариант — `env` с системной переменной окружения.
+> Не коммить пароль в git. Предпочтительный вариант теперь — отдельный локальный файл секрета.
+
+### Приоритет источников пароля
+
+`copilot_mcp_tool.py` ищет пароль в таком порядке:
+
+1. `--password`
+2. `--password-file`
+3. `COLLOQUIUM_PASSWORD`
+4. `COLLOQUIUM_PASSWORD_FILE`
+5. `copilot_mcp_tool.secret` рядом со скриптом
+6. fallback: `devspace`
+
+При старте MCP-tool пишет в stderr диагностическую строку с источником пароля и коротким preview:
+
+```text
+MCP auth password source: copilot_mcp_tool.secret; preview=tE...
+```
+
+Это сделано для быстрой диагностики двух случаев:
+
+- tool неожиданно взял `default` и работает на `devspace`
+- tool читает не тот секретный файл, который ожидался
+
+Preview намеренно показывает только первые 2 символа, а не полный пароль.
+
+Альтернатива для локальной машины: дать `copilot_mcp_tool.py` возможность читать пароль из локального секрета рядом с размещением,
+например из файла вида `copilot_mcp_tool.secret` или через `COLLOQUIUM_PASSWORD_FILE`.
+
+Это разумно, если предполагается, что при получении локального доступа к хосту парольная защита уже не является главным барьером.
+В таком режиме в git хранится только путь к секрету, а не сам пароль.
 
 ---
 
 ## Доступные инструменты
 
-### Чаты и сообщения
-
 | Инструмент | Описание |
 |---|---|
 | `cq_list_chats` | Список всех чатов |
 | `cq_create_chat` | Создать новый чат (вернёт `chat_id`) |
-| `cq_send_message` | Отправить сообщение в чат (в sync-режиме — ждёт ответ) |
+| `cq_send_message` | Отправить сообщение в чат (в sync-режиме ждёт финальный ответ, пропуская прогресс-заглушки) |
 | `cq_wait_reply` | Long-poll ответа AI (до 15 с) |
-| `cq_get_history` | Снapshot истории чата без ожидания |
-| `cq_set_sync_mode` | Включить синхронный режим: `cq_send_message` будет ждать ответ AI до N секунд |
-
-Рекомендация по режимам работы:
-- Асинхронный режим (`cq_set_sync_mode(timeout=0)`) удобен для долгих задач LLM/агента, когда можно отправить запрос и переключиться на другие подзадачи.
-- Асинхронный режим также лучше подходит для параллельного запуска задач в нескольких чатах.
-- Синхронный режим удобен для коротких итераций «вопрос → ответ → следующее действие» в одном активном чате.
-
-### Файлы и патчи (через chat-цикл)
-
-| Инструмент | Описание |
-|---|---|
+| `cq_get_history` | Получить текущий срез истории чата без ожидания |
 | `cq_edit_file` | Записать файл через `<code_file>` (создать или перезаписать) |
 | `cq_patch_file` | Применить unified-diff через `<patch>` |
 | `cq_undo_file` | Откатить файл к бэкапу через `<undo>` |
-
-### Прямые операции (без LLM/chat-цикла)
-
-| Инструмент | Описание |
-|---|---|
-| `cq_read_file` | Прочитать содержимое файла по DB `file_id` — один HTTP-запрос |
-| `cq_exec` | Выполнить shell-команду в рабочей директории проекта — результат сразу |
-| `cq_smart_grep` | Поиск по проекту в преднастроенных наборах файлов (code/logs/docs/all) |
-| `cq_replace` | Точечная замена в одном файле по `file_id` (plain/regex) |
-
-Параметры фокусировки для `cq_smart_grep`:
-- `profile`: преднастроенный профиль выборки `all | backend | frontend | docs | infra | tests | logs`.
-- `time_strict`: фильтр по времени в компактном SQL-like формате.
-
-Поддерживаемый синтаксис `time_strict`:
-- `<field><op><value>`, где `field`: `mtime | ctime | ts`
-- `op`: `>`, `>=`, `<`, `<=`, `=`
-- `value`: `YYYY-MM-DD`, `YYYY-MM-DD HH:MM[:SS]` или unix timestamp
-
-Примеры:
-- `mtime>2026-03-25`
-- `mtime>=2026-03-25 21:00`
-- `ctime>1711390800`
-
-Примечание:
-- `mtime` и `ts` — самые быстрые, потому что используют метку времени из индекса файлов.
-- `ctime` может быть медленнее (нужен файловый stat для каждого кандидата).
-
-### Проекты и индексы
-
-| Инструмент | Описание |
-|---|---|
 | `cq_list_projects` | Список проектов, зарегистрированных в Colloquium |
-| `cq_select_project` | Установить активный проект сессии (нужно после рестарта) |
-| `cq_list_files` | Индекс файлов проекта (id, имя, метка времени) без содержимого |
-| `cq_get_index` | Граф сущностей (функции/классы) из последнего LLM-контекста чата |
-| `cq_get_code_index` | Граф сущностей проекта on-demand, без обращения к LLM |
+| `cq_select_project` | Выбрать активный проект в сессии |
+| `cq_list_files` | Лёгкий индекс файлов проекта (без контента) |
+| `cq_get_index` | Получить rich-index чата/проекта |
+| `cq_get_code_index` | Сборка rich-index проекта по требованию |
+| `cq_read_file` | Прочитать файл по DB `file_id` |
+| `cq_exec` | Выполнить shell-команду в проекте |
+| `cq_query_db` | Выполнить read-only SQL через backend DB layer (debug) |
+| `cq_set_sync_mode` | Включить/выключить синхронный режим для `cq_send_message` |
+| `cq_smart_grep` | Поиск по наборам файлов (code/logs/docs/all) |
+| `cq_grep_logs` | Сканирование одного/нескольких log-файлов по маскам с regex-фильтрацией |
+| `cq_replace` | Точный replace в файле по `file_id` |
 
-### Типичные рабочие циклы
+### Типичный рабочий цикл
 
-**Полный LLM-цикл (исходный):**
+**Вариант 1: Асинхронный (без ожидания)**
 ```
-1. cq_list_chats           → найти chat_id (или cq_create_chat)
-2. cq_send_message         → отправить задачу
-3. cq_wait_reply           → получить ответ AI
-4. cq_edit_file / cq_patch_file → применить изменения
-```
-
-**Синхронный режим (экономия одного вызова):**
-```
-1. cq_set_sync_mode(timeout=60)  → включить один раз
-2. cq_send_message               → отправить + дождаться ответа автоматически
-3. cq_edit_file / cq_patch_file  → применить изменения
+1. cq_list_chats           → найти нужный chat_id (или cq_create_chat)
+2. cq_send_message         → отправить задачу / вопрос (возвращается сразу)
+3. cq_wait_reply           → получить ответ AI (long-poll)
+4. cq_edit_file / cq_patch_file → применить изменения в файлах проекта
 ```
 
-**Прямое чтение/запуск (без LLM вообще):**
+**Вариант 2: Синхронный (рекомендуется для Copilot)**
 ```
-cq_list_files(project_id)        → получить file_id
-cq_read_file(file_id)            → прочитать файл напрямую
-cq_exec(project_id, "pytest -q") → запустить тесты напрямую
+1. cq_set_sync_mode timeout=60  → включить ожидание финального ответа
+2. cq_list_chats                → найти нужный chat_id (или cq_create_chat)
+3. cq_send_message              → отправить задачу (ждёт ответ до 60 сек, пропуская прогресс)
+4. cq_edit_file / cq_patch_file → применить изменения в файлах проекта
 ```
+
+В sync-режиме `cq_send_message` автоматически пропускает промежуточные прогресс-сообщения
+(например "⏳ готовлю ответ") и возвращает только финальный ответ LLM когда он готов.
+
+### Параметры `cq_set_sync_mode`
+
+```
+timeout  — время ожидания ответа AI после отправки сообщения, сек
+           0 = выключить sync-режим (возвращать ответ сразу, default)
+           60 = ждать ответ до 60 сек (пропуская прогресс-заглушки)
+           макс: 300
+```
+
+Когда включен sync-режим, `cq_send_message` автоматически ждёт финального ответа LLM, пропуская промежуточные сообщения вроде "Запрос принят", "⏳ готовлю ответ". Это улучшает UX — нет нужды вызывать `cq_wait_reply` отдельно.
+
+### Параметры `cq_query_db`
+
+```
+project_id — ID проекта (контекст выполнения)
+query      — read-only SQL (SELECT / WITH / EXPLAIN)
+timeout    — лимит времени выполнения, сек (по умолчанию 30)
+```
+
+Ограничения безопасности:
+
+```
+- разрешены только read-only запросы (SELECT / WITH / EXPLAIN)
+- мутационные ключевые слова (INSERT/UPDATE/DELETE/...) блокируются на стороне MCP-tool
+```
+
+Пример использования (отладка):
+
+```powershell
+cq_query_db project_id=1 query="SELECT COUNT(*) FROM posts"
+```
+
+### Параметры `cq_grep_logs`
+
+```
+project_id    — ID проекта (контекст выполнения в контейнере)
+query         — regex для фильтрации строк логов
+log_masks     — JSON-массив glob-масок (например ["logs/*.log", "logs/**/*.txt"])
+tail_lines    — лимит количества совпавших строк на файл (по умолчанию 100)
+since_seconds — необязательное окно по времени в секундах; когда > 0, выбираются строки только за последние N секунд
+case_sensitive — чувствительность regex к регистру (по умолчанию false)
+```
+
+Формат результата:
+
+```json
+{
+  "logs/app.log": ["...", "..."],
+  "logs/worker/error.log": []
+}
+```
+
+`cq_grep_logs` читает логи внутри контейнерного контекста проекта; ссылочные/служебные логи,
+которые не опубликованы наружу, доступны именно через этот инструмент.
 
 ### Параметры `cq_edit_file`
 
@@ -224,6 +310,60 @@ time_back — seconds to look back (по умолчанию 3600)
 
 ---
 
+## 🔒 Безопасность и бэкапы при работе с БД
+
+### Важно: защита декоративна, контроль поведения — ваша ответственность
+
+Инструмент `cq_query_db` **блокирует** явные мутационные запросы (INSERT/UPDATE/DELETE/DROP), но:
+
+- **Через `cq_exec`** вы можете выполнить любой скрипт или команду в проекте  
+  ⟹ включая доступ к БД с любыми намерениями  
+- **Через `cq_send_message` → LLM** agent может предложить опасные операции  
+- **В разработке** обычно используется SQLite или копия Postgres — проще восстановить
+
+### ⚠️  Правило: **BACKUP перед любыми изменениями БД**
+
+**Всегда:**
+1. **Сделай бэкап** перед операциями с БД:
+   ```powershell
+   docker exec colloquium-core pg_dump -U postgres colloquium_db > backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').sql
+   # или для SQLite:
+   docker exec colloquium-core cp /data/colloquium.db /backups/colloquium_$(Get-Date -Format 'yyyyMMdd_HHmmss').db
+   ```
+
+2. **Проверь запрос** перед выполнением:
+   - Убедись, что это SELECT (для `cq_query_db`)  
+   - Убедись, что ты понимаешь, что произойдёт
+
+3. **После удаления/обновления:**
+   - Визуально проверь результат (SELECT * FROM таблица WHERE ...)
+   - Если что-то не так — восстанови из бэкапа:
+     ```powershell
+     docker exec -i colloquium-core psql -U postgres colloquium_db < backup_YYYYMMDD_HHMMSS.sql
+     ```
+
+### Сценарии восстановления
+
+**Случайно удалил строку(и) из БД:**
+```bash
+# 1. Останови контейнер (чтобы БД не писала дальше)
+docker stop colloquium-core
+
+# 2. Восстанови бэкап
+docker exec -i colloquium-core psql -U postgres colloquium_db < backup.sql
+
+# 3. Запусти контейнер
+docker start colloquium-core
+```
+
+**Нужно откатить последние N часов:**
+```bash
+# Если используешь WAL или иную систему версионирования, восстанови из бэкапа + примени логи
+# В простом случае — восстанови последний бэкап до этого момента
+```
+
+---
+
 ## Параметры командной строки
 
 ```
@@ -231,10 +371,25 @@ time_back — seconds to look back (по умолчанию 3600)
              env: COLLOQUIUM_URL
 --username   Имя пользователя         (default: copilot)
              env: COLLOQUIUM_USERNAME
---password   Пароль                   (default: devspace)
+--password   Пароль                   (highest priority)
              env: COLLOQUIUM_PASSWORD
+--password-file  Файл с паролем       (next priority after --password)
+                 env: COLLOQUIUM_PASSWORD_FILE
 --chat-id    Чат по умолчанию (инфо) (default: 0)
              env: COLLOQUIUM_CHAT_ID
+```
+
+Логирование MCP-tool:
+
+```text
+По умолчанию runtime-лог пишется в ./logs/copilot_mcp_tool.runtime.log
+```
+
+Можно переопределить переменными окружения:
+
+```text
+COLLOQUIUM_MCP_LOG_FILE  полный путь к log-файлу
+COLLOQUIUM_MCP_LOG_LEVEL уровень логирования (например INFO/DEBUG)
 ```
 
 ---
@@ -244,8 +399,8 @@ time_back — seconds to look back (по умолчанию 3600)
 Запусти сервер вручную — если стартует без ошибок, конфигурация верна:
 
 ```powershell
-C:\Apps\Python3\python.exe P:\GitHub\Colloquium-DevSpace\src\copilot_mcp_tool.py `
-  --url http://localhost:8008 --username copilot --password devspace
+python.exe X:\docker\cqds\copilot_mcp_tool.py `
+  --url http://localhost:8008 --username copilot
 # Должен зависнуть (ожидает stdin от MCP-клиента) — Ctrl+C для выхода
 ```
 
@@ -254,13 +409,49 @@ C:\Apps\Python3\python.exe P:\GitHub\Colloquium-DevSpace\src\copilot_mcp_tool.py
 ```powershell
 Invoke-RestMethod -Method POST -Uri "http://localhost:8008/api/login" `
   -ContentType "application/json" `
-  -Body '{"username":"copilot","password":"devspace"}'
+  -Body '{"username":"copilot","password":"<пароль_из_файла_или_секрета>"}'
 # Ожидаемый ответ: объект с полями role, user_id и т.п.
 ```
 
 ---
 
+## Быстрый старт: первые тесты в Copilot
+
+После запуска `docker compose up -d` и создания пользователя `copilot`:
+
+1. **Убедись, что API доступна:**
+   ```
+   ✓ cq_list_chats → должна вернуть массив чатов (может быть пусто: [])
+   ```
+
+2. **Создай тестовый чат:**
+   ```
+   → cq_create_chat description="Test MCP"
+   ✓ Должна вернуть chat_id (например, 1)
+   ```
+
+3. **Отправь тестовое сообщение:**
+   ```
+   → cq_set_sync_mode timeout=30  (включи ожидание ответа)
+   → cq_send_message chat_id=1 message="Привет! Я сообщение от Copilot."
+   ✓ Должно вернуться с ответом (либо "Message sent", либо финальный ответ LLM)
+   ```
+
+4. **Тестирование `cq_query_db` (опционально):**
+   ```
+   → cq_list_projects         (получи project_id)
+   → cq_query_db project_id=1 query="SELECT 1 as test"
+   ✓ Должна вернуть: {"status": "success", "rows": [[1]]}
+   ```
+
+Если всё завелось — MCP tool работает готов!
+
+---
+
 ## Security TODOs
 
-- [ ] **Ограничение авторизации по IP** — добавить в ядро backend (`server.py` / FastAPI middleware) проверку, что запросы на `/api/login` принимаются только с `127.0.0.1` или из доверенной подсети (например, `172.16.0.0/12` для Docker). Это защитит от ситуации, когда пользователь оставил стандартный пароль (`devspace`) и сервер случайно оказался доступен извне. Вариант реализации — middleware на уровне nginx (`allow 127.0.0.1; allow 172.0.0.0/8; deny all;`) или FastAPI `Request.client.host` check для эндпоинта `/login`.
+- [ ] **Стратегия сервиса `copilot`** — считать `copilot` резидентным техническим пользователем MCP-tool. Не удалять и не пересоздавать его при обычных перезапусках. Все инструкции и runbook должны исходить из того, что пользователь уже существует.
+- [ ] **Ограничение входа по источнику (`host`)** — расширить схему `users`: добавить поле `host_policy` или `host`, которое будет ограничивать допустимый источник логина для конкретного пользователя. Поддерживаемые режимы: `any`, `localhost`, `local_subnet`, `exact_ip`. Проверка должна выполняться в `/login` по `Request.client.host` до создания сессии.
+- [x] **Секрет из локального файла** — `copilot_mcp_tool.py` умеет читать пароль из `COLLOQUIUM_PASSWORD_FILE` или sidecar-файла `copilot_mcp_tool.secret`, поэтому пароль можно не хранить в `mcp.json`.
+- [ ] **Приоритет вариантов** — краткосрочно предпочтителен секретный файл на хосте: меньше изменений, нет миграции таблицы `users`, быстрее внедряется. Среднесрочно правильнее добавить `host`-ограничение в auth-схему, чтобы `copilot` был привязан к ожидаемому источнику доступа даже при утечке пароля.
 - [ ] **Принудительная смена пароля по умолчанию** — при первом логине с паролем `devspace` возвращать предупреждение в ответе (поле `warn`), чтобы оператор знал о необходимости смены.

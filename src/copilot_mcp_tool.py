@@ -2,19 +2,26 @@
 # Place: P:\GitHub\Colloquium-DevSpace\src\copilot_mcp_tool.py
 #
 # Usage:
-#   python copilot_mcp_tool.py [--url URL] [--username USER] [--password PASS]
+#   python copilot_mcp_tool.py [--url URL] [--username USER]
+#                               [--password PASS | --password-file FILE]
 #                               [--chat-id ID] [--timeout SEC]
 #
 # Default URL: http://localhost:8008
 # Credentials can also be set via env vars:
-#   COLLOQUIUM_URL, COLLOQUIUM_USERNAME, COLLOQUIUM_PASSWORD, COLLOQUIUM_CHAT_ID
+#   COLLOQUIUM_URL, COLLOQUIUM_USERNAME, COLLOQUIUM_PASSWORD,
+#   COLLOQUIUM_PASSWORD_FILE, COLLOQUIUM_CHAT_ID
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+from contextvars import ContextVar
 import json
+import logging
 import os
+from pathlib import Path
+import re
 import sys
 import time
 import textwrap
@@ -28,6 +35,68 @@ from mcp.types import (  # type: ignore[import]
     TextContent,
     Tool,
 )
+
+LOGGER = logging.getLogger("copilot_mcp_tool")
+CURRENT_TOOL: ContextVar[str] = ContextVar("copilot_mcp_current_tool", default="-")
+
+
+def _setup_logging() -> Path:
+    default_log = Path(__file__).resolve().parent / "logs" / "copilot_mcp_tool.runtime.log"
+    log_file = Path(os.environ.get("COLLOQUIUM_MCP_LOG_FILE", str(default_log))).resolve()
+    log_level_name = os.environ.get("COLLOQUIUM_MCP_LOG_LEVEL", "INFO").upper()
+    log_level = getattr(logging, log_level_name, logging.INFO)
+
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    LOGGER.handlers.clear()
+    LOGGER.setLevel(log_level)
+    LOGGER.propagate = False
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setLevel(log_level)
+    file_handler.setFormatter(formatter)
+    LOGGER.addHandler(file_handler)
+
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(log_level)
+    stderr_handler.setFormatter(formatter)
+    LOGGER.addHandler(stderr_handler)
+
+    return log_file
+
+
+def _preview_text(text: str, limit: int = 200) -> str:
+    collapsed = " ".join((text or "").split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return f"{collapsed[:limit]}..."
+
+
+def _summarize_arguments(arguments: dict[str, Any]) -> str:
+    if not isinstance(arguments, dict):
+        return str(type(arguments).__name__)
+    parts: list[str] = []
+    for key in sorted(arguments.keys()):
+        value = arguments[key]
+        if key.lower() in {"password", "token", "authorization"}:
+            parts.append(f"{key}=<redacted>")
+            continue
+        if isinstance(value, str):
+            parts.append(f"{key}=str(len={len(value)}, preview='{_preview_text(value, 64)}')")
+            continue
+        if isinstance(value, list):
+            parts.append(f"{key}=list(len={len(value)})")
+            continue
+        if isinstance(value, dict):
+            parts.append(f"{key}=dict(keys={len(value)})")
+            continue
+        parts.append(f"{key}={value!r}")
+    return ", ".join(parts)
 
 # ---------------------------------------------------------------------------
 # Colloquium HTTP client
@@ -44,9 +113,20 @@ class ColloquiumClient:
             base_url=self._base,
             follow_redirects=True,
             timeout=30.0,
+            event_hooks={
+                "request": [self._log_request],
+                "response": [self._log_response],
+            },
         )
         self._logged_in = False
         self._sync_timeout: int = 0
+
+    async def _log_request(self, request: httpx.Request) -> None:
+        LOGGER.info("HTTP -> %s %s", request.method, request.url)
+
+    async def _log_response(self, response: httpx.Response) -> None:
+        request = response.request
+        LOGGER.info("HTTP <- %s %s status=%s", request.method, request.url, response.status_code)
 
     async def _ensure_login(self) -> None:
         if self._logged_in:
@@ -141,17 +221,27 @@ class ColloquiumClient:
         resp.raise_for_status()
         return resp.json()
 
-    async def get_index(self, chat_id: int) -> dict:
-        """Return the rich entity index for a chat via /api/chat/index."""
+    async def get_index(self, chat_id: int | None = None, project_id: int | None = None) -> dict:
+        """Return the rich entity index for a chat or cached project index via /api/chat/index."""
         await self._ensure_login()
-        resp = await self._client.get("/api/chat/index", params={"chat_id": chat_id})
+        params: dict[str, Any] = {}
+        if chat_id is not None:
+            params["chat_id"] = chat_id
+        if project_id is not None:
+            params["project_id"] = project_id
+        resp = await self._client.get("/api/chat/index", params=params)
         resp.raise_for_status()
         return resp.json()
 
-    async def get_code_index(self, project_id: int) -> dict:
+    async def get_code_index(self, project_id: int, timeout: int = 300) -> dict:
         """Build and return the rich entity index for a project on demand via /api/project/code_index."""
         await self._ensure_login()
-        resp = await self._client.get("/api/project/code_index", params={"project_id": project_id})
+        http_timeout = httpx.Timeout(float(max(timeout, 30) + 30))
+        resp = await self._client.get(
+            "/api/project/code_index",
+            params={"project_id": project_id, "timeout": timeout},
+            timeout=http_timeout,
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -451,14 +541,15 @@ TOOLS: list[Tool] = [
     Tool(
         name="cq_get_index",
         description=(
-            "Return the rich entity index built from the last LLM context assembly for a chat. "
+            "Return the rich entity index built from the last LLM context assembly for a chat, "
+            "or read the cached project index from /app/projects/.cache when project_id is provided. "
             "Includes all parsed functions, classes, methods and variables with their file_id, "
             "line ranges and token counts. Useful for code navigation and understanding project structure.\n"
             "Format: sandwiches_index.jsl — 'entities' is a list of CSV strings, layout described in 'templates.entities':\n"
             "  vis,type,parent,name,file_id,start_line-end_line,tokens\n"
             "  e.g. 'pub,function,,fetchData,3,45-67,120'\n"
             "'filelist' maps file IDs to file names (same format as cq_list_files).\n"
-            "Returns 404 if no LLM response has been generated yet for this chat."
+            "Provide either chat_id or project_id. For project_id, returns the cached project index if it exists."
         ),
         inputSchema={
             "type": "object",
@@ -467,8 +558,12 @@ TOOLS: list[Tool] = [
                     "type": "integer",
                     "description": "Chat ID whose index to retrieve (use cq_list_chats to get IDs).",
                 },
+                "project_id": {
+                    "type": "integer",
+                    "description": "Project ID whose cached index to read from /app/projects/.cache.",
+                },
             },
-            "required": ["chat_id"],
+            "required": [],
         },
     ),
     Tool(
@@ -477,6 +572,7 @@ TOOLS: list[Tool] = [
             "Build the rich entity index for a project on demand — no prior LLM interaction needed.\n"
             "Runs context assembly (loads all project files → SandwichPack.pack) and returns\n"
             "the full sandwiches_index.jsl format JSON with 'entities' and 'filelist'.\n"
+            "When background=true, MCP tool queues or reports a background build and stores the result in /app/projects/.cache/{project_name}_index.jsl.\n"
             "Use this to understand project structure, find functions/classes, or plan edits.\n"
             "'entities' is a list of CSV strings: vis,type,parent,name,file_id,start-end,tokens\n"
             "  e.g. 'pub,function,,fetchData,3,45-67,120'\n"
@@ -488,6 +584,16 @@ TOOLS: list[Tool] = [
                 "project_id": {
                     "type": "integer",
                     "description": "Project ID (use cq_list_projects to get IDs).",
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "If true, queue/report a background build and save cache to /app/projects/.cache/{project_name}_index.jsl.",
+                    "default": False,
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Max seconds to wait for the index build (default: 300). Passed to the backend as a hint and used as the HTTP client timeout.",
+                    "default": 300,
                 },
             },
             "required": ["project_id"],
@@ -538,6 +644,32 @@ TOOLS: list[Tool] = [
                 },
             },
             "required": ["project_id", "command"],
+        },
+    ),
+    Tool(
+        name="cq_query_db",
+        description=(
+            "Execute a read-only SQL query through Colloquium backend DB layer and return rows as JSON. "
+            "Designed for debugging. SELECT/EXPLAIN/WITH only; mutating SQL is rejected."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "integer",
+                    "description": "Project ID (from cq_list_projects).",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Read-only SQL query (SELECT/EXPLAIN/WITH).",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Max execution time in seconds (1-300, default 30).",
+                    "default": 30,
+                },
+            },
+            "required": ["project_id", "query"],
         },
     ),
     Tool(
@@ -599,6 +731,47 @@ TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="cq_grep_logs",
+        description=(
+            "Scan one or more log files inside the selected project container context using regex filtering. "
+            "Accepts file masks (glob array) and returns JSON map: {logname: [matched lines]}."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "integer",
+                    "description": "Project ID (from cq_list_projects).",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Regex pattern for line filtering.",
+                },
+                "log_masks": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "One or more glob masks, e.g. ['logs/*.log', 'logs/**/*.txt'].",
+                },
+                "tail_lines": {
+                    "type": "integer",
+                    "description": "Max matched lines per file to return from tail (default 100).",
+                    "default": 100,
+                },
+                "since_seconds": {
+                    "type": "integer",
+                    "description": "Optional time window in seconds; when > 0, only lines from the last N seconds are considered.",
+                    "default": 0,
+                },
+                "case_sensitive": {
+                    "type": "boolean",
+                    "description": "Case-sensitive regex matching (default false).",
+                    "default": False,
+                },
+            },
+            "required": ["project_id", "query", "log_masks"],
+        },
+    ),
+    Tool(
         name="cq_replace",
         description=(
             "Replace text in one file directly by file_id, with optional regex mode. "
@@ -626,6 +799,11 @@ TOOLS: list[Tool] = [
 
 
 def _text(content: str) -> CallToolResult:
+    LOGGER.info(
+        "TOOL result name=%s content=%s",
+        CURRENT_TOOL.get(),
+        _preview_text(content, 220),
+    )
     return CallToolResult(content=[TextContent(type="text", text=content)])
 
 
@@ -633,8 +811,124 @@ def _json_text(obj: Any) -> CallToolResult:
     return _text(json.dumps(obj, ensure_ascii=False, indent=2))
 
 
+def _index_counts(index_payload: dict[str, Any]) -> tuple[int | None, int | None]:
+    entities = index_payload.get("entities") if isinstance(index_payload, dict) else None
+    filelist = index_payload.get("filelist") if isinstance(index_payload, dict) else None
+    entities_count = len(entities) if isinstance(entities, list) else None
+    files_count = len(filelist) if isinstance(filelist, dict) else None
+    return entities_count, files_count
+
+
+def _is_progress_stub(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    markers = (
+        "llm request accepted",
+        "preparing response",
+        "response in progress",
+        "⏳",
+    )
+    return any(marker in msg for marker in markers)
+
+
+def _extract_latest_message(payload: Any) -> str | None:
+    latest_rank: int | None = None
+    latest_message: str | None = None
+
+    def walk(node: Any) -> None:
+        nonlocal latest_rank, latest_message
+        if isinstance(node, dict):
+            msg = node.get("message")
+            if isinstance(msg, str):
+                rank_raw = node.get("id", node.get("post_id", node.get("timestamp", 0)))
+                try:
+                    rank = int(rank_raw)
+                except Exception:
+                    rank = 0
+                if latest_rank is None or rank >= latest_rank:
+                    latest_rank = rank
+                    latest_message = msg
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(payload)
+    return latest_message
+
+
 async def run_server(client: ColloquiumClient) -> None:
     server = Server("colloquium-mcp")
+    index_queue: asyncio.Queue[int] = asyncio.Queue()
+    index_jobs: dict[int, dict[str, Any]] = {}
+    index_worker_task: asyncio.Task | None = None
+
+    async def index_worker() -> None:
+        while True:
+            project_id = await index_queue.get()
+            job = index_jobs.setdefault(project_id, {"project_id": project_id})
+            job.update(
+                {
+                    "status": "running",
+                    "running": True,
+                    "queued": False,
+                    "started_at": int(time.time()),
+                    "finished_at": None,
+                    "error": None,
+                }
+            )
+            try:
+                payload = await client.get_code_index(project_id)
+                entities_count, files_count = _index_counts(payload)
+                job.update(
+                    {
+                        "status": "ready",
+                        "running": False,
+                        "queued": False,
+                        "finished_at": int(time.time()),
+                        "error": None,
+                        "entities": entities_count,
+                        "files": files_count,
+                    }
+                )
+            except Exception as exc:
+                job.update(
+                    {
+                        "status": "error",
+                        "running": False,
+                        "queued": False,
+                        "finished_at": int(time.time()),
+                        "error": str(exc),
+                    }
+                )
+            finally:
+                index_queue.task_done()
+
+    async def ensure_index_worker() -> None:
+        nonlocal index_worker_task
+        if index_worker_task is None or index_worker_task.done():
+            index_worker_task = asyncio.create_task(index_worker(), name="cq-index-worker")
+
+    def queue_status(project_id: int) -> dict[str, Any]:
+        job = index_jobs.get(project_id)
+        if not job:
+            return {
+                "project_id": project_id,
+                "status": "idle",
+                "running": False,
+                "queued": False,
+                "queue_size": index_queue.qsize(),
+                "started_at": None,
+                "finished_at": None,
+                "error": None,
+                "files": None,
+                "entities": None,
+            }
+        merged = dict(job)
+        merged["queue_size"] = index_queue.qsize()
+        return merged
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
@@ -642,6 +936,9 @@ async def run_server(client: ColloquiumClient) -> None:
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
+        tool_token = CURRENT_TOOL.set(name)
+        started_at = time.monotonic()
+        LOGGER.info("TOOL call start name=%s args=[%s]", name, _summarize_arguments(arguments))
         try:
             # ---- list chats ----
             if name == "cq_list_chats":
@@ -661,6 +958,7 @@ async def run_server(client: ColloquiumClient) -> None:
                 await client.post_message(chat_id, message)
                 if client._sync_timeout > 0:
                     deadline = time.monotonic() + client._sync_timeout
+                    saw_progress_stub = False
                     while time.monotonic() < deadline:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
@@ -668,7 +966,16 @@ async def run_server(client: ColloquiumClient) -> None:
                         resp = await client.get_reply(chat_id, wait=True, timeout=min(remaining, 15.0))
                         hist = resp.get("chat_history", "") if isinstance(resp, dict) else ""
                         if hist not in ("no changes", "chat switch"):
+                            latest_message = _extract_latest_message(resp)
+                            if latest_message and _is_progress_stub(latest_message):
+                                saw_progress_stub = True
+                                continue
                             return _json_text(resp)
+                    if saw_progress_stub:
+                        return _text(
+                            f"Message sent to chat_id={chat_id} "
+                            f"(sync: only progress stub seen within {client._sync_timeout}s)"
+                        )
                     return _text(f"Message sent to chat_id={chat_id} (sync: no reply in {client._sync_timeout}s)")
                 return _text(f"Message sent to chat_id={chat_id}")
 
@@ -735,14 +1042,75 @@ async def run_server(client: ColloquiumClient) -> None:
 
             # ---- get index (chat-based cache) ----
             elif name == "cq_get_index":
-                chat_id = int(arguments["chat_id"])
-                index = await client.get_index(chat_id)
+                chat_id_raw = arguments.get("chat_id")
+                project_id_raw = arguments.get("project_id")
+                if chat_id_raw is None and project_id_raw is None:
+                    raise ValueError("cq_get_index requires chat_id or project_id")
+                chat_id = int(chat_id_raw) if chat_id_raw is not None else None
+                project_id = int(project_id_raw) if project_id_raw is not None else None
+                index = await client.get_index(chat_id=chat_id, project_id=project_id)
                 return _json_text(index)
 
             # ---- get code index (on-demand, project-level) ----
             elif name == "cq_get_code_index":
                 project_id = int(arguments["project_id"])
-                index = await client.get_code_index(project_id)
+                background = bool(arguments.get("background", False))
+                timeout = int(arguments.get("timeout", 300))
+                if background:
+                    await ensure_index_worker()
+                    current = index_jobs.get(project_id)
+                    if current and current.get("status") in {"queued", "running"}:
+                        return _json_text(queue_status(project_id))
+
+                    try:
+                        cached = await client.get_index(project_id=project_id)
+                        entities_count, files_count = _index_counts(cached)
+                        index_jobs[project_id] = {
+                            "project_id": project_id,
+                            "status": "ready",
+                            "running": False,
+                            "queued": False,
+                            "started_at": None,
+                            "finished_at": int(time.time()),
+                            "error": None,
+                            "files": files_count,
+                            "entities": entities_count,
+                            "source": "cache",
+                        }
+                        return _json_text(queue_status(project_id))
+                    except httpx.HTTPStatusError as exc:
+                        if exc.response.status_code != 404:
+                            raise
+
+                    index_jobs[project_id] = {
+                        "project_id": project_id,
+                        "status": "queued",
+                        "running": False,
+                        "queued": True,
+                        "started_at": None,
+                        "finished_at": None,
+                        "error": None,
+                        "files": None,
+                        "entities": None,
+                        "source": "mcp-queue",
+                    }
+                    await index_queue.put(project_id)
+                    return _json_text(queue_status(project_id))
+
+                index = await client.get_code_index(project_id, timeout=timeout)
+                entities_count, files_count = _index_counts(index)
+                index_jobs[project_id] = {
+                    "project_id": project_id,
+                    "status": "ready",
+                    "running": False,
+                    "queued": False,
+                    "started_at": None,
+                    "finished_at": int(time.time()),
+                    "error": None,
+                    "files": files_count,
+                    "entities": entities_count,
+                    "source": "sync",
+                }
                 return _json_text(index)
 
             # ---- read file ----
@@ -756,6 +1124,34 @@ async def run_server(client: ColloquiumClient) -> None:
                 project_id = int(arguments["project_id"])
                 command = str(arguments["command"])
                 timeout = int(arguments.get("timeout", 30))
+                result = await client.exec_command(project_id, command, timeout)
+                return _json_text(result)
+
+            # ---- query DB (read-only) ----
+            elif name == "cq_query_db":
+                project_id = int(arguments["project_id"])
+                query = str(arguments["query"] or "").strip()
+                timeout = int(arguments.get("timeout", 30))
+                if not query:
+                    raise ValueError("query must be non-empty")
+
+                ql = query.lower().lstrip()
+                if not (ql.startswith("select") or ql.startswith("with") or ql.startswith("explain")):
+                    raise ValueError("Only read-only SQL is allowed (SELECT/WITH/EXPLAIN)")
+                if re.search(r"\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|comment)\b", ql):
+                    raise ValueError("Mutating SQL keywords are not allowed in cq_query_db")
+
+                encoded = base64.b64encode(query.encode("utf-8")).decode("ascii")
+                command = (
+                    "PYTHONPATH=/app/agent /app/venv/bin/python - <<'PY'\n"
+                    "import base64, json\n"
+                    "from managers.db import Database\n"
+                    f"q = base64.b64decode('{encoded}').decode('utf-8')\n"
+                    "db = Database.get_database()\n"
+                    "rows = db.fetch_all(q)\n"
+                    "print(json.dumps({'status': 'success', 'rows': [list(r) for r in rows]}, ensure_ascii=False))\n"
+                    "PY"
+                )
                 result = await client.exec_command(project_id, command, timeout)
                 return _json_text(result)
 
@@ -793,6 +1189,117 @@ async def run_server(client: ColloquiumClient) -> None:
                 )
                 return _json_text(result)
 
+            # ---- grep logs ----
+            elif name == "cq_grep_logs":
+                project_id = int(arguments["project_id"])
+                query = str(arguments["query"] or "").strip()
+                log_masks_raw = arguments.get("log_masks")
+                if not query:
+                    raise ValueError("query must be non-empty")
+                if not isinstance(log_masks_raw, list) or not log_masks_raw:
+                    raise ValueError("log_masks must be a non-empty array of glob masks")
+
+                log_masks = [str(mask).strip() for mask in log_masks_raw if str(mask).strip()]
+                if not log_masks:
+                    raise ValueError("log_masks must contain at least one non-empty mask")
+
+                tail_lines = int(arguments.get("tail_lines", 100))
+                tail_lines = max(1, min(tail_lines, 5000))
+                since_seconds = int(arguments.get("since_seconds", 0))
+                since_seconds = max(0, min(since_seconds, 7 * 24 * 3600))
+                case_sensitive = bool(arguments.get("case_sensitive", False))
+
+                encoded_query = base64.b64encode(query.encode("utf-8")).decode("ascii")
+                encoded_masks = base64.b64encode(
+                    json.dumps(log_masks, ensure_ascii=False).encode("utf-8")
+                ).decode("ascii")
+
+                command = (
+                    "python3 - <<'PY'\n"
+                    "import base64, glob, json, os, re, time\n"
+                    "from datetime import datetime\n"
+                    f"query = base64.b64decode('{encoded_query}').decode('utf-8')\n"
+                    f"masks = json.loads(base64.b64decode('{encoded_masks}').decode('utf-8'))\n"
+                    f"tail_lines = {tail_lines}\n"
+                    f"since_seconds = {since_seconds}\n"
+                    f"case_sensitive = {str(case_sensitive)}\n"
+                    "cutoff_ts = (time.time() - since_seconds) if since_seconds > 0 else None\n"
+                    "flags = re.MULTILINE if case_sensitive else (re.MULTILINE | re.IGNORECASE)\n"
+                    "pattern = re.compile(query, flags)\n"
+                    "ts_patterns = [\n"
+                    "    re.compile(r'^\\[(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})(?:[\\.,]\\d+)?\\]'),\n"
+                    "    re.compile(r'^(\\d{4}-\\d{2}-\\d{2}[ T]\\d{2}:\\d{2}:\\d{2})(?:[\\.,]\\d+)?'),\n"
+                    "]\n"
+                    "ts_formats = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S']\n"
+                    "def parse_line_ts(line):\n"
+                    "    for rx in ts_patterns:\n"
+                    "        m = rx.search(line)\n"
+                    "        if not m:\n"
+                    "            continue\n"
+                    "        raw = m.group(1).replace('T', ' ')\n"
+                    "        for fmt in ts_formats:\n"
+                    "            try:\n"
+                    "                dt = datetime.strptime(raw, fmt.replace('T', ' '))\n"
+                    "                return dt.timestamp()\n"
+                    "            except ValueError:\n"
+                    "                pass\n"
+                    "    return None\n"
+                    "paths = []\n"
+                    "seen = set()\n"
+                    "for mask in masks:\n"
+                    "    for path in glob.glob(mask, recursive=True):\n"
+                    "        norm = os.path.normpath(path)\n"
+                    "        if not os.path.isfile(norm):\n"
+                    "            continue\n"
+                    "        if norm in seen:\n"
+                    "            continue\n"
+                    "        seen.add(norm)\n"
+                    "        paths.append(norm)\n"
+                    "paths.sort()\n"
+                    "result = {}\n"
+                    "for path in paths:\n"
+                    "    try:\n"
+                    "        with open(path, 'r', encoding='utf-8', errors='replace') as fh:\n"
+                    "            lines = fh.read().splitlines()\n"
+                    "    except OSError:\n"
+                    "        result[path] = []\n"
+                    "        continue\n"
+                    "    matched = []\n"
+                    "    current_ts = None\n"
+                    "    for line in lines:\n"
+                    "        parsed_ts = parse_line_ts(line)\n"
+                    "        if parsed_ts is not None:\n"
+                    "            current_ts = parsed_ts\n"
+                    "        effective_ts = parsed_ts if parsed_ts is not None else current_ts\n"
+                    "        if cutoff_ts is not None and (effective_ts is None or effective_ts < cutoff_ts):\n"
+                    "            continue\n"
+                    "        if pattern.search(line):\n"
+                    "            matched.append(line)\n"
+                    "    if tail_lines > 0:\n"
+                    "        matched = matched[-tail_lines:]\n"
+                    "    result[path] = matched\n"
+                    "print(json.dumps(result, ensure_ascii=False))\n"
+                    "PY"
+                )
+
+                result = await client.exec_command(project_id, command, 120)
+                output = result.get("output", "") if isinstance(result, dict) else ""
+                parsed_output = output.strip()
+                if parsed_output.startswith("<stdout>") and "</stdout>" in parsed_output:
+                    parsed_output = parsed_output[len("<stdout>"):parsed_output.rfind("</stdout>")].strip()
+                try:
+                    parsed = json.loads(parsed_output)
+                except Exception as exc:
+                    return _json_text(
+                        {
+                            "status": "error",
+                            "error": f"Failed to parse cq_grep_logs output as JSON: {exc}",
+                            "raw_output": output,
+                            "exec": result,
+                        }
+                    )
+                return _json_text(parsed)
+
             # ---- replace in file ----
             elif name == "cq_replace":
                 project_id = int(arguments["project_id"])
@@ -817,9 +1324,15 @@ async def run_server(client: ColloquiumClient) -> None:
                 return _text(f"Unknown tool: {name}")
 
         except httpx.HTTPStatusError as exc:
+            LOGGER.exception("TOOL call http error name=%s status=%s", name, exc.response.status_code)
             return _text(f"HTTP error {exc.response.status_code}: {exc.response.text}")
         except Exception as exc:
+            LOGGER.exception("TOOL call error name=%s", name)
             return _text(f"Error: {exc}")
+        finally:
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+            LOGGER.info("TOOL call end name=%s elapsed_ms=%d", name, elapsed_ms)
+            CURRENT_TOOL.reset(tool_token)
 
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
@@ -833,6 +1346,51 @@ async def run_server(client: ColloquiumClient) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _read_password_file(password_file: str) -> str:
+    try:
+        with open(password_file, "r", encoding="utf-8") as handle:
+            password = handle.read().strip()
+    except OSError as exc:
+        raise RuntimeError(f"Failed to read password file '{password_file}': {exc}") from exc
+    if not password:
+        raise RuntimeError(f"Password file '{password_file}' is empty")
+    return password
+
+
+def _resolve_password(
+    cli_password: str | None,
+    cli_password_file: str | None,
+) -> tuple[str, str]:
+    if cli_password:
+        return cli_password, "--password"
+    if cli_password_file:
+        return _read_password_file(cli_password_file), "--password-file"
+
+    env_password = os.environ.get("COLLOQUIUM_PASSWORD")
+    if env_password:
+        return env_password, "COLLOQUIUM_PASSWORD"
+
+    env_password_file = os.environ.get("COLLOQUIUM_PASSWORD_FILE")
+    if env_password_file:
+        return _read_password_file(env_password_file), "COLLOQUIUM_PASSWORD_FILE"
+
+    sidecar_secret = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "copilot_mcp_tool.secret",
+    )
+    if os.path.isfile(sidecar_secret):
+        return _read_password_file(sidecar_secret), "copilot_mcp_tool.secret"
+
+    return "devspace", "default"
+
+
+def _password_preview(password: str) -> str:
+    if not password:
+        return "<empty>"
+    if len(password) <= 2:
+        return password
+    return f"{password[:2]}..."
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="MCP proxy server for Colloquium-DevSpace",
@@ -840,8 +1398,9 @@ def main() -> None:
         epilog=textwrap.dedent("""\
             Environment variables (override CLI defaults):
               COLLOQUIUM_URL       Base URL of Colloquium-DevSpace  (default: http://localhost:8008)
-              COLLOQUIUM_USERNAME  Login username                   (default: admin)
-              COLLOQUIUM_PASSWORD  Login password                   (required if not via --password)
+              COLLOQUIUM_USERNAME  Login username                   (default: copilot)
+              COLLOQUIUM_PASSWORD  Login password                   (higher priority than file/env file)
+              COLLOQUIUM_PASSWORD_FILE  Path to file containing only the password
         """),
     )
     parser.add_argument(
@@ -853,8 +1412,12 @@ def main() -> None:
         help="Username for Colloquium login (default: copilot)",
     )
     parser.add_argument(
-        "--password", default=os.environ.get("COLLOQUIUM_PASSWORD", "devspace"),
-        help="Password for Colloquium login (default: devspace)",
+        "--password", default=None,
+        help="Password for Colloquium login (overrides password file and env file)",
+    )
+    parser.add_argument(
+        "--password-file", default=None,
+        help="Path to a file containing only the Colloquium password",
     )
     parser.add_argument(
         "--chat-id", type=int, default=int(os.environ.get("COLLOQUIUM_CHAT_ID", "0") or "0"),
@@ -862,18 +1425,36 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not args.password:
+    log_file = _setup_logging()
+    LOGGER.info("MCP tool start url=%s username=%s pid=%s", args.url, args.username, os.getpid())
+
+    password, password_source = _resolve_password(args.password, args.password_file)
+
+    if not password:
         print(
             "ERROR: Colloquium password is required. "
-            "Set --password or COLLOQUIUM_PASSWORD env var (default: devspace).",
+            "Set --password, --password-file, COLLOQUIUM_PASSWORD, "
+            "COLLOQUIUM_PASSWORD_FILE, or create copilot_mcp_tool.secret next to the script.",
             file=sys.stderr,
         )
         sys.exit(1)
 
+    print(
+        "MCP auth password source: "
+        f"{password_source}; preview={_password_preview(password)}",
+        file=sys.stderr,
+    )
+    LOGGER.info(
+        "MCP auth password source=%s preview=%s log_file=%s",
+        password_source,
+        _password_preview(password),
+        str(log_file),
+    )
+
     client = ColloquiumClient(
         base_url=args.url,
         username=args.username,
-        password=args.password,
+        password=password,
     )
 
     try:
