@@ -32,6 +32,8 @@ class BasicLogger:
         self.indent = ""
         self.last_msg = ""
         self.last_msg_t = 0.0
+        self.last_dedupe_msg = ""  # For deduplication tracking
+        self.dedupe_count = 0  # Count of consecutive duplicates
         self.size_limit = 300 * 1024 * 1024  # 300 MB
         self.file_name = ""
         self.real_name = ""
@@ -214,6 +216,23 @@ class BasicLogger:
     def _format_backtrace(self):
         return "".join(traceback.format_stack(limit=5)).strip()
 
+    def _extract_dedupe_key(self, fmt: str, *args) -> str:
+        """Extract message content excluding timestamp and session_id for deduplication.
+        
+        This removes formatting codes and returns a stable key for comparison.
+        Session IDs (~C34...~C00) and '---' markers are ignored.
+        """
+        try:
+            msg = format_color(fmt, *args)
+        except:
+            msg = fmt
+        
+        # Remove ANSI color codes and session_id markers (~C34, ~C00, etc.)
+        import re
+        clean = re.sub(r'~C\d{2}', '', msg)  # Remove ~C## color codes
+        clean = re.sub(r'---', '', clean)     # Ignore "---" markers
+        return clean.strip()
+
     def log_msg(self, fmt, *args, echo=None):
         if not fmt or self.initializing:
             return
@@ -228,6 +247,18 @@ class BasicLogger:
             if len(msg) > 20480:
                 msg = f"#TRUNCATED: {msg[:20480]}"
 
+            # Deduplication: check if message content (excluding timestamp/session_id) is identical to last
+            dedupe_key = self._extract_dedupe_key(fmt, *args)
+            if dedupe_key and dedupe_key == self.last_dedupe_msg:
+                # Identical message: output "---" instead
+                self.dedupe_count += 1
+                output_msg = "---"
+            else:
+                # New or different message: output normally
+                self.last_dedupe_msg = dedupe_key
+                self.dedupe_count = 0
+                output_msg = msg
+
             ts = self._tss()
             elps = self._pr_time() - self.last_msg_t
             if "#PERF" in msg:
@@ -235,12 +266,17 @@ class BasicLogger:
 
             self.last_msg = msg
             self.last_msg_t = self._pr_time()
-            colored_msg = colorize_msg(msg)
+            colored_msg = colorize_msg(output_msg)
             if self.log_fd:
-                self.log_fd.write(f"[{ts}]. {self.indent}{msg}\n".encode("utf-8"))
+                self.log_fd.write(f"[{ts}]. {self.indent}{output_msg}\n".encode("utf-8"))
                 self.log_fd.flush()
             if callable(echo):
-                echo(format_uncolor(fmt, *args))  # Только чистый текст для logging
+                # For echo, use original message only if not a duplicate marker
+                echo_text = fmt if output_msg != "---" else "---"
+                if output_msg == "---":
+                    echo(echo_text)  # Just echo "---"
+                else:
+                    echo(format_uncolor(fmt, *args))
             elif self.std_out:
                 self.std_out.write(f"/{ts}/. {self.indent}{colored_msg}\n")
                 self.std_out.flush()
