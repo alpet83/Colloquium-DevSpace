@@ -1,11 +1,11 @@
 # /app/agent/managers/llm_interactor.py, updated 2025-07-28 09:41 EEST
+import asyncio
 import datetime
 import json
 from pathlib import Path
 from lib.sandwich_pack import SandwichPack, estimate_tokens
 from context_assembler import ContextAssembler
 from managers.db import DataTable
-from managers.project import ProjectManager
 from chat_actor import ChatActor
 import globals as g
 import os
@@ -90,6 +90,17 @@ class LLMInteractor(ContextAssembler):
             ]
         )
 
+    @staticmethod
+    def _atomic_write_text(path: Path, text: str):
+        lock = g.get_named_lock(f"path:{str(path)}")
+        with lock:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+
+    @staticmethod
+    def _stats_lock_key(llm_name: str) -> str:
+        return f"llm-stats:{llm_name}"
+
     def _write_context_stats(self, content_blocks: list, llm_name: str, chat_id: int, index_json: str):
         """Записывает статистику контекста в файл логов.
 
@@ -142,36 +153,40 @@ class LLMInteractor(ContextAssembler):
             f"{s['block_type']:<15} {s['block_id']:<10} {s['file_name']:<50} {s['tokens']:<10} {s['accumulated']:<10}\n"
             for s in stats]
         try:
-            with open(stats_file, "w", encoding="utf-8") as f:
-                f.write(header)
-                f.write(separator)
-                f.writelines(rows)
+            # Stats file is shared by actor name across chats; serialize writes explicitly.
+            lock = g.get_named_lock(self._stats_lock_key(llm_name))
+            with lock:
+                with open(stats_file, "w", encoding="utf-8") as f:
+                    f.write(header)
+                    f.write(separator)
+                    f.writelines(rows)
             log.info("Статистика контекста записана в %s для chat_id=%d, блоков=%d",
                      str(stats_file), chat_id, len(stats))
         except Exception as e:
             g.handle_exception(f"Не удалось записать статистику контекста в {stats_file}", e)
-            g.post_manager.add_post(chat_id, 2, f"Не удалось записать статистику контекста для {llm_name}: {str(e)}")
+            g.post_manager.add_post(chat_id, g.AGENT_UID, f"Не удалось записать статистику контекста для {llm_name}: {str(e)}")
 
-    def _write_chat_index(self, chat_id: int):
+    def _write_chat_index(self, chat_id: int, index_content: str):
         """Сохраняет индекс чата в /app/projects/.chat-meta/{chat_id}-index.json и регистрирует в БД.
 
         Args:
             chat_id (int): ID чата.
         """
-        index_content = self.last_sandwich_idx
         file_name = f".chat-meta/{chat_id}-index.json"
         try:
             fm = g.file_manager
             file_id = fm.add_file(file_name, content=index_content, project_id=0)
-            if file_id > 0:
+            if not file_id:
+                file_id = fm.find(file_name, project_id=0)
+            if file_id and file_id > 0:
                 log.debug("Дамп индекса '%s' зарегистрирован как %d", file_name, file_id)
-                fm.update_file(file_id, index_content)
+                fm.update_file(file_id, index_content, project_id=0)
             else:
                 log.error("Не удалось зарегистрировать %s", file_name)
         except Exception as e:
             log.excpt("Не удалось сохранить индекс для chat_id=%d", chat_id, e=e)
             g.post_manager.add_post(
-                chat_id, 2, f"Не удалось сохранить индекс для {file_name}: {str(e)}"
+                chat_id, g.AGENT_UID, f"Не удалось сохранить индекс для {file_name}: {str(e)}"
             )
 
     def entity_index(self, chat_id: int):
@@ -186,15 +201,13 @@ class LLMInteractor(ContextAssembler):
         last_post_id = 0
         log.debug("Упаковка %d блоков контента для rql=%d", len(ci.blocks), rql)
         try:
-            sid_project = g.chat_manager.active_project(actor.user_id)
-            self.active_project_id = sid_project
-            proj_man = ProjectManager.get(sid_project) if sid_project else g.project_manager
+            proj_man = g.current_project_manager.get() or g.project_manager  # TODO(pre-release): remove g.project_manager fallback after ContextVar adoption is verified
             project_name = proj_man.project_name
             packer = SandwichPack(project_name, max_size=1_000_000, compression=True)
             result = packer.pack(ci.blocks, users=ci.users)
             self.entities_idx[ci.chat_id] = list(packer.entities).copy()
             self.last_sandwich_idx = full_idx = result['index']  # Запомнить индекс, это уже JSON в строке
-            self._write_chat_index(ci.chat_id)  # сохранение отдельного файла с индексом, для перекрестного взаимодействия в разных чатах
+            self._write_chat_index(ci.chat_id, full_idx)  # сохранение отдельного файла с индексом, для перекрестного взаимодействия в разных чатах
 
             context = f"RQL: {rql}\n{full_idx}\n"  # От полного списка блоков забираются только индексы, содержащий описание файлов и сущностей. Детальный deep_index сохранять сейчас нельзя, поскольку привязывается к блокам
 
@@ -242,19 +255,19 @@ class LLMInteractor(ContextAssembler):
         actor = ci.actor
         self.pre_prompt, self.pre_prompt_path = _load_pre_prompt(actor.user_name)
         tokens_limit, tokens_cost = g.user_manager.get_user_token_limits(actor.user_id)
-        context = self.build_context(ci, rql)
+        # build_context is CPU/IO heavy and can block event loop; move it to a worker thread.
+        context = await asyncio.to_thread(self.build_context, ci, rql)
         if not context:
             return "ERROR: failed build_context"
 
         context_file = Path(f"/app/logs/context-{actor.user_name}-{ci.chat_id}.llm")
         try:
-            with open(context_file, "w", encoding="utf-8") as f:
-                f.write(context)
+            await asyncio.to_thread(self._atomic_write_text, context_file, context)
             log.info("Контекст сохранён в %s для user_id=%d, размер=%d символов",
                      str(context_file), actor.user_id, len(context))
         except Exception as e:
             err = f"Не удалось сохранить контекст для {actor.user_name}: {str(e)}"
-            g.post_manager.add_post(ci.chat_id, 2, err, rql=rql)
+            g.post_manager.add_post(ci.chat_id, g.AGENT_UID, err, rql=rql)
             g.handle_exception(err, e)
         sent_tokens = estimate_tokens(context)
         if sent_tokens > tokens_limit:
@@ -300,8 +313,7 @@ class LLMInteractor(ContextAssembler):
                           ci.chat_id, actor.user_id, conn.model, sent_tokens, used_tokens, output_tokens, sources_used, total_cost)
                 text = response.get('text', 'void-response')
                 response_file = Path(f"/app/logs/response-{actor.user_name}-{ci.chat_id}.llm")
-                with open(response_file, "w", encoding="utf-8") as f:
-                    f.write(text)
+                await asyncio.to_thread(self._atomic_write_text, response_file, text)
                 return text
             else:
                 log.error("llm_connection вернул %s", str(response))

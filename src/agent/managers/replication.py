@@ -47,8 +47,16 @@ class ReplicationManager(LLMInteractor):
         log.debug("Загружено %d актёров из таблицы users: ~C95%s~C00", len(rows),
                   str([(row[0], row[1]) for row in rows]))
         for row in rows:
-            actor = ChatActor(row[0], row[1], row[2], row[3],
-                              reasoning_eff=row[4] or "medium",
+            llm_token = row[3]
+            if llm_token:
+                try:
+                    llm_token = g.decrypt_token(llm_token)
+                except Exception as e:
+                    log.warn("Не удалось расшифровать llm_token для user_id=%d (%s): %s",
+                             row[0], row[1], str(e))
+                    llm_token = None
+            actor = ChatActor(row[0], row[1], row[2], llm_token,
+                              reasoning_eff=row[4],
                               post_manager=g.post_manager)
             actors.append(actor)
         return actors
@@ -62,8 +70,18 @@ class ReplicationManager(LLMInteractor):
             g.post_manager.agent_post(task.chat_id, f"Async task caused exception {e}", task.rql + 1, task.post_id)
             self.failed_tasks += 1
 
+    def has_replication_trigger(self, message: str, rql: int = 0) -> bool:
+        if rql > 0 or not message:
+            return False
+        llm_usernames = [actor.user_name for actor in self.actors if actor.llm_connection and actor.user_id > g.AGENT_UID]
+        if not llm_usernames:
+            return False
+        pattern = '|'.join([f'@{re.escape(username)}' for username in llm_usernames] + ['@all'])
+        return bool(re.search(pattern, message, re.IGNORECASE))
+
     def check_start_replication(self, chat_id: int, post_id: int,
-                                user_id: int, message: str, rql: int = 0) -> bool:
+                                user_id: int, message: str, rql: int = 0,
+                                session_id: str | None = None) -> bool:
         """Проверяет условия и запускает репликацию, если rql=0 и есть триггер (@username или @all).
 
         Args:
@@ -84,8 +102,7 @@ class ReplicationManager(LLMInteractor):
         # Проверяем наличие @username (LLM-актёры) или @all
         llm_usernames = [actor.user_name for actor in self.actors if actor.llm_connection and actor.user_id > g.AGENT_UID]
         log.debug("LLM-актёры для проверки триггеров: %s", llm_usernames)
-        pattern = '|'.join([f'@{re.escape(username)}' for username in llm_usernames] + ['@all'])
-        if not re.search(pattern, message, re.IGNORECASE):
+        if not self.has_replication_trigger(message, rql=rql):
             log.debug("Репликация не запущена для post_id=%d, chat_id=%d: нет триггера (@username или @all)",
                       post_id, chat_id)
             return False
@@ -93,7 +110,7 @@ class ReplicationManager(LLMInteractor):
         try:
             log.debug("Запуск репликации для post_id=%d, chat_id=%d, user_id=%d", post_id, chat_id, user_id)
             loop = asyncio.get_event_loop()
-            task = loop.create_task(self.replicate_to_llm(chat_id), name="Replicate to LLM")
+            task = loop.create_task(self.replicate_to_llm(chat_id, post_id=post_id, session_id=session_id), name="Replicate to LLM")
             task.rql = rql
             task.chat_id = chat_id
             task.post_id = post_id
@@ -104,7 +121,7 @@ class ReplicationManager(LLMInteractor):
             log.excpt("Ошибка запуска репликации для post_id=%d, chat_id=%d: %s", post_id, chat_id, e=e)
             user_name = g.user_manager.get_user_name(user_id) or 'unknown'
             error_result = g.post_manager.add_post(
-                chat_id, 2, f"@{user_name} Replication check error: {str(e)}", 0, post_id
+                chat_id, g.AGENT_UID, f"@{user_name} Replication check error: {str(e)}", 0, post_id
             )
             if error_result.get("error"):
                 log.warn("Не удалось сохранить сообщение об ошибке проверки репликации: %s", error_result["error"])
@@ -112,7 +129,7 @@ class ReplicationManager(LLMInteractor):
                 log.debug("Добавлено сообщение об ошибке проверки репликации в chat_id=%d для user_id=2", chat_id)
             return False
 
-    async def _recursive_replicate(self, ci: ContextInput, rql: int = 1, max_rql: int = 5):
+    async def _recursive_replicate(self, ci: ContextInput, rql: int = 1, max_rql: int = 5, session_id: str | None = None):
         """Рекурсивно обрабатывает ответы LLM, добавляя посты и вызывая репликацию для других участников.
 
         Args:
@@ -122,6 +139,11 @@ class ReplicationManager(LLMInteractor):
         """
         actor = ci.actor
         post_man = g.post_manager
+
+        try:
+            max_rql = max(1, int(g.get_session_option(session_id, 'llm_max_rql', max_rql)))
+        except Exception:
+            pass
 
         if rql > max_rql:
             log.info("Достигнут предел рекурсивного диалога %d для actor_id=%d, chat_id=%d",
@@ -136,8 +158,45 @@ class ReplicationManager(LLMInteractor):
 
         try:
             ci.debug_mode = self.debug_mode
-            with ChatLocker(ci.chat_id, actor.user_name):
-                original_response = await self.interact(ci, rql=rql)
+            # Reuse the early stub created by process_post() for this actor, if present.
+            # This avoids showing two sequential spinners to the user.
+            _existing = post_man.latest_post({'chat_id': ci.chat_id, 'user_id': actor.user_id})
+            if _existing and str(_existing.get('message', '')).startswith('⏳'):
+                progress_post_id = _existing['id']
+                log.debug("Повторное использование прогресс-поста id=%d для actor_id=%d", progress_post_id, actor.user_id)
+            else:
+                progress = post_man.add_post(
+                    ci.chat_id,
+                    actor.user_id,
+                    f"⏳ @{actor.user_name} preparing response...",
+                    rql,
+                    None,
+                    0,
+                    session_id=session_id,
+                )
+                progress_post_id = progress.get('post_id') if isinstance(progress, dict) else None
+            progress_started = time.time()
+            last_heartbeat = None
+            interval_ms = g.get_session_option(session_id, 'llm_update_interval_ms', 900)
+            try:
+                interval_s = max(0.3, min(int(interval_ms), 5000) / 1000.0)
+            except Exception:
+                interval_s = 0.9
+
+            async with ChatLocker(ci.chat_id, actor.user_name):
+                task = asyncio.create_task(self.interact(ci, rql=rql), name=f"llm_interact:{actor.user_name}:{ci.chat_id}")
+                while not task.done():
+                    if progress_post_id:
+                        elapsed_wait = max(0, int(time.time() - progress_started))
+                        heartbeat = (
+                            f"⏳ @{actor.user_name} response in progress... {elapsed_wait}s "
+                            f"(update interval {int(interval_s * 1000)}ms)"
+                        )
+                        if heartbeat != last_heartbeat:
+                            post_man.edit_post(progress_post_id, heartbeat, actor.user_id)
+                            last_heartbeat = heartbeat
+                    await asyncio.sleep(interval_s)
+                original_response = await task
             elapsed = time.time() - t_start
             if original_response:
                 log.debug("Ответ получен после %.1f секунд, проверка возможности обработки агентом...", elapsed)
@@ -178,9 +237,23 @@ class ReplicationManager(LLMInteractor):
                     log.debug("Установлен reply_to=%s на основе последнего поста", str(reply_to))
 
                 # Сохраняем ответ модели через add_message
-                post = post_man.add_post(
-                    ci.chat_id, actor.user_id, prefix + agent_command, rql, reply_to, elapsed
-                )
+                if progress_post_id:
+                    post_man.edit_post(progress_post_id, prefix + agent_command, actor.user_id)
+                    post = {
+                        'chat_id': ci.chat_id,
+                        'user_id': actor.user_id,
+                        'post_id': progress_post_id,
+                        'status': 'ok',
+                        'message': prefix + agent_command,
+                        'reply_to': reply_to,
+                        'elapsed': elapsed,
+                        'rql': rql,
+                        'session_id': session_id,
+                    }
+                else:
+                    post = post_man.add_post(
+                        ci.chat_id, actor.user_id, prefix + agent_command, rql, reply_to, elapsed, session_id=session_id
+                    )
                 if not post.get("status"):
                     log.warn("Не удалось сохранить ответ модели для actor_id=%d, chat_id=%d: %s",
                              actor.user_id, ci.chat_id, str(post))
@@ -192,18 +265,20 @@ class ReplicationManager(LLMInteractor):
                     return
                 processed_msg = response_result.get("processed_msg", "")
                 if processed_msg and rql < max_rql:
-                    await self._broadcast(ci.users, ci.chat_id, ci.exclude_id, rql=rql + 1, post_id=post['post_id'])
+                    await self._broadcast(ci.users, ci.chat_id, ci.exclude_id, rql=rql, max_rql=max_rql, post_id=post['post_id'], session_id=session_id)
                 agent_reply = response_result.get("agent_reply")
-                if agent_reply:
+                if agent_reply and rql < max_rql:
                     log.debug("Добавлен ответ агента для chat_id=%d: %s, проверка на репликацию", ci.chat_id, agent_reply[:50])
                     agent_post = g.post_manager.latest_post({'chat_id': ci.chat_id, 'user_id': g.AGENT_UID})
                     if isinstance(agent_post, dict) and agent_post.get('id'):
-                        await self._broadcast(ci.users, ci.chat_id, ci.exclude_id, rql=rql + 1, post_id=agent_post.get('id'))
+                        await self._broadcast(ci.users, ci.chat_id, ci.exclude_id, rql=rql, max_rql=max_rql, post_id=agent_post.get('id'), session_id=session_id)
                     else:
                         log.error("latest_post returned %s, can't broadcast response to LLM,", str(agent_post))
 
             else:
                 log.warn("Ответ от LLM не получен для user_id=%d, rql=%d: %s", actor.user_id, rql, str(original_response))
+                if progress_post_id:
+                    post_man.edit_post(progress_post_id, f"⚠️ @{actor.user_name} no response (elapsed {elapsed:.1f}s)", actor.user_id)
                 g.post_manager.agent_post(
                     ci.chat_id, f"Нет ответа от LLM для {actor.user_name}, время запроса {elapsed} сек.", rql, None
                 )
@@ -219,7 +294,8 @@ class ReplicationManager(LLMInteractor):
         content_blocks.extend(self.assemble_spans())
         return content_blocks
 
-    async def _broadcast(self, users: list, chat_id: int, exclude_id: int = None, rql: int = 0, post_id: int = -1):
+    async def _broadcast(self, users: list, chat_id: int, exclude_id: int = None, rql: int = 0,
+                         post_id: int = -1, max_rql: int = 5, session_id: str | None = None):
         """Отправляет контент всем LLM-актёрам при @all и RQL <= 1, иначе по триггерам.
 
         Args:
@@ -228,6 +304,8 @@ class ReplicationManager(LLMInteractor):
             exclude_id (int, optional): ID пользователя для исключения.
             rql (int, optional: Уровень рекурсии репликации (0 для начала, от инициатора)
             post_id (int, optional): ID поста, в котором смотреть получателей репликации
+            max_rql (int, optional): Максимальный уровень рекурсии, пробрасывается в _recursive_replicate.
+            session_id (str | None, optional): HTTP session id инициатора для runtime опций.
         """
 
         cond = {'chat_id': chat_id}
@@ -292,7 +370,7 @@ class ReplicationManager(LLMInteractor):
                 log.debug(f"{action} диалог между %s и %s для chat_id=%d, trigger = %d", user_name, actor.user_name, chat_id, trigger)
                 content_blocks = self.collect_blocks(chat_id, exclude_id)
                 ci = ContextInput(content_blocks, users, chat_id, actor, exclude_id)
-                coro = self._recursive_replicate(ci, rql + 1)
+                coro = self._recursive_replicate(ci, rql + 1, max_rql=max_rql, session_id=session_id)
                 coro_list.append(coro)
                 processed_actors.add(actor.user_id)
             else:
@@ -326,12 +404,13 @@ class ReplicationManager(LLMInteractor):
                     g.handle_exception(
                         f"Не удалось обновить llm_context для actor_id={actor.user_id}, chat_id={chat_id}", e)
 
-    async def replicate_to_llm(self, chat_id: int, exclude_source_id: int = None):
+    async def replicate_to_llm(self, chat_id: int, exclude_source_id: int = None, post_id: int = -1, session_id: str | None = None):
         """Запускает репликацию контента для указанного chat_id.
 
         Args:
             chat_id (int): ID чата.
             exclude_source_id (int, optional): ID пользователя для исключения.
+            post_id (int, optional): ID исходного поста для точной адресации в _broadcast.
         """
 
         replication_key = (chat_id, exclude_source_id)
@@ -353,7 +432,8 @@ class ReplicationManager(LLMInteractor):
                         'admin' if username == 'admin' else 'mcp' if username == 'agent' else 'developer')
                 users.append({"user_id": actor.user_id, "username": username, "role": role})
 
-            await self._broadcast(users, chat_id, exclude_source_id)
+            max_rql = max(1, int(g.get_session_option(session_id, 'llm_max_rql', 5)))
+            await self._broadcast(users, chat_id, exclude_source_id, post_id=post_id, max_rql=max_rql, session_id=session_id)
             log.debug("Диалог завершён для chat_id=%d, exclude_source_id=%s", chat_id, str(exclude_source_id))
         finally:
             self.active_replications.remove(replication_key)

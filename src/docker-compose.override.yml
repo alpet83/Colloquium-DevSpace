@@ -1,0 +1,18 @@
+services:
+  postgres:
+    volumes:
+      - /opt/data/pgdata:/var/lib/postgresql/data    
+  colloquium-core:
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DEBUG_MODE=False  
+    volumes:
+      # Local deployment-only bind mounts for real project trees.
+      - P:/vps.alpet.me/sigsys-ts:/app/projects/sigsys-ts
+      - P:/opt/docker:/app/projects/Colloquium-DevSpace     
+
+  mcp-sandbox:
+    volumes:
+      # Keep sandbox view consistent with core.
+      - P:/vps.alpet.me/sigsys-ts:/app/projects/sigsys-ts
+      - P:/opt/docker:/app/projects/Colloquium-DevSpace

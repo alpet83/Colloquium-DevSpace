@@ -5,10 +5,11 @@
     <ul>
       <li v-for="(node, name) in tree.nodes" :key="name" :style="{ 'margin-left': level * 20 + 'px' }">
         <div v-if="node.type === 'directory'" class="directory">
-          <span class="toggle" @click="toggleExpand(name, index)">
+          <span class="toggle" @click="toggleExpand(node, name, index)">
             {{ expanded[index] && expanded[index][name] ? '▼' : '▶' }}  
           </span>
           <span  @click="selectDir(node, name)">{{ name }}</span>
+          <span v-if="node.loading" class="tree-status">...</span>
         </div>
         <div v-else class="file">
           <span @click="selectFile(node.id)">{{ name }}</span>
@@ -49,13 +50,32 @@ export default defineComponent({
     return { authStore, fileStore, expanded, mitt }
   },
   methods: {
-    toggleExpand(nodeName, treeIndex) {
+    async toggleExpand(node, nodeName, treeIndex) {
       if (!this.expanded[treeIndex]) {
         this.expanded[treeIndex] = reactive({})
       }
-      this.expanded[treeIndex][nodeName] = !this.expanded[treeIndex][nodeName]
+      const nextState = !this.expanded[treeIndex][nodeName]
+      this.expanded[treeIndex][nodeName] = nextState
+      if (nextState && node.type === 'directory' && node.has_more && !node.isLoaded && !node.loading) {
+        await this.loadChildren(node)
+      }
       log_msg('FILE', 'Toggled expand for: %s, Tree %s, New state: %s', nodeName, treeIndex, this.expanded[treeIndex][nodeName])
     }, 
+    async loadChildren(node) {
+      try {
+        node.loading = true
+        const payload = await this.fileStore.fetchFileTree(node.project_id ?? null, node.path, 1)
+        const tree = (payload?.trees || []).find(item => item.project_id === node.project_id) || payload?.trees?.[0]
+        node.children = tree?.nodes || {}
+        node.isLoaded = true
+        node.has_more = false
+        log_msg('FILE', 'Loaded subtree for path: %s, nodes=%s', node.path, Object.keys(node.children).length)
+      } catch (error) {
+        log_error(this, error, `load subtree ${node.path}`)
+      } finally {
+        node.loading = false
+      }
+    },
     selectDir(node, name) {            
       const dirPath = node.path
       log_msg('FILE', 'Selecting directory: %s, path: %s', name, dirPath)
@@ -104,6 +124,11 @@ li {
 .toggle {
   width: 20px;
   text-align: center;
+}
+.tree-status {
+  margin-left: 6px;
+  opacity: 0.7;
+  font-size: 12px;
 }
 .file {
   display: inline-flex;

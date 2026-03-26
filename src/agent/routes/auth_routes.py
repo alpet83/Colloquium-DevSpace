@@ -170,18 +170,32 @@ async def save_user_settings(request: Request):
         mode = data.get("mode", "off")
         sources = json.dumps([src for src in data.get("sources", ["web", "x", "news"]) if src in ["web", "x", "news"]])
         max_search_results = data.get("max_search_results", 20)
-        db.execute(
-            'INSERT OR REPLACE INTO user_settings (user_id, search_mode, search_sources, max_search_results, from_date, to_date) '
-            'VALUES (:user_id, :mode, :sources, :max_search_results, :from_date, :to_date)',
-            {
-                'user_id': user_id,
-                'mode': mode,
-                'sources': sources,
-                'max_search_results': max_search_results,
-                'from_date': data.get("from_date"),
-                'to_date': data.get("to_date")
-            }
-        )
+        params = {
+            'user_id': user_id,
+            'mode': mode,
+            'sources': sources,
+            'max_search_results': max_search_results,
+            'from_date': data.get("from_date"),
+            'to_date': data.get("to_date")
+        }
+        if db.is_postgres():
+            db.execute(
+                'INSERT INTO user_settings (user_id, search_mode, search_sources, max_search_results, from_date, to_date) '
+                'VALUES (:user_id, :mode, :sources, :max_search_results, :from_date, :to_date) '
+                'ON CONFLICT (user_id) DO UPDATE SET '
+                'search_mode = EXCLUDED.search_mode, '
+                'search_sources = EXCLUDED.search_sources, '
+                'max_search_results = EXCLUDED.max_search_results, '
+                'from_date = EXCLUDED.from_date, '
+                'to_date = EXCLUDED.to_date',
+                params
+            )
+        else:
+            db.execute(
+                'INSERT OR REPLACE INTO user_settings (user_id, search_mode, search_sources, max_search_results, from_date, to_date) '
+                'VALUES (:user_id, :mode, :sources, :max_search_results, :from_date, :to_date)',
+                params
+            )
         log.debug(globals.with_session_tag(request, "Сохранены настройки для user_id=%d: mode=%s, sources=%s, max_search_results=%d"),
                   user_id, mode, sources, max_search_results)
         return {"status": "Settings saved"}

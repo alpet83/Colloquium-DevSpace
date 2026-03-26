@@ -3,8 +3,8 @@ import re, os
 import json
 import globals as g
 import hashlib
-from managers.project import ProjectManager
 from datetime import datetime
+from managers.project import ProjectManager
 from processors.block_processor import BlockProcessor, res_error, res_success, ProcessorError
 
 log = g.get_logger("llm_proc")
@@ -37,8 +37,7 @@ class SpanProcessor(BlockProcessor):
         self.attrs = None
 
     def _load_file(self, file_id: int):
-        pid = self.attrs.get('project_id') if isinstance(self.attrs, dict) else None
-        file_name, source, project_id = self.get_file_data(file_id, self.user_name, pid)
+        file_name, source, project_id = self.get_file_data(file_id, self.user_name)
         self.file_lines = [''] + source.splitlines(keepends=True)
         qfn = ProjectManager.get(project_id).locate_file(file_name, project_id)
         mt = os.path.getmtime(qfn)

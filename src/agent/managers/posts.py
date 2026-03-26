@@ -2,9 +2,9 @@
 import json
 import time
 import re
-import os
 import asyncio
 from managers.db import Database, DataTable
+from managers.project import ProjectManager
 import globals as g
 from lib.basic_logger import BasicLogger
 
@@ -149,21 +149,40 @@ class PostManager:
         )
         user_name = user_row[1] if user_row else 'unknown'
         t_start = time.time()
+        replication_progress_post_id = None
 
-        # Определяем активный проект строго в контексте текущей сессии.
+        # Show immediate feedback for long-running LLM-triggered flows before heavier processing starts.
+        if allow_rep and g.replication_manager.has_replication_trigger(message, rql=rql):
+            _triggered = next((
+                a for a in g.replication_manager.actors
+                if a.llm_connection and a.user_id > g.AGENT_UID
+                and (f'@{a.user_name}'.lower() in message.lower() or '@all' in message.lower())
+            ), None)
+            _p_uid = _triggered.user_id if _triggered else g.AGENT_UID
+            _p_name = _triggered.user_name if _triggered else 'agent'
+            progress_post = self.add_post(
+                chat_id,
+                _p_uid,
+                f"⏳ LLM request accepted, preparing response...",
+                rql,
+                post_id,
+                0,
+                session_id=session_id,
+            )
+            if isinstance(progress_post, dict) and progress_post.get('status') == 'ok':
+                replication_progress_post_id = progress_post.get('post_id')
+
+        # Вытаскиваем проект в контексте текущего запроса, устанавливаем через ContextVar (async-safe).
         project_id = g.chat_manager.active_project(user_id, session_id=session_id) if session_id else None
-        if project_id is None:
-            project_id = getattr(g.project_manager, 'project_id', None)
+        if project_id is not None:
+            proj_man = ProjectManager.get(project_id)
+            g.current_project_manager.set(proj_man)
 
         # через пост-процессор не требуется пропускать лишь ответы агента
-        if chat_id != 2:
+        if user_id != g.AGENT_UID:
             try:
                 pp = g.post_processor
-                process_timeout = int(os.getenv("CQDS_POST_PROCESS_TIMEOUT_SEC", "240"))
-                result = await asyncio.wait_for(
-                    pp.process_response(chat_id, user_id, message, post_id, project_id=project_id),
-                    timeout=process_timeout,
-                )  # может занять много времени, если выполнять команды MCP
+                result = await pp.process_response(chat_id, user_id, message, post_id)  # может занять много времени, если выполнять команды MCP
                 log.debug("Результат process_response: handled_cmds=%d, failed_cmds=%d, processed_msg=%s",
                           result["handled_cmds"], result["failed_cmds"], result["processed_msg"][:50])
                 if isinstance(result, dict):
@@ -174,9 +193,6 @@ class PostManager:
                         agent_message = f"@{user_name} {agent_message or 'Unknown error'}"
                 else:
                     raise ValueError("Unexpected process_response result type: %s" % type(result))
-            except asyncio.TimeoutError:
-                log.warn("Timeout in post_processor for chat_id=%d, user_id=%d", chat_id, user_id)
-                agent_message = f"@{user_name} Timeout: message processing exceeded configured limit"
             except Exception as e:
                 log.excpt("Ошибка обработки сообщения в post_processor", e=e)
                 agent_message = f"@{user_name} Error processing message: {str(e)}"
@@ -189,7 +205,7 @@ class PostManager:
         # Добавляем ответ агента, если есть
         if agent_message:
             elapsed = time.time() - t_start
-            agent_result = self.add_post(chat_id, 2, agent_message, rql, post_id, elapsed)
+            agent_result = self.add_post(chat_id, g.AGENT_UID, agent_message, rql, post_id, elapsed)
             if agent_result.get("error"):
                 log.warn("Не удалось сохранить ответ агента: %s", agent_result["error"])
             else:
@@ -200,7 +216,12 @@ class PostManager:
         # Проверяем необходимость репликации
         sr = False
         if allow_rep:
-            sr = g.replication_manager.check_start_replication(chat_id, post_id, user_id, message, rql)
+            sr = g.replication_manager.check_start_replication(chat_id, post_id, user_id, message, rql, session_id=session_id)
+            # Ранний прогресс-пост:
+            #   sr=False → репликация не запустилась, удаляем (ответа не будет)
+            #   sr=True  → _recursive_replicate подхватит его по user_id и наполнит ответом
+            if replication_progress_post_id and not sr:
+                self.delete_post(replication_progress_post_id, g.AGENT_UID)
 
         log.debug("Обработка сообщения %d в чате %d завершена %s",
                   post_id, chat_id, 'с репликацией' if sr else 'без репликации')

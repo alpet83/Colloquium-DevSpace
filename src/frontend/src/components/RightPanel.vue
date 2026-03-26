@@ -57,8 +57,8 @@
         <button @click="updateProject">Сохранить</button>
         <button @click="closeEditProjectModal">Отмена</button>
       </dialog>
-      <div v-if="filteredFiles.length" class="file-tree">
-        <FileManager :files="filteredFiles" @delete-file="fileStore.deleteFile" @update-file="fileStore.updateFile" />
+      <div v-if="fileTrees.length" class="file-tree">
+        <FileManager :trees="fileTrees" @delete-file="fileStore.deleteFile" @update-file="fileStore.updateFile" />
       </div>
       <div v-else class="no-files">
         <p>Файлы не найдены</p>
@@ -100,7 +100,8 @@ export default defineComponent({
         mode: 'off',
         sources: ['web', 'x', 'news'],
         max_search_results: 20
-      }
+      },
+      fileTrees: []
     }
   },
   setup() {
@@ -110,36 +111,17 @@ export default defineComponent({
     const isCollapsed = ref(false)
     return { fileStore, authStore, mitt, isCollapsed }
   },
-  computed: {
-    filteredFiles() {
-      // log_msg('FILE', 'Computing filteredFiles, fileStore.files:', JSON.stringify(this.fileStore.files, null, 2), 'selectedProject:', this.selectedProject)
-      if (!this.selectedProject) {
-        return this.fileStore.files          
-          .map(file => ({
-            ...file,
-            file_name: file.file_name.startsWith('/') ? file.file_name.slice(1) : file.file_name
-          }))
-      }
-      const projectId = parseInt(this.selectedProject)
-      return this.fileStore.files
-        .filter(file => file.project_id > 0 && file.project_id === projectId)
-        .map(file => ({
-          ...file,
-          file_name: file.file_name.startsWith('/') ? file.file_name.slice(1) : file.file_name
-        }))
-    }
-  },
   mounted() {
     this.fetchProjects()
-    this.loadProjectFiles()
+    this.loadProjectTree()
     this.loadSearchSettings()
-    this.mitt.on('files-updated', () => {
+    this.mitt.on('file-tree-changed', () => {
       clearTimeout(this.debounceLoadFiles)
-      this.debounceLoadFiles = setTimeout(() => this.loadProjectFiles(), 100)
+      this.debounceLoadFiles = setTimeout(() => this.loadProjectTree(), 100)
     })
   },
   beforeUnmount() {
-    this.mitt.off('files-updated')
+    this.mitt.off('file-tree-changed')
     clearTimeout(this.debounceLoadFiles)
   },
   methods: {
@@ -161,13 +143,14 @@ export default defineComponent({
         log_error(this, e, 'fetch projects')
       }
     },
-    async loadProjectFiles() {
+    async loadProjectTree() {
       try {
         const project_id = this.selectedProject ? parseInt(this.selectedProject) : null
-        log_msg('FILE', 'Loading files for project_id:', project_id)
-        await this.fileStore.fetchFiles(project_id)
+        log_msg('FILE', 'Loading shallow file tree for project_id:', project_id)
+        const payload = await this.fileStore.fetchFileTree(project_id, '', 3)
+        this.fileTrees = payload?.trees || []
       } catch (e) {
-        log_error(this, e, 'load files')
+        log_error(this, e, 'load file tree')
       }
     },
     async selectProject() {
@@ -181,7 +164,7 @@ export default defineComponent({
           body: JSON.stringify({ project_id }),
           credentials: 'include'
         })
-        await this.loadProjectFiles()
+        await this.loadProjectTree()
       } catch (e) {
         log_error(this, e, 'select project')
       }
@@ -251,7 +234,7 @@ export default defineComponent({
           this.selectedProject = data.project_id
           this.fileStore.setSelectedProject(data.project_id)
           await this.fetchProjects()
-          await this.loadProjectFiles()
+          await this.loadProjectTree()
           this.closeCreateProjectModal()
           log_msg('UI', 'Created project:', data)
         } else {
@@ -284,7 +267,7 @@ export default defineComponent({
         })
         if (res.ok) {
           await this.fetchProjects()
-          await this.loadProjectFiles()
+          await this.loadProjectTree()
           this.closeEditProjectModal()
           log_msg('UI', 'Updated project:', this.editProject)
         } else {

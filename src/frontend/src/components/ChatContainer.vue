@@ -17,7 +17,7 @@
              placeholder="Полное имя файла (например, trade_report/src/test.rs)"
              list="fileSuggestions" />
       <datalist id="fileSuggestions">
-        <option v-for="file in fileStore.files" :value="file.file_name" :key="file.id" />
+        <option v-for="file in fileStore.knownFiles" :value="file.file_name" :key="file.id" />
       </datalist>
       <button @click="confirmFileUpload">Загрузить</button>
       <button @click="doModal('fileConfirmModal', false)">Отмена</button>
@@ -80,13 +80,27 @@
     <div v-if="activeTab === 'chat'" class="message-input">
       <p v-if="chatStore.status.status === 'busy'" class="processing-status">
         Идёт обработка запроса {{ chatStore.status.actor || 'unknown' }}, прошло {{ chatStore.status.elapsed || 0 }} секунд...
+        wait_avg={{ chatStore.status.lock_wait_ms_avg || 0 }}ms, hold_avg={{ chatStore.status.lock_hold_ms_avg || 0 }}ms
       </p>
+      <div class="llm-update-interval">
+        <label for="llm-update-interval-input">Интервал апдейта LLM (мс):</label>
+        <input
+          id="llm-update-interval-input"
+          type="number"
+          min="300"
+          max="5000"
+          step="100"
+          :value="chatStore.llmUpdateIntervalMs"
+          @change="chatStore.setLlmUpdateInterval($event.target.value)"
+        />
+      </div>
       <textarea
         v-model="newMessage"
         ref="messageInput"
         placeholder="Сообщение (@agent для команд или <code_file> для кода)"
         rows="4"
         wrap="soft"
+        :disabled="isInputLocked"
         @input="autoResize($event, 'messageInput')"
         @keyup.enter="sendMessage"
       ></textarea>
@@ -95,9 +109,10 @@
         <button @click="fileStore.clearAttachment">Очистить</button>
       </div>
       <input type="file"
+              :disabled="isInputLocked"
              @change="doModal('fileConfirmModal', true, { pendingFile: $event.target.files[0],
              pendingFileName: $event.target.files[0]?.name || '' })" />
-      <button @click="doModal('createChatModal', true, { newChatDescription: '' },
+            <button :disabled="isInputLocked" @click="doModal('createChatModal', true, { newChatDescription: '' },
               (comp) => comp.chatStore.openCreateChatModal(Object.values(comp.chatStore.history)
               .sort((a, b) => a.id - b.id)[Object.values(comp.chatStore.history).length - 1]?.id))">Ответвление</button>
     </div>
@@ -152,6 +167,10 @@
       return { chatStore, fileStore, authStore, mitt }
     },
     computed: {
+      isInputLocked() {
+        const status = this.chatStore.status?.status
+        return this.chatStore.llmPending || status === 'busy'
+      },
       formattedMessages() {
         return Object.values(this.chatStore.history)
           .filter(post => post.action !== 'delete')
@@ -159,7 +178,7 @@
           .map(msg => ({
             ...msg,
             formatted: formatMessage(msg.message, msg.user_name, msg.timestamp, this.chatStore.quotes,
-                                    this.fileStore.files, msg.id, this)
+                                    this.fileStore.knownFiles, msg.id, this)
           }))
       }
     },
@@ -167,7 +186,7 @@
       this.startPolling()
       this.mitt.on('select-dir', (dirPath) => this.handleSelectDir(dirPath))
       this.mitt.on('select-file', (fileId) => this.handleSelectFile(fileId))
-      this.mitt.on('files-updated', () => reformatMessages(this))
+      this.mitt.on('file-meta-updated', () => reformatMessages(this))
       this.$nextTick(() => {
         this.autoResize({ target: this.$refs.messageInput }, 'messageInput')        
         this.applyHighlightJS()
@@ -181,7 +200,7 @@
       this.stopPolling()
       this.mitt.off('select-dir')
       this.mitt.off('select-file')
-      this.mitt.off('files-updated')
+      this.mitt.off('file-meta-updated')
       if (this.backendLogInterval) {
         clearInterval(this.backendLogInterval)
       }

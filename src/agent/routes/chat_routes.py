@@ -78,7 +78,7 @@ async def get_chat(request: Request, chat_id: int, wait_changes: int = 0):
                 if status['status'] == 'busy' and max_wait > 1:
                     log.debug(g.with_session_tag(request, " Ожидание сокращено, поскольку чат занят пользователем %s "), status['actor'])
                     max_wait = 1
-                active = g.chat_manager.active_chat(user_id)
+                active = g.chat_manager.active_chat(user_id, session_id)
                 if active is None:
                     active = 0
 
@@ -134,9 +134,18 @@ async def post_message(request: Request):
         data = await request.json()
         chat_id = data.get('chat_id')
         message = data.get('message')
+        interval = data.get('llm_update_interval_ms')
         if not chat_id or not message:
             log.info(g.with_session_tag(request, "Неверные параметры chat_id=%s или message для IP=%s"), str(chat_id) if chat_id is not None else "None", request.client.host)
             raise HTTPException(status_code=400, detail="Missing chat_id or message")
+        if interval is not None:
+            try:
+                iv = int(interval)
+                iv = max(300, min(iv, 5000))
+                g.set_session_option(session_id, 'llm_update_interval_ms', iv)
+                log.debug(g.with_session_tag(request, "Обновлён session-option llm_update_interval_ms=%d"), iv)
+            except Exception:
+                log.warn(g.with_session_tag(request, "Игнорируется некорректный llm_update_interval_ms=%s"), str(interval))
         post = g.post_manager.add_post(
             chat_id, user_id, message, rql=0, reply_to=None, session_id=session_id
         )

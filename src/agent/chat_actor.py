@@ -4,7 +4,7 @@ from llm_api import *
 
 class ChatActor:
     def __init__(self, user_id, user_name, llm_class=None, llm_token=None,
-                 reasoning_eff="medium", post_manager=None):
+                 reasoning_eff=None, post_manager=None):
         self.user_id = user_id
         self.user_name = user_name
         self.llm_class = llm_class

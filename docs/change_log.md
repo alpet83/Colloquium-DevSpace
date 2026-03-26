@@ -27,26 +27,6 @@
   - Added `postgresql-client` in `Dockerfile.core`.
   - Mounted `./secrets:/run/secrets:ro` into `colloquium-core` in `docker-compose.yml`.
 
-### Deployment automation and first-run reliability
-- Added automated deployment scripts:
-  - `scripts/deploy-cqds.ps1` (Windows PowerShell)
-  - `scripts/deploy-cqds.sh` (Linux and Git Bash)
-- Scripts now bootstrap a working environment even without any existing DB backup:
-  - Start `postgres` first and wait for healthy status.
-  - Reconcile `cqds` role and password with the current deployment secret.
-  - Ensure `cqds` database exists and import prototype schema (`postgres/init/02-cqds-schema.sql`) when `users` table is missing.
-- Added optional backup-restore path:
-  - If dump files are found, restore can be requested (interactive) or forced by flag/env.
-  - Non-interactive mode defaults to no restore unless explicitly enabled.
-- Added post-deploy admin-password guidance in scripts:
-  - Scripts print a fragment from `logs/colloquium_core.log` with the temporary admin password when it is generated on first run.
-  - If admin already exists, scripts print an explicit note that generation may have been skipped.
-- Improved portability and robustness of the shell script:
-  - Fallback sync when `rsync` is unavailable.
-  - Safe password generation with `pipefail` enabled.
-  - Windows Git Bash path normalization for Docker volume mounts during restore.
-  - Overlay copy for `agent/lib` to avoid deleting core modules.
-
 ## TODO / Known Issues
 
 ### Per-session project isolation (priority: high)

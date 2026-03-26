@@ -29,7 +29,7 @@ export async function sendMessage(component, event) {
     component.chatStore.status = { status: 'free', actor: null, elapsed: 0 }
     log_msg('CHAT', 'Initialized chatStore.status to default')
   }
-  if (component.chatStore.status.status === 'busy') {
+  if (component.chatStore.llmPending || component.chatStore.status.status === 'busy') {
     log_msg('CHAT', 'Отправка заблокирована: идёт обработка запроса', component.chatStore.status)
     component.chatStore.chatError = 'Отправка заблокирована: идёт обработка запроса'
     component.debugLogs.push({
@@ -69,7 +69,7 @@ export async function editPost(component) {
     component.chatStore.status = { status: 'free', actor: null, elapsed: 0 }
     log_msg('CHAT', 'Initialized chatStore.status to default')
   }
-  if (component.chatStore.status.status === 'busy') {
+  if (component.chatStore.llmPending || component.chatStore.status.status === 'busy') {
     log_msg('CHAT', 'Редактирование заблокировано: идёт обработка запроса', component.chatStore.status)
     component.chatStore.chatError = 'Редактирование заблокирована: идёт обработка запроса'
     component.debugLogs.push({
@@ -129,7 +129,7 @@ export async function showFilePreview(component, fileId) {
         handleModal(component, 'filePreviewModal', true)      
         const codeElement = document.getElementById('file-preview-code')  // <code id="file-preview-code">
         if (codeElement && window.hljs) {          
-          let lc = lang_class(component.fileStore.files, fileId)                  
+          let lc = lang_class(component.fileStore.knownFiles, fileId)                  
           codeElement.className = `framed-code ${lc}`          
           codeElement.removeAttribute('data-highlighted')          
           window.hljs.highlightElement(codeElement)               

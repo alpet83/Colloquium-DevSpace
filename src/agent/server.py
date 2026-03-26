@@ -108,12 +108,12 @@ def server_init():
                                            ]
                                            )
 
-
-        globals.post_processor = PostProcessor()
         log.info("Инициализация менеджеров")
         globals.user_manager = UserManager()
         globals.chat_manager = ChatManager()
+        globals.post_processor = PostProcessor()
         globals.post_manager = PostManager(globals.user_manager)
+        globals.project_registry = {}
         globals.project_manager = ProjectManager()
         # Auto-load first project as default so processors work after restart
         try:
@@ -122,10 +122,25 @@ def server_init():
             )
             if first:
                 globals.project_manager = ProjectManager(first[0][0])
+                globals.project_registry[first[0][0]] = globals.project_manager
                 log.info("Авто-загружен проект id=%d как дефолтный", first[0][0])
         except Exception as _e:
             log.warn("Не удалось авто-загрузить проект: %s", str(_e))
         globals.file_manager = FileManager()
+        # Scan all projects at startup to populate attached_files.
+        # Removed from ProjectManager.load() for speed; this is the single reliable trigger.
+        try:
+            all_projects = globals.project_manager.projects_table.select_from(
+                columns=['id'], conditions='id > 0'
+            )
+            for proj_row in (all_projects or []):
+                pid = proj_row[0]
+                pm = ProjectManager.get(pid)
+                if pm is not None:
+                    log.info("Сканирование файлов проекта id=%d при запуске", pid)
+                    pm.scan_project_files()
+        except Exception as _e:
+            log.warn("Ошибка сканирования проектов при запуске: %s", str(_e))
         dbg = os.getenv("DEBUG_MODE", "0").strip().lower()
         debug_enabled = dbg in ("1", "true", "yes", "on")
         log.debug("ENV DEBUG_MODE=%s parsed=%s", dbg, str(debug_enabled))

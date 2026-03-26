@@ -26,7 +26,31 @@ class UserManager:
                 "salt TEXT"
             ]
         )
+        self._migrate_llm_tokens()
         self._init_users()
+
+    def _migrate_llm_tokens(self):
+        rows = self.users_table.select_from(
+            columns=["user_id", "user_name", "llm_token"],
+            conditions=[("llm_token", "IS NOT", None)]
+        )
+        migrated = 0
+        for row in rows:
+            user_id, user_name, llm_token = row
+            if not llm_token:
+                continue
+            if g.is_encrypted_token(llm_token):
+                try:
+                    g.decrypt_token(llm_token)
+                except Exception as e:
+                    log.warn("Некорректный зашифрованный llm_token для user_id=%d (%s): %s", user_id, user_name, str(e))
+                continue
+            enc = g.encrypt_token(llm_token)
+            if enc and enc != llm_token:
+                self.users_table.update(values={"llm_token": enc}, conditions={"user_id": user_id})
+                migrated += 1
+        if migrated > 0:
+            log.info("Миграция llm_token: зашифровано %d записей", migrated)
 
     def _init_users(self):
         count = self.users_table.select_row(
@@ -130,4 +154,4 @@ class UserManager:
             columns=["llm_reasoning_eff"],
             conditions={"user_id": user_id}
         )
-        return row[0] if row and row[0] else "medium"
+        return row[0] if row and row[0] else "none"

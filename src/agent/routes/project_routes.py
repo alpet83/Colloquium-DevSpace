@@ -1,15 +1,18 @@
-# /agent/routes/project_routes.py, updated 2025-07-18 14:28 EEST
+# /agent/routes/project_routes.py, updated 2026-03-26 — simplified sync indexing + cache
+import json
+import re
+import time
+import asyncio
+from datetime import datetime
+from pathlib import Path
+
 from fastapi import APIRouter, Request, HTTPException, Query
 from managers.db import Database
 from managers.project import ProjectManager
 from context_assembler import ContextAssembler
 from lib.sandwich_pack import SandwichPack
 from fnmatch import fnmatch
-import re
-import time
-from datetime import datetime
 import globals as g
-import json
 from lib.basic_logger import BasicLogger
 
 router = APIRouter()
@@ -33,6 +36,73 @@ SMART_GREP_PROFILES = {
 }
 
 
+def project_index_cache_path(project_name: str) -> Path:
+    return Path('/app/projects/.cache') / f'{project_name}_index.jsl'
+
+
+def read_project_cached_index(project_name: str) -> dict | None:
+    cache_path = project_index_cache_path(project_name)
+    if not cache_path.exists():
+        return None
+    return json.loads(cache_path.read_text(encoding='utf-8'))
+
+
+def get_project_index_status(project_id: int, project_name: str) -> dict:
+    cache_path = project_index_cache_path(project_name)
+    cache_exists = cache_path.exists()
+    cache_mtime = int(cache_path.stat().st_mtime) if cache_exists else None
+    file_entries = g.file_manager.file_index(project_id)
+    latest_file_ts = max((int(entry.get('ts') or 0) for entry in file_entries), default=0) or None
+    stale = bool(cache_exists and latest_file_ts and cache_mtime and latest_file_ts > cache_mtime)
+    return {
+        'project_id': project_id,
+        'project_name': project_name,
+        'status': 'ready' if cache_exists and not stale else ('stale' if cache_exists else 'missing'),
+        'cache_path': str(cache_path),
+        'cache_exists': cache_exists,
+        'cache_mtime': cache_mtime,
+        'latest_file_ts': latest_file_ts,
+        'stale': stale,
+        'running': False,
+        'started_at': None,
+        'finished_at': None,
+        'error': None,
+        'files': None,
+        'blocks': None,
+        'entities': None,
+    }
+
+
+def _resolve_project(project_id: int) -> tuple[ProjectManager, str]:
+    pm = ProjectManager.get(project_id)
+    if pm is None or pm.project_name is None:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+    return pm, pm.project_name
+
+
+def _build_project_index_sync(project_id: int, project_name: str) -> tuple[dict, int, int, int, str]:
+    file_entries = g.file_manager.file_index(project_id)
+    if not file_entries:
+        raise HTTPException(status_code=404, detail=f"No files in project {project_id}")
+    file_ids_set = {entry['id'] for entry in file_entries}
+
+    assembler = ContextAssembler()
+    file_map = {}
+    blocks = assembler.assemble_files(file_ids_set, file_map)
+    if not blocks:
+        raise HTTPException(status_code=404, detail="No supported files to index in project")
+
+    packer = SandwichPack(project_name, max_size=10_000_000, compression=True)
+    result = packer.pack(blocks)
+    entities_count = len(packer.entities) if packer.entities is not None else 0
+
+    cache_path = project_index_cache_path(project_name)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(result['index'], encoding='utf-8')
+
+    return json.loads(result['index']), len(file_ids_set), len(blocks), entities_count, str(cache_path)
+
+
 def _is_mode_match(file_name: str, mode: str) -> bool:
     mode = mode if mode in SMART_GREP_MODES else 'code'
     globs = SMART_GREP_MODES.get(mode)
@@ -49,6 +119,80 @@ def _is_profile_match(file_name: str, profile: str) -> bool:
         return True
     path = file_name.replace('\\', '/').lstrip('/')
     return any(fnmatch(path, p) for p in globs)
+
+
+def _project_name_map() -> dict:
+    db = Database.get_database()
+    rows = db.fetch_all('SELECT id, project_name FROM projects', {})
+    return {row[0]: row[1] for row in rows}
+
+
+def _sort_tree_nodes(nodes: dict) -> dict:
+    sorted_items = sorted(
+        nodes.items(),
+        key=lambda item: (0 if item[1].get('type') == 'directory' else 1, item[0].lower())
+    )
+    result = {}
+    for name, node in sorted_items:
+        if node.get('type') == 'directory':
+            node['children'] = _sort_tree_nodes(node.get('children', {}))
+        result[name] = node
+    return result
+
+
+def _build_tree_nodes(file_entries: list, base_path: str, depth: int, project_id: int | None) -> dict:
+    root = {}
+    normalized_base = str(base_path or '').lstrip('/').rstrip('/')
+    normalized_prefix = f'{normalized_base}/' if normalized_base else ''
+
+    for entry in file_entries:
+        file_name = str(entry.get('file_name') or '').lstrip('/')
+        if normalized_prefix:
+            if not file_name.startswith(normalized_prefix):
+                continue
+            relative_name = file_name[len(normalized_prefix):]
+        else:
+            relative_name = file_name
+
+        parts = [part for part in relative_name.split('/') if part]
+        if not parts:
+            continue
+
+        node = root
+        for index, part in enumerate(parts):
+            is_terminal = index == len(parts) - 1
+            at_boundary = index == depth - 1
+
+            if is_terminal and index < depth:
+                node.setdefault(part, {
+                    'type': 'file',
+                    'id': entry.get('id'),
+                    'path': file_name,
+                    'project_id': project_id,
+                })
+                break
+
+            full_path = normalized_prefix + '/'.join(parts[:index + 1])
+            dir_node = node.get(part)
+            if not dir_node or dir_node.get('type') != 'directory':
+                dir_node = {
+                    'type': 'directory',
+                    'children': {},
+                    'path': f'{full_path}/',
+                    'project_id': project_id,
+                    'has_more': False,
+                    'isLoaded': not at_boundary,
+                }
+                node[part] = dir_node
+
+            if at_boundary:
+                dir_node['has_more'] = True
+                dir_node['isLoaded'] = False
+                break
+
+            node = dir_node['children']
+
+    return _sort_tree_nodes(root)
 
 
 def _parse_dt_to_ts(value: str) -> int:
@@ -88,6 +232,65 @@ def _cmp(left: int, op: str, right: int) -> bool:
     if op == '<=':
         return left <= right
     return left == right
+
+
+def _scan_state_store() -> dict:
+    state = getattr(g, 'project_scan_state', None)
+    if not isinstance(state, dict):
+        state = {}
+        g.project_scan_state = state
+    return state
+
+
+def _scan_state(project_id: int, project_name: str | None = None) -> dict:
+    state = _scan_state_store().get(project_id, {})
+    return {
+        'project_id': project_id,
+        'project_name': project_name,
+        'stale': bool(state.get('stale', True)),
+        'running': bool(state.get('running', False)),
+        'reason': state.get('reason'),
+        'updated_at': state.get('updated_at'),
+        'started_at': state.get('started_at'),
+        'finished_at': state.get('finished_at'),
+        'duration_sec': state.get('duration_sec'),
+        'files_count': state.get('files_count'),
+        'error': state.get('error'),
+    }
+
+
+async def _run_project_scan_refresh(project_id: int):
+    state = _scan_state_store()
+    current = state.get(project_id, {})
+    current.update({
+        'running': True,
+        'error': None,
+        'started_at': int(time.time()),
+    })
+    state[project_id] = current
+
+    try:
+        pm = ProjectManager.get(project_id)
+        if pm is None or pm.project_name is None:
+            raise ValueError(f"Project {project_id} not found")
+        await asyncio.to_thread(pm.scan_project_files)
+        fresh = _scan_state_store().get(project_id, {})
+        fresh.update({
+            'running': False,
+            'finished_at': int(time.time()),
+            'error': None,
+        })
+        state[project_id] = fresh
+    except Exception as e:
+        failed = _scan_state_store().get(project_id, {})
+        failed.update({
+            'running': False,
+            'finished_at': int(time.time()),
+            'error': str(e),
+            'stale': True,
+        })
+        state[project_id] = failed
+        log.excpt("Ошибка refresh scan для project_id=%d: ", project_id, e=e)
 
 @router.get("/project/list")
 async def list_projects(request: Request):
@@ -175,7 +378,9 @@ async def update_project(request: Request):
             log.info(g.with_session_tag(request, "Неверные параметры project_id=%s, project_name=%s для IP=%s"),
                      str(project_id), str(project_name), request.client.host)
             raise HTTPException(status_code=400, detail="Missing project_id or project_name")
-        project_manager = ProjectManager(project_id)
+        project_manager = ProjectManager.get(project_id)
+        if project_manager is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
         project_manager.update(project_name, description, local_git, public_git, dependencies)
         log.debug(g.with_session_tag(request, "Обновлён проект project_id=%d, project_name=%s для user_id=%d"), project_id, project_name, user_id)
         return {"status": "Project updated"}
@@ -259,49 +464,158 @@ async def file_index(
         raise
 
 
+@router.get("/project/file_tree")
+async def file_tree(
+    request: Request,
+    project_id: int = Query(None),
+    path: str = Query(''),
+    depth: int = Query(3),
+):
+    started = time.monotonic()
+    try:
+        g.check_session(request)
+        effective_project_id = None if project_id is None or project_id < 0 else project_id
+        normalized_path = str(path or '').lstrip('/').rstrip('/')
+        depth = max(1, min(int(depth or 3), 6))
+
+        file_entries = g.file_manager.file_index(effective_project_id)
+        grouped = {}
+        for entry in file_entries:
+            proj_id = entry.get('project_id')
+            grouped.setdefault(proj_id, []).append(entry)
+
+        project_names = _project_name_map()
+        trees = []
+        for grouped_project_id, entries in grouped.items():
+            nodes = _build_tree_nodes(entries, normalized_path, depth, grouped_project_id)
+            if not nodes:
+                continue
+            if grouped_project_id == 0:
+                project_name = '.chat-meta'
+            elif grouped_project_id is None:
+                project_name = 'Global'
+            else:
+                project_name = project_names.get(grouped_project_id) or f'project_{grouped_project_id}'
+            trees.append({
+                'project_id': grouped_project_id,
+                'project_name': project_name,
+                'path': normalized_path,
+                'nodes': nodes,
+            })
+
+        trees.sort(key=lambda tree: ((tree.get('project_id') or 0) <= 0, str(tree.get('project_name') or '').lower()))
+        duration = time.monotonic() - started
+        if duration >= 2:
+            log.warn(
+                g.with_session_tag(request, 'PERF_WARN GET /project/file_tree project_id=%s path=%s depth=%s took=%.2fs trees=%d'),
+                str(effective_project_id), normalized_path or '/', depth, duration, len(trees)
+            )
+        else:
+            log.debug(
+                g.with_session_tag(request, 'GET /project/file_tree project_id=%s path=%s depth=%s took=%.2fs trees=%d'),
+                str(effective_project_id), normalized_path or '/', depth, duration, len(trees)
+            )
+        return {
+            'project_id': effective_project_id,
+            'path': normalized_path,
+            'depth': depth,
+            'trees': trees,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        g.handle_exception('Ошибка в GET /project/file_tree', e)
+        raise
+
+
+@router.get("/project/scan_state")
+async def project_scan_state(request: Request, project_id: int = Query(...)):
+    try:
+        g.check_session(request)
+        pm = ProjectManager.get(project_id)
+        if pm is None or pm.project_name is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+        return _scan_state(project_id, pm.project_name)
+    except HTTPException:
+        raise
+    except Exception as e:
+        g.handle_exception("Ошибка в GET /project/scan_state", e)
+        raise
+
+
+@router.post("/project/scan_refresh")
+async def project_scan_refresh(request: Request):
+    try:
+        g.check_session(request)
+        data = await request.json()
+        project_id = int(data.get('project_id') or 0)
+        background = bool(data.get('background', True))
+        if project_id <= 0:
+            raise HTTPException(status_code=400, detail="Missing or invalid project_id")
+
+        pm = ProjectManager.get(project_id)
+        if pm is None or pm.project_name is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+        state = _scan_state_store()
+        current = state.get(project_id, {})
+        if current.get('running'):
+            return _scan_state(project_id, pm.project_name)
+
+        if background:
+            asyncio.create_task(_run_project_scan_refresh(project_id), name=f"scan-refresh-{project_id}")
+            current = state.get(project_id, {})
+            current.update({
+                'running': True,
+                'started_at': int(time.time()),
+                'error': None,
+            })
+            state[project_id] = current
+            return _scan_state(project_id, pm.project_name)
+
+        started = time.monotonic()
+        pm.scan_project_files()
+        done = _scan_state_store().get(project_id, {})
+        done.update({
+            'running': False,
+            'finished_at': int(time.time()),
+            'duration_sec': round(time.monotonic() - started, 3),
+            'error': None,
+        })
+        state[project_id] = done
+        return _scan_state(project_id, pm.project_name)
+    except HTTPException:
+        raise
+    except Exception as e:
+        g.handle_exception("Ошибка в POST /project/scan_refresh", e)
+        raise
+
+
 @router.get("/project/code_index")
-async def code_index(
+def code_index(
     request: Request,
     project_id: int = Query(...),
+    timeout: int = Query(default=300, description="Max seconds the caller is willing to wait (informational — not enforced server-side; enforced by nginx/proxy)."),
 ):
-    """Build and return the rich entity index for a project on demand.
+    """Build and return the rich entity index for a project synchronously.
 
-    Runs context assembly (assemble_files → SandwichPack.pack) without any
-    LLM interaction. Returns the sandwiches_index.jsl format JSON with 'entities'
-    (functions, classes, methods) and 'filelist', keyed by file_id.
+    Always saves result to cache file for MCP-tool to read.
+    Background queuing handled by MCP-tool (background=1 parameter no longer needed).
+    `timeout` is a client hint; actual cutoff is the nginx proxy_read_timeout.
     """
     try:
         g.check_session(request)
-        # Resolve project_name from DB
-        pm = ProjectManager(project_id)
-        pm.load()
-        if pm.project_name is None:
-            raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
-        project_name = pm.project_name
-
-        # Get all file IDs for the project
-        file_entries = g.file_manager.file_index(project_id)
-        if not file_entries:
-            raise HTTPException(status_code=404, detail=f"No files in project {project_id}")
-        file_ids_set = {entry['id'] for entry in file_entries}
-
-        # Build ContentBlock list (same pipeline as LLM context assembly)
-        assembler = ContextAssembler()
-        file_map = {}
-        blocks = assembler.assemble_files(file_ids_set, file_map)
-        if not blocks:
-            raise HTTPException(status_code=404, detail="No supported files to index in project")
-
-        # Pack → index only (no token limit, compression to get entities)
-        packer = SandwichPack(project_name, max_size=10_000_000, compression=True)
-        result = packer.pack(blocks)
-        entities_count = len(packer.entities) if packer.entities is not None else 0
+        _, project_name = _resolve_project(project_id)
+        index_data, files_count, blocks_count, entities_count, cache_path = _build_project_index_sync(
+            project_id,
+            project_name,
+        )
 
         log.debug(
-            g.with_session_tag(request, "GET /project/code_index: project_id=%d, project_name=%s, files=%d, blocks=%d, entities=%d"),
-            project_id, project_name, len(file_ids_set), len(blocks), entities_count
+            g.with_session_tag(request, "GET /project/code_index: project_id=%d, project_name=%s, timeout=%ds, files=%d, blocks=%d, entities=%d, cache=%s"),
+            project_id, project_name, timeout, files_count, blocks_count, entities_count, cache_path
         )
-        return json.loads(result['index'])
+        return index_data
     except HTTPException:
         raise
     except Exception as e:
@@ -322,9 +636,8 @@ async def exec_project_command(request: Request):
             log.info(g.with_session_tag(request, "Пустая команда в POST /project/exec для user_id=%d"), user_id)
             raise HTTPException(status_code=400, detail="Missing command")
         timeout = min(max(timeout, 1), 300)
-        pm = ProjectManager(project_id)
-        pm.load()
-        if pm.project_name is None:
+        pm = ProjectManager.get(project_id)
+        if pm is None or pm.project_name is None:
             log.info(g.with_session_tag(request, "Проект не найден project_id=%s для user_id=%d"), str(project_id), user_id)
             raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
         project_dir = f'/app/projects/{pm.project_name}'
@@ -373,6 +686,10 @@ async def smart_grep(request: Request):
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
 
+        pm = ProjectManager.get(project_id)
+        if pm is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
         entries = g.file_manager.file_index(project_id)
         hits = []
         truncated = False
@@ -396,7 +713,7 @@ async def smart_grep(request: Request):
                     lhs = int(entry.get('ts') or 0)
                 elif field == 'ctime':
                     try:
-                        qfn = g.project_manager.locate_file(file_name, project_id)
+                        qfn = pm.locate_file(file_name, project_id)
                         if qfn and qfn.exists():
                             lhs = int(qfn.stat().st_ctime)
                     except Exception:

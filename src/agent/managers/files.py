@@ -4,6 +4,7 @@ import os
 import time
 import pwd
 from pathlib import Path
+from contextlib import contextmanager
 from .db import Database, DataTable
 from .project import ProjectManager
 from lib.basic_logger import BasicLogger
@@ -11,9 +12,21 @@ from lib.basic_logger import BasicLogger
 log = globals.get_logger("fileman")
 
 
+def _mark_project_scan_stale(project_id: int, reason: str):
+    try:
+        ProjectManager.mark_scan_stale(project_id, reason=reason)
+    except Exception as e:
+        log.debug("Не удалось отметить scan stale для project_id=%s: %s", str(project_id), str(e))
+
+
 def _qfn(file_name, project_id: int):
     file_name = str(file_name).lstrip("@").lstrip("/")
-    pm = ProjectManager.get(project_id) if project_id is not None else globals.project_manager
+    if project_id in (None, 0):
+        pm = globals.project_manager
+    else:
+        pm = ProjectManager.get(project_id)
+    if pm is None:
+        pm = ProjectManager()
     return pm.locate_file(file_name, project_id)
 
 
@@ -47,6 +60,23 @@ class FileManager:
             ]
         )
         self.check()
+
+    @staticmethod
+    def _file_lock_key(file_name: str, project_id=None) -> str:
+        try:
+            qfn = _qfn(file_name, project_id)
+            return f"file:{str(qfn.resolve())}"
+        except Exception:
+            return f"file:{project_id}:{str(file_name)}"
+
+    @contextmanager
+    def _file_lock(self, file_name: str, project_id=None):
+        lock = globals.get_named_lock(self._file_lock_key(file_name, project_id))
+        lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
 
     def check(self):
         rows = self.files_table.select_from(
@@ -172,8 +202,9 @@ class FileManager:
         file_name = str(file_name).lstrip("@").lstrip("/")
         if len(file_name) > 300:
             raise ValueError(f"Слишком длинное имя файла {len(file_name)}")
-        file_id = self.exists(file_name, project_id=project_id)
-        if file_id:
+        # exists() returns bool, but add_file must work with numeric id.
+        file_id = self.find(file_name, project_id=project_id)
+        if file_id is not None:
             return file_id
         if timestamp is None:
             timestamp = int(time.time())
@@ -188,6 +219,7 @@ class FileManager:
         if file_id is None:
             # On PostgreSQL with conflict-ignore, insert may return None; reuse existing link id.
             file_id = self.find(file_name, project_id=project_id)
+        _mark_project_scan_stale(project_id, reason='file_added')
         log.debug("Добавлен файл id=%s, file_name=%s, project_id=%s", str(file_id), file_name, str(project_id))
         return file_id
 
@@ -207,37 +239,39 @@ class FileManager:
             log.error("Файл id=%d не найден для обновления", file_id)
             return -1
 
-        backup_path = self.backup_file(file_id)
-        if not backup_path:
-            log.error("Не удалось создать бэкап для file_id=%d", file_id)
-            return -3
-
         file_name = self.get_file_name(file_id).lstrip('@')
         safe_path = _qfn(file_name, project_id)
-        if content:
-            try:
-                wb = self.write_file(file_name, content, project_id)
-                if wb < len(content):
-                    log.error("Частично записано в файл %s, %d / %d", file_name, wb, len(content))
-                    return -4
-                os.chown(safe_path, pwd.getpwnam('agent').pw_uid, -1)
-                log.debug("Установлен владелец agent для файла: %s", file_name)
-                if timestamp is None:
-                    timestamp = _mod_time(file_name, project_id)
+        with self._file_lock(file_name, project_id):
+            backup_path = self.backup_file(file_id)
+            if not backup_path:
+                log.error("Не удалось создать бэкап для file_id=%d", file_id)
+                return -3
 
-            except Exception as e:
-                log.excpt("Ошибка записи файла %s   : ", file_name, e=e)
-                return -6
+            if content:
+                try:
+                    wb = self.write_file(file_name, content, project_id)
+                    if wb < len(content):
+                        log.error("Частично записано в файл %s, %d / %d", file_name, wb, len(content))
+                        return -4
+                    os.chown(safe_path, pwd.getpwnam('agent').pw_uid, -1)
+                    log.debug("Установлен владелец agent для файла: %s", file_name)
+                    if timestamp is None:
+                        timestamp = _mod_time(file_name, project_id)
 
-        self.files_table.update(
-            conditions={'id': file_id},
-            values={
-                'content': None,
-                'file_name': f"@{file_name}",
-                'ts': timestamp,
-                'project_id': project_id
-            }
-        )
+                except Exception as e:
+                    log.excpt("Ошибка записи файла %s   : ", file_name, e=e)
+                    return -6
+
+            self.files_table.update(
+                conditions={'id': file_id},
+                values={
+                    'content': None,
+                    'file_name': f"@{file_name}",
+                    'ts': timestamp,
+                    'project_id': project_id
+                }
+            )
+        _mark_project_scan_stale(project_id, reason='file_updated')
         log.debug("Обновлён файл id=%d, file_name=%s, project_id=%s", file_id, file_name, str(project_id))
         return file_id
 
@@ -260,29 +294,40 @@ class FileManager:
             log.debug("Target file %s exists, overwrite=%s, removing existing file_id=%d", new_name, overwrite, existing_file_id)
             self.unlink(existing_file_id)
 
-        backup_path = self.backup_file(file_id)
-        if not backup_path:
-            log.error("Не удалось создать бэкап для file_id=%d перед переименованием", file_id)
-            return -3
-
+        # Lock both source and target path to avoid concurrent rename/write races.
+        lock_keys = sorted({self._file_lock_key(old_file_name, project_id), self._file_lock_key(new_name, project_id)})
+        lock_a = globals.get_named_lock(lock_keys[0])
+        lock_b = globals.get_named_lock(lock_keys[1])
+        lock_a.acquire()
+        lock_b.acquire()
         try:
-            os.makedirs(new_path.parent, exist_ok=True)
-            os.rename(old_path, new_path)
-            os.chown(new_path, pwd.getpwnam('agent').pw_uid, -1)
-            log.debug("Moved file_id=%d from %s to %s", file_id, old_file_name, new_name)
-        except Exception as e:
-            log.excpt("Ошибка переименования файла id=%d с %s на %s: ", file_id, old_file_name, new_name, e=e)
-            return -6
+            backup_path = self.backup_file(file_id)
+            if not backup_path:
+                log.error("Не удалось создать бэкап для file_id=%d перед переименованием", file_id)
+                return -3
 
-        effective_new_name = f"@{new_name}" if project_id == 0 else new_name
-        self.files_table.update(
-            conditions={'id': file_id},
-            values={
-                'file_name': effective_new_name,
-                'ts': int(time.time()),
-                'project_id': project_id
-            }
-        )
+            try:
+                os.makedirs(new_path.parent, exist_ok=True)
+                os.rename(old_path, new_path)
+                os.chown(new_path, pwd.getpwnam('agent').pw_uid, -1)
+                log.debug("Moved file_id=%d from %s to %s", file_id, old_file_name, new_name)
+            except Exception as e:
+                log.excpt("Ошибка переименования файла id=%d с %s на %s: ", file_id, old_file_name, new_name, e=e)
+                return -6
+
+            effective_new_name = f"@{new_name}" if project_id == 0 else new_name
+            self.files_table.update(
+                conditions={'id': file_id},
+                values={
+                    'file_name': effective_new_name,
+                    'ts': int(time.time()),
+                    'project_id': project_id
+                }
+            )
+        finally:
+            lock_b.release()
+            lock_a.release()
+        _mark_project_scan_stale(project_id, reason='file_moved')
         log.debug("Updated file record id=%d, new_name=%s, project_id=%s", file_id, new_name, str(project_id))
         return file_id
 
@@ -304,7 +349,12 @@ class FileManager:
         except ValueError as e:
             log.error("Ошибка распаковки результата запроса в backup_file: id=%d, row=%s, error=%s", file_id, str(row), str(e))
             return None
-        proj_man = ProjectManager.get(project_id) if project_id is not None else globals.project_manager
+        if project_id in (None, 0):
+            proj_man = globals.project_manager
+        else:
+            proj_man = ProjectManager.get(project_id)
+        if proj_man is None:
+            proj_man = ProjectManager()
         proj_dir = proj_man.projects_dir
         if proj_dir is None:
             log.warn("Попытка бэкапа без выбранного проекта")
@@ -313,36 +363,37 @@ class FileManager:
             log.warn("Файл id=%d не является ссылкой, бэкап невозможен", file_id)
             return None
         clean_file_name = file_name.lstrip('@')
-        file_path = _qfn(clean_file_name, project_id)
+        with self._file_lock(clean_file_name, project_id):
+            file_path = _qfn(clean_file_name, project_id)
 
-        proj_dir = str(proj_dir)
-        new_path = str(file_path).replace(proj_dir, proj_dir + '/backups/') + f".{int(time.time())}"
-        log.debug("Formed backup path: %s", new_path)
-        backup_path = Path(new_path)
-        os.makedirs(backup_path.parent, exist_ok=True)
-        try:
-            os.chown(backup_path.parent, pwd.getpwnam('agent').pw_uid, -1)
-            log.debug("Установлен владелец agent для папки бэкапа: %s", str(backup_path.parent))
-        except Exception as e:
-            log.excpt("Ошибка установки владельца для папки бэкапа %s: ", str(backup_path.parent), e=e)
-        file = self.get_file(file_id)
-        if file is None:
-            log.warn("Файл %s не найден на диске для бэкапа", clean_file_name)
-            return None
-        content = file['content']
-        if content is None:
-            log.warn("backup failed: Нет контента для %s, нечего сохранить", clean_file_name)
-            return None
+            proj_dir = str(proj_dir)
+            new_path = str(file_path).replace(proj_dir, proj_dir + '/backups/') + f".{int(time.time())}"
+            log.debug("Formed backup path: %s", new_path)
+            backup_path = Path(new_path)
+            os.makedirs(backup_path.parent, exist_ok=True)
+            try:
+                os.chown(backup_path.parent, pwd.getpwnam('agent').pw_uid, -1)
+                log.debug("Установлен владелец agent для папки бэкапа: %s", str(backup_path.parent))
+            except Exception as e:
+                log.excpt("Ошибка установки владельца для папки бэкапа %s: ", str(backup_path.parent), e=e)
+            file = self.get_file(file_id)
+            if file is None:
+                log.warn("Файл %s не найден на диске для бэкапа", clean_file_name)
+                return None
+            content = file['content']
+            if content is None:
+                log.warn("backup failed: Нет контента для %s, нечего сохранить", clean_file_name)
+                return None
 
-        with open(backup_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        try:
-            os.chown(backup_path, pwd.getpwnam('agent').pw_uid, -1)
-            log.debug("Установлен владелец agent для бэкапа: %s", str(backup_path))
-        except Exception as e:
-            log.excpt("Ошибка установки владельца для бэкапа %s: ", str(backup_path), e=e)
-        log.debug("Создан бэкап: %s", str(backup_path))
-        return str(backup_path)
+            with open(backup_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            try:
+                os.chown(backup_path, pwd.getpwnam('agent').pw_uid, -1)
+                log.debug("Установлен владелец agent для бэкапа: %s", str(backup_path))
+            except Exception as e:
+                log.excpt("Ошибка установки владельца для бэкапа %s: ", str(backup_path), e=e)
+            log.debug("Создан бэкап: %s", str(backup_path))
+            return str(backup_path)
 
     def remove_file(self, file_id: int):
         row = self.files_table.select_from(
@@ -357,42 +408,44 @@ class FileManager:
         if not content and not file_name.startswith('@'):
             log.warn("Запись id=%d не является ссылкой, удаление невозможно", file_id)
             return
-        backup_path = self.backup_file(file_id)
-        if backup_path and project_id > 0:
-            clean_file_name = file_name.lstrip('@')
-            file_path = _qfn(clean_file_name, project_id)
-            if file_path.exists():
-                file_path.unlink()
-                log.debug("Удалён файл с диска: %s", str(file_path))
-            self.unlink(file_id)
+        clean_file_name = file_name.lstrip('@')
+        with self._file_lock(clean_file_name, project_id):
+            backup_path = self.backup_file(file_id)
+            if backup_path and project_id > 0:
+                file_path = _qfn(clean_file_name, project_id)
+                if file_path.exists():
+                    file_path.unlink()
+                    log.debug("Удалён файл с диска: %s", str(file_path))
+                self.unlink(file_id)
+                _mark_project_scan_stale(project_id, reason='file_removed')
 
-    @staticmethod
-    def write_file(file_name, content, project_id=None):
+    def write_file(self, file_name, content, project_id=None):
         # assert file_name.startswith('@'), "Using write_file not for a link"
-        safe_path = _qfn(file_name, project_id)
-        log.debug("Creating directory for file: %s", safe_path.parent)
-        os.makedirs(safe_path.parent, exist_ok=True)
-        try:
-            os.chown(safe_path.parent, pwd.getpwnam('agent').pw_uid, -1)
-            log.debug("Установлен владелец agent для папки: %s", str(safe_path.parent))
-        except Exception as e:
-            log.excpt("Ошибка установки владельца для папки %s: ", str(safe_path.parent), e=e)
-        with safe_path.open('w', encoding='utf-8') as f:
+        with self._file_lock(file_name, project_id):
+            safe_path = _qfn(file_name, project_id)
+            log.debug("Creating directory for file: %s", safe_path.parent)
+            os.makedirs(safe_path.parent, exist_ok=True)
             try:
-                wb = f.write(content)
+                os.chown(safe_path.parent, pwd.getpwnam('agent').pw_uid, -1)
+                log.debug("Установлен владелец agent для папки: %s", str(safe_path.parent))
             except Exception as e:
-                log.excpt("Ошибка записи в %s: ", str(safe_path), e=e)
-                return 0
-        try:
-            os.chown(safe_path, pwd.getpwnam('agent').pw_uid, -1)
-            log.debug("Установлен владелец agent для файла: %s", file_name)
-        except Exception as e:
-            log.excpt("Ошибка установки владельца для файла %s: ", file_name, e=e)
-        if wb < len(content):
-            log.error("Частично записано в файл %s, %d / %d", file_name, wb, len(content))
+                log.excpt("Ошибка установки владельца для папки %s: ", str(safe_path.parent), e=e)
+            with safe_path.open('w', encoding='utf-8') as f:
+                try:
+                    wb = f.write(content)
+                except Exception as e:
+                    log.excpt("Ошибка записи в %s: ", str(safe_path), e=e)
+                    return 0
+            try:
+                os.chown(safe_path, pwd.getpwnam('agent').pw_uid, -1)
+                log.debug("Установлен владелец agent для файла: %s", file_name)
+            except Exception as e:
+                log.excpt("Ошибка установки владельца для файла %s: ", file_name, e=e)
+            if wb < len(content):
+                log.error("Частично записано в файл %s, %d / %d", file_name, wb, len(content))
+                return wb
+            log.debug("Записано в файл %s, %d / %d", file_name, wb, len(content))
             return wb
-        log.debug("Записано в файл %s, %d / %d", file_name, wb, len(content))
-        return wb
 
     def list_files(self, project_id=None, sql_filter=None, as_map: bool = False):
         self._dedup(project_id)

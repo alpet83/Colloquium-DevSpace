@@ -17,6 +17,8 @@ export const useChatStore = defineStore('chat', {
     need_full_history: false,
     stats: { tokens: null, num_sources_used: null },
     status: { status: 'free', actor: null, elapsed: 0 },
+    llmPending: false,
+    llmUpdateIntervalMs: Number(sessionStorage.getItem('llm_update_interval_ms') || 900),
     pollingInterval: null,
     isPolling: false,
     awaited_to_del: []
@@ -93,6 +95,7 @@ export const useChatStore = defineStore('chat', {
             this.waitChanges = false
             this.need_full_history = true
             this.status = data.status
+            this.llmPending = this.status?.status === 'busy'
             await this.fetchHistory()
           } else if (data.posts && data.posts.chat_history === 'no changes') {
             if (this.awaited_to_del.length > 0) {
@@ -102,6 +105,7 @@ export const useChatStore = defineStore('chat', {
               this.need_full_history = false
             }
             this.status = data.status
+            this.llmPending = this.status?.status === 'busy'
             log_msg('CHAT', 'No changes in chat history, status:', this.status)
           } else {
             const newHistory = {}
@@ -129,8 +133,9 @@ export const useChatStore = defineStore('chat', {
               this.awaited_to_del = []
             }
             this.need_full_history = false
-            this.status.status = 'free'
-            log_msg('CHAT', 'Reset status to free after fetchHistory')
+            this.status = data.status || { status: 'free', actor: null, elapsed: 0 }
+            this.llmPending = this.status?.status === 'busy'
+            log_msg('CHAT', 'Updated status after fetchHistory:', this.status)
             if (deletedIds.size === 0) {
               await this.scrollToBottom()
             } else {
@@ -188,6 +193,13 @@ export const useChatStore = defineStore('chat', {
         this.chatError = 'Failed to fetch chat stats'
       }
     },
+    setLlmUpdateInterval(value) {
+      const parsed = Number(value)
+      const normalized = Number.isFinite(parsed) ? Math.min(5000, Math.max(300, Math.round(parsed))) : 900
+      this.llmUpdateIntervalMs = normalized
+      sessionStorage.setItem('llm_update_interval_ms', String(normalized))
+      log_msg('CHAT', 'Updated llmUpdateIntervalMs:', normalized)
+    },
     async sendMessage(message) {
       if (this.selectedChatId === null) return
       if (!message) {
@@ -196,11 +208,16 @@ export const useChatStore = defineStore('chat', {
         return
       }
       try {
+        this.llmPending = true
         log_msg('CHAT', 'Sending message to backend:', { chat_id: this.selectedChatId, message })
         const res = await fetch(this.apiUrl + '/chat/post', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: this.selectedChatId, message }),
+          body: JSON.stringify({
+            chat_id: this.selectedChatId,
+            message,
+            llm_update_interval_ms: this.llmUpdateIntervalMs
+          }),
           credentials: 'include'
         })
         if (res.status === 500 || res.status === 502) {
@@ -221,6 +238,10 @@ export const useChatStore = defineStore('chat', {
       } catch (e) {
         log_error(null, e, 'send message')
         this.chatError = 'Failed to send message'
+      } finally {
+        if (this.status?.status !== 'busy') {
+          this.llmPending = false
+        }
       }
     },
     async editPost(postId, message) {

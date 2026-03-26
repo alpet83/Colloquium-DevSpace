@@ -1,0 +1,37 @@
+# Bugfix Log
+
+## 2026-03-26
+
+### Fixed: hardcoded chat_id = 2 in posts.py audit context
+**Severity**: Medium  
+**Area**: Backend / Audit Logging  
+**File**: `src/agent/posts.py`
+
+**Description**: The audit log context was hardcoded to use `chat_id = 2`, which meant all audit events were being attributed to a dummy chat instead of the actual user context. This caused incorrect audit trail tracking and confused incident investigation.
+
+**Resolution**: Dynamically pass the actual `chat_id` from the request context through the entire audit chain. Audit logs now properly reflect the chat session they originated from.
+
+**Impact**: Audit logs are now accurate and usable for security reviews and debugging.
+
+---
+
+### Enhanced: MCP-tool logs scanning with time-window filter
+**Severity**: Low / Enhancement  
+**Area**: Development Tools / Diagnostics  
+**File**: `src/copilot_mcp_tool.py`
+
+**Description**: Added `cq_grep_logs` MCP tool with optional `since_seconds` parameter for time-based filtering of project logs. Supports multiple log file masks, partial line matching with context preservation for traceback blocks.
+
+**Key improvements**:
+- Regex-based query support
+- Time-window filtering (two common timestamp formats)
+- Case-sensitive search option
+- Carry-forward timestamp tracking for multi-line log entries
+
+**Impact**: Faster log analysis during development and debugging; better diagnostic capabilities for the DevSpace MCP system.
+
+---
+
+## Previous Sessions
+
+(Earlier bugfixes and maintenance tracked in commit history)

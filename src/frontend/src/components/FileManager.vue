@@ -2,8 +2,11 @@
 <template>
   <div class="file-manager">
     <h3>Файлы проекта</h3>
-    <div v-if="buildFileTrees && buildFileTrees.length">
-      <FileTree :trees="buildFileTrees" :level="0" />
+    <div v-if="trees && trees.length">
+      <div v-for="tree in trees" :key="`${tree.project_id ?? 'global'}:${tree.path || ''}`" class="tree-group">
+        <h4 v-if="showProjectTitle(tree)" class="tree-title">{{ tree.project_name }}</h4>
+        <FileTree :trees="[tree]" :level="0" />
+      </div>
     </div>
     <div v-else>
       <p>Файлы не найдены</p>
@@ -13,7 +16,6 @@
 
 <script>
   import { defineComponent, inject } from 'vue'
-  import { log_msg, log_error } from '../utils/debugging'
   import FileTree from './FileTree.vue'  
   
 
@@ -21,78 +23,20 @@
     name: 'FileManager',
     components: { FileTree },
     props: {
-      files: Array
+      trees: {
+        type: Array,
+        default: () => []
+      }
     },
     emits: ['delete-file', 'update-file'],
     setup() {
       const mitt = inject('mitt')
       return { mitt }
     },
-    computed: {
-      buildFileTrees() {
-        const files = this.files;
-        const trees = [];
-        const projectMap = new Map();
-        const globalFiles = { project_name: null, project_id: null, nodes: {} };
-
-        files.forEach(file => {
-          log_msg('FILE', 'Processing file: %s, project %s', file.file_name, file.project_id);
-          const parts = file.file_name.split('/');
-          const projectId = file.project_id;
-          const root = projectId ? `project_${projectId}` : 'global';
-          let current = projectId ? projectMap.get(projectId) || { project_name: parts[0], project_id: projectId, nodes: {} } : globalFiles;
-
-          let node = current.nodes;
-          let parent = null;
-          let path = '';
-          for (let i = 0; i < parts.length - 1; i++) {
-            const part = parts[i];
-            path += part + '/';
-            if (!node[part]) {
-              node[part] = { type: 'directory', children: {}, parent: parent, path: path };
-            }
-            parent = node;
-            node = node[part].children;
-          }
-          const fileName = parts[parts.length - 1];
-          node[fileName] = { type: 'file', id: file.id, user_id: file.user_id, parent: node, path: path + fileName };
-
-          if (projectId) {
-            projectMap.set(projectId, current);
-          }
-        });
-
-        // Sort nodes by type: directories first, then files
-        const sortNodes = (nodes) => {
-          const sorted = Object.entries(nodes).sort(([, a], [, b]) => {
-            if (a.type === 'directory' && b.type === 'file') return -1;
-            if (a.type === 'file' && b.type === 'directory') return 1;
-            return 0;
-          });
-          const result = {};
-          sorted.forEach(([name, node]) => {
-            result[name] = node;
-            if (node.type === 'directory') {
-              node.children = sortNodes(node.children);
-            }
-          });
-          return result;
-        };
-
-        projectMap.forEach(project => {
-          project.nodes = sortNodes(project.nodes);
-          trees.push(project);
-        });
-        if (Object.keys(globalFiles.nodes).length > 0) {
-          globalFiles.nodes = sortNodes(globalFiles.nodes);
-          trees.push(globalFiles);
-        }
-
-        return trees;
-      }    
-    },  // computed properties
     methods: {
-                
+      showProjectTitle(tree) {
+        return (this.trees?.length || 0) > 1 && !!tree?.project_name
+      }
     }
   })
 </script>
@@ -111,9 +55,18 @@
   .file-manager h3 {
     color: #eee;
   }
+  .tree-title {
+    margin: 10px 0 4px;
+    color: #bbb;
+    font-size: 13px;
+    text-transform: uppercase;
+  }
   @media (prefers-color-scheme: light) {
     .file-manager h3 {
       color: #333;
+    }
+    .tree-title {
+      color: #666;
     }
   }
 </style>

@@ -3,7 +3,6 @@
 
 import re
 import globals as g
-from managers.project import ProjectManager
 from processors.block_processor import BlockProcessor, res_error, res_success, ProcessorError
 
 log = g.get_logger("project_scan")
@@ -14,7 +13,7 @@ class ProjectScanProcessor(BlockProcessor):
     def __init__(self):
         super().__init__('project_scan')
 
-    async def handle_block(self, attrs: dict, block_code: str):
+    async def handle_block(self, attrs: dict, block_code: str) -> dict:
         """Обрабатывает блок <project_scan> для поиска строки в файлах attached_files.
 
         Args:
@@ -31,13 +30,9 @@ class ProjectScanProcessor(BlockProcessor):
                 log.error("Нет строки для поиска")
                 raise ProcessorError("Error: No search query provided", user_name)
 
-            proj_id = attrs.get('project_id', None)
-            proj_man = ProjectManager.get(proj_id) if proj_id else g.project_manager
-            if proj_man is None or g.file_manager is None:
-                raise ProcessorError("Error: No active project selected", user_name)
+            proj_man = g.project_manager
             # Получаем все файлы из attached_files
-            fm = g.file_manager
-            files = getattr(fm, 'list_files', lambda **_: [])(project_id=proj_man.project_id) or []  # поиск в активном проекте
+            files = g.file_manager.list_files(project_id=proj_man.project_id)  # поиск в активном проекте
             results = []
             for file in files:
                 file_id = file['id']

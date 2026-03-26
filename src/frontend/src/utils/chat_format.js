@@ -241,10 +241,10 @@ export function reformatMessages(context) {
     .map(msg => ({
       ...msg,
       formatted: formatMessage(msg.message, msg.user_name, msg.timestamp, context.chatStore.quotes,
-                              context.fileStore.files, msg.id, context)
+                              context.fileStore.knownFiles, msg.id, context)
     }))
   Object.keys(context.awaited_files).forEach(fileId => {
-    if (!context.fileStore.files.some(f => f.id === parseInt(fileId)) && context.awaited_files[fileId] > 0) {
+    if (!context.fileStore.knownFiles.some(f => f.id === parseInt(fileId)) && context.awaited_files[fileId] > 0) {
       context.awaited_files[fileId]--
     }
   })
@@ -256,7 +256,7 @@ export function checkAwaitedFiles(context) {
     .filter(([_, retries]) => retries > 0)
     .map(([fileId]) => fileId)
   if (activeFiles.length > 0) {
-    context.fileStore.fetchFilesAndNotify(null, activeFiles)
-    log_msg('UI', `Requested file list for awaited_files: ${activeFiles}`)
+    context.fileStore.fetchFileMetadata(activeFiles)
+    log_msg('UI', `Requested file metadata for awaited_files: ${activeFiles}`)
   }
 }

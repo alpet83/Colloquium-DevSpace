@@ -4,7 +4,6 @@
 import re
 from datetime import datetime, timezone
 from managers.db import Database, DataTable
-from managers.project import ProjectManager
 from lib.content_block import ContentBlock, SpanBlock
 from lib.sandwich_pack import SandwichPack
 import globals as g
@@ -27,7 +26,6 @@ class ContextAssembler:
     def __init__(self):
         self.db = Database.get_database()
         self._init_tables()
-        self.active_project_id = None
         self.fresh_files = set()
         self.fresh_spans = set()
         self.t = 0
@@ -204,8 +202,8 @@ class ContextAssembler:
             file_id_list.append(str(file_id))
 
         if match.group(1):  # @attach_dir#dir_name
-            pm = ProjectManager.get(self.active_project_id) if self.active_project_id else g.project_manager
-            pm.scan_project_files()
+            _proj_man = g.current_project_manager.get() or g.project_manager  # TODO(pre-release): remove g.project_manager fallback
+            _proj_man.scan_project_files()
             dir_name = match.group(1)
             log.debug("Обработка @attach_dir#%s", dir_name)
             query = "SELECT id, file_name FROM attached_files WHERE file_name LIKE :dir_name OR file_name LIKE :ref_name"

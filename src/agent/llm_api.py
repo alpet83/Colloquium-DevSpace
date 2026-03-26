@@ -77,6 +77,21 @@ class LLMConnection:
             client = AsyncOpenAI(base_url=self.base_url, api_key=self.api_key, timeout=self.timeout.total)
             comp = await client.chat.completions.create(**self.payload)
             return self._process_result(comp.to_dict())
+        except TypeError as e:
+            # Some providers/models reject reasoning args; retry once without them.
+            err = str(e)
+            if ('reasoning' in err or 'reasoning_effort' in err) and isinstance(self.payload, dict):
+                payload = dict(self.payload)
+                payload.pop('reasoning', None)
+                payload.pop('reasoning_effort', None)
+                try:
+                    client = AsyncOpenAI(base_url=self.base_url, api_key=self.api_key, timeout=self.timeout.total)
+                    comp = await client.chat.completions.create(**payload)
+                    self.payload = payload
+                    return self._process_result(comp.to_dict())
+                except Exception as inner_e:
+                    return self.api_error_result('Unknown', inner_e, 500)
+            return self.api_error_result('Unknown', e, 500)
         except RateLimitError as e:
             return self.api_error_result('RateLimit', e, 429)
         except APIStatusError as e:
@@ -223,7 +238,12 @@ class XAIConnection(LLMConnection):
         self.base_url = "https://api.x.ai/v1"
         self.search_sources = ["web", "x", "news"]
         eff = config.get("reasoning_eff")
-        if eff and eff != "none" and "non-reasoning" not in self.model.lower():
+        model_l = (self.model or "").lower()
+        # Restrict only known-bad family (grok-code-fast*). Keep fast-reasoning models enabled.
+        supports_reasoning = ("non-reasoning" not in model_l) and (not re.match(r"^grok-code-fast", model_l))
+        if "fast-reasoning" in model_l:
+            supports_reasoning = True
+        if eff and eff != "none" and supports_reasoning:
             self.model_params["reasoning"] = {"effort": eff}
 
 

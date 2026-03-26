@@ -1,6 +1,7 @@
 # /agent/managers/project.py, updated 2025-07-26 17:00 EEST
 import os
 import re
+import time
 from pathlib import Path
 from .db import Database, DataTable
 from lib.sandwich_pack import SandwichPack
@@ -53,7 +54,7 @@ class ProjectManager:
         self.local_git = row[0][3]
         self.public_git = row[0][4]
         self.dependencies = row[0][5]
-        self.scan_project_files()
+        # Keep load() lightweight: file-system scan is an explicit operation.
         log.debug("Загружен проект id=%d, project_name=%s", self.project_id, self.project_name)
 
     def abs_file_name(self, file_name: str, project_name: str):
@@ -124,9 +125,23 @@ class ProjectManager:
     @staticmethod
     def get(project_id):
         import globals
+        if project_id is None:
+            return globals.project_manager
+
+        registry = getattr(globals, 'project_registry', None)
+        if not isinstance(registry, dict):
+            registry = {}
+            globals.project_registry = registry
+
         if project_id == getattr(globals.project_manager, 'project_id', None):
             log.debug("Возвращён глобальный ProjectManager для project_id=%d", project_id)
+            registry[project_id] = globals.project_manager
             return globals.project_manager
+
+        cached = registry.get(project_id)
+        if cached is not None and getattr(cached, 'project_id', None) == project_id:
+            return cached
+
         row = DataTable(
             table_name="projects",
             template=[
@@ -146,7 +161,43 @@ class ProjectManager:
             log.warn("Проект id=%d не найден", project_id)
             return None
         log.debug("Создаётся новый ProjectManager для project_id=%d", project_id)
-        return ProjectManager(project_id=project_id)
+        manager = ProjectManager(project_id=project_id)
+        registry[project_id] = manager
+        return manager
+
+    @staticmethod
+    def mark_scan_stale(project_id: int, reason: str = "mutation"):
+        if project_id is None or project_id <= 0:
+            return
+        state = getattr(globals, 'project_scan_state', None)
+        if not isinstance(state, dict):
+            state = {}
+            globals.project_scan_state = state
+        current = state.get(project_id, {})
+        current.update({
+            'project_id': project_id,
+            'stale': True,
+            'reason': reason,
+            'updated_at': int(time.time()),
+        })
+        state[project_id] = current
+
+    @staticmethod
+    def mark_scan_fresh(project_id: int, files_count: int, duration_sec: float):
+        if project_id is None or project_id <= 0:
+            return
+        state = getattr(globals, 'project_scan_state', None)
+        if not isinstance(state, dict):
+            state = {}
+            globals.project_scan_state = state
+        state[project_id] = {
+            'project_id': project_id,
+            'stale': False,
+            'reason': None,
+            'updated_at': int(time.time()),
+            'files_count': int(files_count),
+            'duration_sec': float(duration_sec),
+        }
 
     def create_project(self, project_name, description='', local_git=None, public_git=None, dependencies=None):
         try:
@@ -161,6 +212,7 @@ class ProjectManager:
                     'dependencies': dependencies
                 }
             )
+            ProjectManager.mark_scan_stale(project_id, reason='project_created')
             log.info("Создан проект id=%d, project_name=%s", project_id, project_name)
             return project_id
         except Exception as e:
@@ -193,7 +245,10 @@ class ProjectManager:
             return []
 
         try:
+            started = time.monotonic()
             ignored_count = 0
+            if not SandwichPack._block_classes:
+                SandwichPack.load_block_classes()
             project_dir = self.projects_dir / project_name
             if not project_dir.exists():
                 log.warn("Директория проекта %s не существует", project_name)
@@ -235,7 +290,13 @@ class ProjectManager:
                     reg_path = Path(project_name) / relative_path
                     if self.project_name == project_name:
                         globals.file_manager.add_file(reg_path, None, file_mod, self.project_id)
-            log.debug("Найдено %d поддерживаемых файлов в проекте %s, пропущено из-за фильтрации %d", len(files), project_name, ignored_count)
+            duration = time.monotonic() - started
+            if duration >= 10:
+                log.warn("PERF_WARN scan_project_files project_id=%s project_name=%s took=%.2fs files=%d ignored=%d",
+                         str(self.project_id), project_name, duration, len(files), ignored_count)
+            ProjectManager.mark_scan_fresh(self.project_id, len(files), duration)
+            log.debug("Найдено %d поддерживаемых файлов в проекте %s, пропущено из-за фильтрации %d, duration=%.2fs",
+                      len(files), project_name, ignored_count, duration)
             return files
         except Exception as e:
             log.excpt("Ошибка сканирования файлов проекта %s: %s", project_name, str(e))

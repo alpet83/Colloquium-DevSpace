@@ -3,8 +3,10 @@ from fastapi import APIRouter, Request, Response, UploadFile, File, Form, HTTPEx
 from fastapi.responses import PlainTextResponse, JSONResponse
 import time, json
 from managers.db import Database
+from managers.project import ProjectManager
 import globals as g
 from lib.basic_logger import BasicLogger
+import routes.project_routes as project_routes
 
 router = APIRouter()
 
@@ -89,17 +91,28 @@ async def delete_file(request: Request):
 @router.get("/chat/list_files")
 async def list_files(request: Request, project_id: int = Query(None)):
     try:
+        started = time.monotonic()
         # Интерпретируем project_id <= 0 как запрос всех файлов
         project_id = None if (project_id is None) or (project_id <= 0) else project_id
         fm = g.file_manager
-        files = fm.list_files(project_id, as_map=True)
+
+        # Fast path: read index directly from DB without per-file disk checks.
+        files = {entry['id']: entry for entry in fm.file_index(project_id)}
         if project_id is not None:
-            common = fm.list_files(sql_filter=('file_name', 'LIKE', '@.chat-meta%'), as_map=True)  # always list common index files
-            log.debug(g.with_session_tag(request, "Common files: %s"), str(common))
-            files.update(common)
+            # Always include common chat-meta index files for project views.
+            common = [entry for entry in fm.file_index(0) if str(entry.get('file_name', '')).startswith('.chat-meta')]
+            for entry in common:
+                files[entry['id']] = entry
         assert isinstance(files, dict)
         files = list(files.values())
         files.sort(key=lambda x: x["file_name"])
+        duration = time.monotonic() - started
+        if duration >= 2:
+            log.warn(g.with_session_tag(request, "PERF_WARN GET /chat/list_files project_id=%s took=%.2fs files=%d"),
+                     str(project_id), duration, len(files))
+        else:
+            log.debug(g.with_session_tag(request, "GET /chat/list_files project_id=%s took=%.2fs files=%d"),
+                      str(project_id), duration, len(files))
         return files
     except Exception as e:
         g.handle_exception("Ошибка в GET /chat/list_files", e)
@@ -130,15 +143,31 @@ async def get_file_contents(request: Request, file_id: int = Query(...)):
 
 
 @router.get("/chat/index")
-async def get_chat_index(request: Request, chat_id: int = Query(...)):
+async def get_chat_index(request: Request, chat_id: int = Query(None), project_id: int = Query(None)):
     """Returns the rich entity index (functions, classes, methods with file_id and line ranges)
-    built from the last LLM context assembly for this chat.
+    built from the last LLM context assembly for this chat, or a cached project index.
     Format: sandwiches_index.jsl — see 'templates' field for column layout.
-    Returns 404 if no LLM response has been generated for this chat yet.
+    Returns 404 if no LLM response has been generated for this chat yet or if project cache is missing.
     """
-    log.debug(g.with_session_tag(request, "Запрос GET /chat/index, IP=%s, chat_id=%d"), request.client.host, chat_id)
+    log.debug(g.with_session_tag(request, "Запрос GET /chat/index, IP=%s, chat_id=%s, project_id=%s"), request.client.host, str(chat_id), str(project_id))
     try:
         g.check_session(request)
+        if project_id is not None:
+            pm = ProjectManager.get(project_id)
+            if pm is None or pm.project_name is None:
+                raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+            cached = project_routes.read_project_cached_index(pm.project_name)
+            if cached is not None:
+                return cached
+            status = project_routes.get_project_index_status(project_id, pm.project_name)
+            if status.get('running') or status.get('status') in ('queued', 'running'):
+                return JSONResponse(status, status_code=202)
+            raise HTTPException(
+                status_code=404,
+                detail=f"No cached project index for project_id={project_id}. Trigger cq_get_code_index(project_id={project_id}, background=true) or run synchronous build first."
+            )
+        if chat_id is None:
+            raise HTTPException(status_code=400, detail="Specify chat_id or project_id")
         fm = g.file_manager
         file_id = fm.find(f".chat-meta/{chat_id}-index.json", project_id=0)
         if not file_id:

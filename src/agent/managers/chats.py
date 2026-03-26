@@ -3,6 +3,7 @@ from .db import Database, DataTable
 from datetime import datetime
 import globals as g
 import asyncio
+import time
 
 log = g.get_logger("chatman")
 
@@ -11,6 +12,16 @@ class ChatLocker:    # можно использовать с операторо
     def __init__(self, chat_id: int, user_name: str):
         self.chat_id = chat_id
         self.user_name = user_name
+        self._acquired_at = None
+
+    async def __aenter__(self):
+        self._acquired_at = await g.chat_manager.acquire_chat_lock(self.chat_id, self.user_name)
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        g.chat_manager.release_chat_lock(self.chat_id, self.user_name, self._acquired_at)
+        if exc_value:
+            log.excpt("ChatLocker.__aexit__", exc_info=(exc_type, exc_value, traceback))
 
     def __enter__(self):
         g.chat_manager.set_chat_busy(self.chat_id, self.user_name)
@@ -49,6 +60,8 @@ class ChatManager:
         self.set_chat_busy(0, 'admin')
         log.debug("chats_info = %s", str(self.chats_busy))
         self.switch_events = {}  # Хранилище событий переключения чата: {f"{user_id}:{chat_id}": asyncio.Event}
+        self.chat_locks = {}
+        self.chat_lock_stats = {}
 
     @staticmethod
     def active_chat(user, sid=None) -> int:
@@ -103,8 +116,18 @@ class ChatManager:
     def chat_status(self, chat_id: int) -> dict:
         busy = self.chats_busy.get(chat_id, {})
         now = datetime.utcnow().timestamp()
+        stats = self.chat_lock_stats.get(chat_id, {})
         if not busy:
-            return {'status': 'free', 'actor': '', 'elapsed': 0}
+            return {
+                'status': 'free',
+                'actor': '',
+                'elapsed': 0,
+                'lock_wait_ms_avg': round(stats.get('wait_total', 0.0) / stats.get('acquires', 1), 1) if stats else 0.0,
+                'lock_wait_ms_max': round(stats.get('wait_max', 0.0), 1) if stats else 0.0,
+                'lock_hold_ms_avg': round(stats.get('hold_total', 0.0) / stats.get('releases', 1), 1) if stats else 0.0,
+                'lock_hold_ms_max': round(stats.get('hold_max', 0.0), 1) if stats else 0.0,
+                'lock_acquires': stats.get('acquires', 0),
+            }
 
         oldest = now
         for from_ts in busy.values():
@@ -113,7 +136,60 @@ class ChatManager:
         if result:
             result['elapsed'] = int(now - oldest)
             result['actor'] = ', '.join(busy.keys())  # TODO: better user actors
+            result['lock_wait_ms_avg'] = round(stats.get('wait_total', 0.0) / stats.get('acquires', 1), 1) if stats else 0.0
+            result['lock_wait_ms_max'] = round(stats.get('wait_max', 0.0), 1) if stats else 0.0
+            result['lock_hold_ms_avg'] = round(stats.get('hold_total', 0.0) / stats.get('releases', 1), 1) if stats else 0.0
+            result['lock_hold_ms_max'] = round(stats.get('hold_max', 0.0), 1) if stats else 0.0
+            result['lock_acquires'] = stats.get('acquires', 0)
         return result
+
+    def _chat_lock(self, chat_id: int) -> asyncio.Lock:
+        lock = self.chat_locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.chat_locks[chat_id] = lock
+        return lock
+
+    def _chat_lock_stats(self, chat_id: int) -> dict:
+        stats = self.chat_lock_stats.get(chat_id)
+        if stats is None:
+            stats = {
+                'acquires': 0,
+                'releases': 0,
+                'wait_total': 0.0,
+                'wait_max': 0.0,
+                'hold_total': 0.0,
+                'hold_max': 0.0,
+            }
+            self.chat_lock_stats[chat_id] = stats
+        return stats
+
+    async def acquire_chat_lock(self, chat_id: int, user_name: str) -> float:
+        lock = self._chat_lock(chat_id)
+        stats = self._chat_lock_stats(chat_id)
+        t0 = time.monotonic()
+        await lock.acquire()
+        wait_ms = (time.monotonic() - t0) * 1000.0
+        stats['acquires'] += 1
+        stats['wait_total'] += wait_ms
+        stats['wait_max'] = max(stats['wait_max'], wait_ms)
+        self.set_chat_busy(chat_id, user_name)
+        log.debug("Чат %d lock acquired by %s wait=%.1fms", chat_id, user_name, wait_ms)
+        return time.monotonic()
+
+    def release_chat_lock(self, chat_id: int, user_name: str, acquired_at: float | None):
+        lock = self._chat_lock(chat_id)
+        hold_ms = 0.0
+        if acquired_at:
+            hold_ms = max(0.0, (time.monotonic() - acquired_at) * 1000.0)
+        stats = self._chat_lock_stats(chat_id)
+        stats['releases'] += 1
+        stats['hold_total'] += hold_ms
+        stats['hold_max'] = max(stats['hold_max'], hold_ms)
+        self.release_chat(chat_id, user_name)
+        if lock.locked():
+            lock.release()
+        log.debug("Чат %d lock released by %s hold=%.1fms", chat_id, user_name, hold_ms)
 
     def set_chat_busy(self, chat_id: int, user_name: str):
         now = datetime.utcnow().timestamp()
