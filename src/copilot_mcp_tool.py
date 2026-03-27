@@ -70,6 +70,52 @@ def _setup_logging() -> Path:
     return log_file
 
 
+def _read_mcp_json_token() -> str | None:
+    """Walk up from cwd and script dir looking for .vscode/mcp.json with MCP_AUTH_TOKEN."""
+    script_path = str(Path(__file__).resolve())
+    seen: set[Path] = set()
+    candidates: list[Path] = []
+    for base in (Path.cwd(), Path(__file__).resolve().parent):
+        for parent in (base, *base.parents):
+            p = parent / ".vscode" / "mcp.json"
+            if p not in seen:
+                seen.add(p)
+                candidates.append(p)
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        # Top-level env block (non-standard but convenient)
+        token = (data.get("env") or {}).get("MCP_AUTH_TOKEN")
+        if token:
+            return str(token)
+        # Per-server env block — match by script path in args or server name
+        for server_name, server_cfg in (data.get("servers") or {}).items():
+            if not isinstance(server_cfg, dict):
+                continue
+            args = server_cfg.get("args") or []
+            if not (any(script_path in str(a) for a in args) or server_name == "colloquium"):
+                continue
+            token = (server_cfg.get("env") or {}).get("MCP_AUTH_TOKEN")
+            if token:
+                return str(token)
+    return None
+
+
+def _resolve_mcp_auth_token() -> str:
+    """Resolve MCP_AUTH_TOKEN: env var → mcp.json → built-in default."""
+    token = os.environ.get("MCP_AUTH_TOKEN") or _read_mcp_json_token()
+    return token or "Grok-xAI-Agent-The-Best"
+
+
+# Resolved once at startup; used by all process-management and docker-control handlers.
+_MCP_AUTH_TOKEN: str = _resolve_mcp_auth_token()
+_MCP_SERVER_URL: str = os.environ.get("MCP_SERVER_URL", "http://localhost:8084")
+
+
 def _preview_text(text: str, limit: int = 200) -> str:
     collapsed = " ".join((text or "").split())
     if len(collapsed) <= limit:
@@ -230,6 +276,16 @@ class ColloquiumClient:
         if project_id is not None:
             params["project_id"] = project_id
         resp = await self._client.get("/api/chat/index", params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_project_status(self, project_id: int) -> dict:
+        """Fetch health status and diagnostics for a project via /api/project/status."""
+        await self._ensure_login()
+        resp = await self._client.get(
+            "/api/project/status",
+            params={"project_id": project_id},
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -687,7 +743,7 @@ TOOLS: list[Tool] = [
         },
     ),
     Tool(
-        name="cq_get_code_index",
+        name="cq_rebuild_index",
         description=(
             "Build the rich entity index for a project on demand — no prior LLM interaction needed.\n"
             "Runs context assembly (loads all project files → SandwichPack.pack) and returns\n"
@@ -720,11 +776,38 @@ TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="cq_get_code_index",
+        description=(
+            "DEPRECATED alias for cq_rebuild_index. "
+            "Builds the rich entity index for a project on demand and returns sandwiches_index.jsl JSON."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "integer",
+                    "description": "Project ID (use cq_list_projects to get IDs).",
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "If true, queue/report a background build and save cache to /app/projects/.cache/{project_name}_index.jsl.",
+                    "default": False,
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Max seconds to wait for the index build (default: 300). Passed to the backend as a hint and used as the HTTP client timeout.",
+                    "default": 300,
+                },
+            },
+            "required": ["project_id"],
+        },
+    ),
+    Tool(
         name="cq_read_file",
         description=(
             "Read the contents of a project file directly by its DB file_id. "
             "Returns raw text (or formatted JSON for .json files). "
-            "Use cq_list_files or cq_get_code_index to look up file_ids. "
+            "Use cq_list_files or cq_rebuild_index to look up file_ids. "
             "Direct HTTP call — no LLM or chat round-trip required."
         ),
         inputSchema={
@@ -732,7 +815,7 @@ TOOLS: list[Tool] = [
             "properties": {
                 "file_id": {
                     "type": "integer",
-                    "description": "DB file_id from cq_list_files or cq_get_code_index filelist.",
+                    "description": "DB file_id from cq_list_files or cq_rebuild_index filelist.",
                 },
             },
             "required": ["file_id"],
@@ -1133,6 +1216,27 @@ TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="cq_project_status",
+        description=(
+            "Get health status and diagnostics for a project.\n"
+            "Returns: status (ok/info/warning/error), problems[] with severity codes,\n"
+            "file link counts (total/active), backup/undo stack info (count, size_bytes, oldest_ts, newest_ts),\n"
+            "scan state and index cache state.\n"
+            "Use this to quickly check if a project has stale file links, a failing scan,\n"
+            "or a missing index cache. 'problems' drives the frontend warning indicator."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "integer",
+                    "description": "Project ID (use cq_list_projects to get IDs).",
+                },
+            },
+            "required": ["project_id"],
+        },
+    ),
+    Tool(
         name="cq_process_wait",
         description=(
             "Wait for a process condition (output or exit) with timeout. Non-blocking poll."
@@ -1159,6 +1263,47 @@ TOOLS: list[Tool] = [
             "required": ["process_guid"],
         },
     ),
+    Tool(
+        name="cq_docker_control",
+        description=(
+            "Control CQDS Docker Compose services on the host. Wraps scripts/cqds_ctl.py.\n"
+            "Commands:\n"
+            "  status      — report container state, health, and recent log failures\n"
+            "  restart     — docker compose restart + wait for stable/failed\n"
+            "  rebuild     — docker compose up -d --build + wait for stable/failed\n"
+            "  clear-logs  — truncate container json-file logs via Docker VM\n"
+            "Optional 'services' list narrows the scope to specific compose services\n"
+            "(e.g. ['colloquium-core', 'frontend']). Omit to target all services.\n"
+            "'wait' (bool, status only): block until stable or failed rather than snapshot.\n"
+            "'timeout': seconds to wait for stable state (default 90, restart/rebuild only)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "enum": ["status", "restart", "rebuild", "clear-logs"],
+                    "description": "Control action to perform.",
+                },
+                "services": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of compose service names, e.g. ['colloquium-core'].",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Seconds to wait for stable/failed state (default 90). Only for status/restart/rebuild.",
+                    "default": 90,
+                },
+                "wait": {
+                    "type": "boolean",
+                    "description": "For 'status': block until stable or failed before returning (default false).",
+                    "default": False,
+                },
+            },
+            "required": ["command"],
+        },
+    ),
 ]
 
 
@@ -1177,9 +1322,13 @@ def _json_text(obj: Any) -> CallToolResult:
 
 def _index_counts(index_payload: dict[str, Any]) -> tuple[int | None, int | None]:
     entities = index_payload.get("entities") if isinstance(index_payload, dict) else None
-    filelist = index_payload.get("filelist") if isinstance(index_payload, dict) else None
+    filelist = None
+    if isinstance(index_payload, dict):
+        filelist = index_payload.get("files")
+        if filelist is None:
+            filelist = index_payload.get("filelist")
     entities_count = len(entities) if isinstance(entities, list) else None
-    files_count = len(filelist) if isinstance(filelist, dict) else None
+    files_count = len(filelist) if isinstance(filelist, (list, dict)) else None
     return entities_count, files_count
 
 
@@ -1416,7 +1565,7 @@ async def run_server(client: ColloquiumClient) -> None:
                 return _json_text(index)
 
             # ---- get code index (on-demand, project-level) ----
-            elif name == "cq_get_code_index":
+            elif name in {"cq_rebuild_index", "cq_get_code_index"}:
                 project_id = int(arguments["project_id"])
                 background = bool(arguments.get("background", False))
                 timeout = int(arguments.get("timeout", 300))
@@ -1759,12 +1908,8 @@ async def run_server(client: ColloquiumClient) -> None:
                 env = arguments.get("env")
                 timeout = int(arguments.get("timeout", 3600))
                 
-                # Call mcp_server endpoint
-                mcp_server_url = os.environ.get("MCP_SERVER_URL", "http://localhost:8084")
-                mcp_auth_token = os.environ.get("MCP_AUTH_TOKEN", "")
-                
                 resp = await httpx.AsyncClient().post(
-                    f"{mcp_server_url}/process/spawn",
+                    f"{_MCP_SERVER_URL}/process/spawn",
                     json={
                         "project_id": project_id,
                         "command": command,
@@ -1773,7 +1918,7 @@ async def run_server(client: ColloquiumClient) -> None:
                         "env": env,
                         "timeout": timeout,
                     },
-                    headers={"Authorization": f"Bearer {mcp_auth_token}"},
+                    headers={"Authorization": f"Bearer {_MCP_AUTH_TOKEN}"},
                     timeout=30.0,
                 )
                 resp.raise_for_status()
@@ -1787,18 +1932,15 @@ async def run_server(client: ColloquiumClient) -> None:
                 read_timeout_ms = int(arguments.get("read_timeout_ms", 5000))
                 max_bytes = int(arguments.get("max_bytes", 65536))
                 
-                mcp_server_url = os.environ.get("MCP_SERVER_URL", "http://localhost:8084")
-                mcp_auth_token = os.environ.get("MCP_AUTH_TOKEN", "")
-                
                 resp = await httpx.AsyncClient().post(
-                    f"{mcp_server_url}/process/io",
+                    f"{_MCP_SERVER_URL}/process/io",
                     json={
                         "process_guid": process_guid,
                         "input": input_data,
                         "read_timeout_ms": read_timeout_ms,
                         "max_bytes": max_bytes,
                     },
-                    headers={"Authorization": f"Bearer {mcp_auth_token}"},
+                    headers={"Authorization": f"Bearer {_MCP_AUTH_TOKEN}"},
                     timeout=30.0,
                 )
                 resp.raise_for_status()
@@ -1822,33 +1964,32 @@ async def run_server(client: ColloquiumClient) -> None:
                     return _text("Missing required argument: process_guid")
                 signal_name = str(arguments.get("signal", "SIGTERM"))
                 
-                mcp_server_url = os.environ.get("MCP_SERVER_URL", "http://localhost:8084")
-                mcp_auth_token = os.environ.get("MCP_AUTH_TOKEN", "")
-                
                 resp = await httpx.AsyncClient().post(
-                    f"{mcp_server_url}/process/kill",
+                    f"{_MCP_SERVER_URL}/process/kill",
                     json={
                         "process_guid": process_guid,
                         "signal": signal_name,
                     },
-                    headers={"Authorization": f"Bearer {mcp_auth_token}"},
+                    headers={"Authorization": f"Bearer {_MCP_AUTH_TOKEN}"},
                     timeout=30.0,
                 )
                 resp.raise_for_status()
                 return _json_text(resp.json())
+
+            elif name == "cq_project_status":
+                project_id = int(arguments["project_id"])
+                status = await client.get_project_status(project_id)
+                return _json_text(status)
 
             elif name == "cq_process_status":
                 process_guid = str(arguments.get("process_guid") or "")
                 if not process_guid:
                     return _text("Missing required argument: process_guid")
                 
-                mcp_server_url = os.environ.get("MCP_SERVER_URL", "http://localhost:8084")
-                mcp_auth_token = os.environ.get("MCP_AUTH_TOKEN", "")
-                
                 resp = await httpx.AsyncClient().get(
-                    f"{mcp_server_url}/process/status",
+                    f"{_MCP_SERVER_URL}/process/status",
                     params={"process_guid": process_guid},
-                    headers={"Authorization": f"Bearer {mcp_auth_token}"},
+                    headers={"Authorization": f"Bearer {_MCP_AUTH_TOKEN}"},
                     timeout=30.0,
                 )
                 resp.raise_for_status()
@@ -1857,17 +1998,14 @@ async def run_server(client: ColloquiumClient) -> None:
             elif name == "cq_process_list":
                 project_id = arguments.get("project_id")
                 
-                mcp_server_url = os.environ.get("MCP_SERVER_URL", "http://localhost:8084")
-                mcp_auth_token = os.environ.get("MCP_AUTH_TOKEN", "")
-                
                 params = {}
                 if project_id:
                     params["project_id"] = int(project_id)
                 
                 resp = await httpx.AsyncClient().get(
-                    f"{mcp_server_url}/process/list",
+                    f"{_MCP_SERVER_URL}/process/list",
                     params=params,
-                    headers={"Authorization": f"Bearer {mcp_auth_token}"},
+                    headers={"Authorization": f"Bearer {_MCP_AUTH_TOKEN}"},
                     timeout=30.0,
                 )
                 resp.raise_for_status()
@@ -1880,21 +2018,79 @@ async def run_server(client: ColloquiumClient) -> None:
                 wait_timeout_ms = int(arguments.get("wait_timeout_ms", 30000))
                 wait_condition = str(arguments.get("wait_condition", "any_output"))
                 
-                mcp_server_url = os.environ.get("MCP_SERVER_URL", "http://localhost:8084")
-                mcp_auth_token = os.environ.get("MCP_AUTH_TOKEN", "")
-                
                 resp = await httpx.AsyncClient().post(
-                    f"{mcp_server_url}/process/wait",
+                    f"{_MCP_SERVER_URL}/process/wait",
                     json={
                         "process_guid": process_guid,
                         "wait_timeout_ms": wait_timeout_ms,
                         "wait_condition": wait_condition,
                     },
-                    headers={"Authorization": f"Bearer {mcp_auth_token}"},
+                    headers={"Authorization": f"Bearer {_MCP_AUTH_TOKEN}"},
                     timeout=(wait_timeout_ms / 1000.0) + 10,  # Add 10s overhead
                 )
                 resp.raise_for_status()
                 return _json_text(resp.json())
+
+            # ---- docker control ----
+            elif name == "cq_docker_control":
+                command = str(arguments.get("command", "status"))
+                services = [str(s) for s in (arguments.get("services") or [])]
+                timeout = max(10, min(int(arguments.get("timeout", 90)), 600))
+                wait = bool(arguments.get("wait", False))
+
+                allowed = {"status", "restart", "rebuild", "clear-logs"}
+                if command not in allowed:
+                    raise ValueError(f"Unknown command '{command}'. Allowed: {', '.join(sorted(allowed))}")
+
+                ctl_script = Path(__file__).resolve().parent / "scripts" / "cqds_ctl.py"
+                if not ctl_script.is_file():
+                    raise RuntimeError(f"cqds_ctl.py not found at {ctl_script}")
+
+                # Inherit current env and fill required docker-compose vars if absent,
+                # so that `docker compose` can parse the compose file without hanging on stdin.
+                proc_env = dict(os.environ)
+                if not proc_env.get("MCP_AUTH_TOKEN"):
+                    proc_env["MCP_AUTH_TOKEN"] = _MCP_AUTH_TOKEN
+                if not proc_env.get("DB_ROOT_PASSWD"):
+                    db_passwd_file = ctl_script.parent.parent / "secrets" / "cqds_db_password"
+                    if db_passwd_file.is_file():
+                        proc_env["DB_ROOT_PASSWD"] = db_passwd_file.read_text(encoding="utf-8").strip()
+
+                cmd_args = [sys.executable, str(ctl_script), command]
+                if command in {"status", "restart", "rebuild"}:
+                    cmd_args.append(f"--timeout={timeout}")
+                if command == "status" and wait:
+                    cmd_args.append("--wait")
+                cmd_args.extend(services)
+
+                LOGGER.info("cq_docker_control: %s", " ".join(cmd_args))
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd_args,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    env=proc_env,
+                )
+                proc_timeout = timeout + 60
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        proc.communicate(), timeout=proc_timeout
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    return _text(f"cq_docker_control: timed out after {proc_timeout}s")
+
+                stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+                stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+
+                try:
+                    payload = json.loads(stdout_text)
+                except Exception:
+                    return _text(
+                        f"cq_docker_control: non-JSON output from cqds_ctl.py\n"
+                        f"stdout: {stdout_text[:600]}\nstderr: {stderr_text[:300]}"
+                    )
+                return _json_text(payload)
 
             else:
 

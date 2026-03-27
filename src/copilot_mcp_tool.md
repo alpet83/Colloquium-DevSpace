@@ -96,9 +96,23 @@ docker exec colloquium-core python3 /app/agent/create_user.py --list
     "--url",  "http://localhost:8008",
     "--username", "copilot"
   ],
-  "type": "stdio"
+  "type": "stdio",
+  "env": {
+    "MCP_AUTH_TOKEN": "<токен_для_cqds_ctl>"
+  }
 }
 ```
+
+`MCP_AUTH_TOKEN` используется инструментом `cq_docker_control` для авторизации вызовов к `cqds_ctl.py` через localhost HTTP API.
+Если поле не задано, `copilot_mcp_tool.py` пробует прочитать токен из env-переменной `MCP_AUTH_TOKEN`,
+затем из самого `mcp.json`, и как последний fallback использует значение по умолчанию `Grok-xAI-Agent-The-Best`.
+
+> **Источники `MCP_AUTH_TOKEN` (по приоритету)**:
+> 1. `MCP_AUTH_TOKEN` env-переменная окружения
+> 2. поле `env.MCP_AUTH_TOKEN` в секции `colloquium` файла `mcp.json`
+> 3. встроенный fallback `Grok-xAI-Agent-The-Best`
+
+Значение в `mcp.json` должно совпадать с токеном, настроенным в `cqds_ctl.py` / `scripts/cqds_ctl.py`.
 
 Предпочтительный локальный вариант: пароль хранится в отдельном файле рядом с `copilot_mcp_tool.py`
 или в другом защищённом месте на хосте.
@@ -191,13 +205,15 @@ Preview намеренно показывает только первые 2 си
 | `cq_select_project` | Выбрать активный проект в сессии |
 | `cq_list_files` | Лёгкий индекс файлов проекта (без контента) |
 | `cq_get_index` | Получить rich-index чата/проекта |
-| `cq_get_code_index` | Сборка rich-index проекта по требованию |
+| `cq_rebuild_index` | Пересобрать rich-index проекта по требованию |
+| `cq_get_code_index` | Совместимый alias для `cq_rebuild_index` |
 | `cq_read_file` | Прочитать файл по DB `file_id` |
 | `cq_exec` | Выполнить shell-команду в проекте |
 | `cq_query_db` | Выполнить read-only SQL через backend DB layer (debug) |
 | `cq_set_sync_mode` | Включить/выключить синхронный режим для `cq_send_message` |
 | `cq_smart_grep` | Поиск по наборам файлов (code/logs/docs/all) |
 | `cq_grep_logs` | Сканирование одного/нескольких log-файлов по маскам с regex-фильтрацией |
+| `cq_docker_control` | Управление Docker Compose сервисами CQDS на хосте (status/restart/rebuild/clear-logs) |
 | `cq_replace` | Точный replace в файле по `file_id` |
 | `cq_process_spawn` | Запустить subprocess в mcp-sandbox (возвращает `process_guid`) |
 | `cq_process_io` | Читать/писать stdin/stdout/stderr процесса по `process_guid` |
@@ -500,6 +516,47 @@ Invoke-RestMethod -Method POST -Uri "http://localhost:8008/api/login" `
   -Body '{"username":"copilot","password":"<пароль_из_файла_или_секрета>"}'
 # Ожидаемый ответ: объект с полями role, user_id и т.п.
 ```
+
+---
+
+## Инструмент `cq_docker_control`
+
+Позволяет Copilot управлять Docker Compose сервисами CQDS без прямого доступа к shell.
+
+### Параметры
+
+```
+command  — действие:
+  status      — состояние контейнеров, health, недавние ошибки в логах
+  restart     — docker compose restart + ожидание стабильного состояния
+  rebuild     — docker compose up -d --build + ожидание стабильного состояния
+  clear-logs  — обрезка json-file логов контейнеров через Docker VM
+services — список имён compose-сервисов (опционально; без параметра — все сервисы)
+           Имена сервисов: postgres, nginx-router, frontend, colloquium-core, mcp-sandbox
+timeout  — секунд ожидания стабильного состояния (по умолчанию 90; для status/restart/rebuild)
+wait     — для status: блокировать до stable/failed вместо моментального снимка (по умолчанию false)
+```
+
+### Примеры
+
+```
+→ cq_docker_control command=status
+  Ожидаемый ответ: JSON с overall_status (stable/unstable) и списком сервисов
+
+→ cq_docker_control command=status services=["colloquium-core"]
+  Снимок только для одного сервиса
+
+→ cq_docker_control command=restart services=["colloquium-core"] timeout=120
+  Перезапуск ядра с ожиданием до 120 секунд
+
+→ cq_docker_control command=clear-logs
+  Очистить log-файлы всех контейнеров (нужно при зависании docker logs)
+```
+
+> **Примечание о `docker logs --tail`**: при ручной обрезке json-file логов контейнера
+> команда `docker logs --tail=N` начинает висеть бесконечно — известное поведение Docker.
+> `cqds_ctl.py` обходит это, читая json-файл логов напрямую через вспомогательный alpine-контейнер,
+> поэтому `status` работает корректно даже после `clear-logs`.
 
 ---
 
