@@ -1,12 +1,14 @@
 # /app/agent/managers/llm_interactor.py, updated 2025-07-28 09:41 EEST
 import asyncio
 import datetime
+import hashlib
 import json
 from pathlib import Path
 from lib.sandwich_pack import SandwichPack, estimate_tokens
 from context_assembler import ContextAssembler
 from managers.db import DataTable
 from chat_actor import ChatActor
+from lib.session_context import get_session_id
 import globals as g
 import os
 
@@ -74,6 +76,7 @@ class LLMInteractor(ContextAssembler):
         self.pre_prompt, self.pre_prompt_path = _load_pre_prompt()
         self.last_sandwich_idx = None
         self.entities_idx = {}   # index per chat
+        self.context_fp_cache = {}
         self.tokens_limit = 131072
         self.llm_usage_table = DataTable(
             table_name="llm_usage",
@@ -88,6 +91,72 @@ class LLMInteractor(ContextAssembler):
                 "token_cost FLOAT",
                 "chat_id INTEGER"
             ]
+        )
+
+    @staticmethod
+    def _hash_text(text: str) -> str:
+        payload = (text or "").encode("utf-8", errors="replace")
+        return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _build_blocks_signature(blocks: list) -> str:
+        rows = []
+        for block in blocks:
+            rows.append(
+                f"{block.content_type}|{block.post_id or 0}|{block.file_id or 0}|{block.file_name or ''}"
+            )
+        return LLMInteractor._hash_text("\n".join(rows))
+
+    def _context_cache_key(self, actor_id: int, chat_id: int, session_id: str | None) -> str:
+        sid = str(session_id or "")
+        return f"{actor_id}:{chat_id}:{sid}"
+
+    def _decide_cache_mode(self, cache_key: str, current_fp: dict) -> tuple[str, str]:
+        prev = self.context_fp_cache.get(cache_key)
+        if prev is None:
+            return "FULL", "no_cache_state"
+
+        if prev.get("pre_prompt_hash") != current_fp.get("pre_prompt_hash"):
+            return "FULL", "pre_prompt_changed"
+        if prev.get("index_hash") != current_fp.get("index_hash"):
+            return "FULL", "index_changed"
+        if prev.get("blocks_signature") != current_fp.get("blocks_signature"):
+            return "FULL", "block_layout_changed"
+
+        prev_last_post = int(prev.get("last_post_id", 0) or 0)
+        cur_last_post = int(current_fp.get("last_post_id", 0) or 0)
+        if cur_last_post < prev_last_post:
+            return "FULL", "history_rewind_or_edit"
+        if cur_last_post == prev_last_post:
+            return "FULL", "no_tail_append"
+
+        return "DELTA_SAFE", "tail_append_detected"
+
+    def _log_context_fingerprint(self, ci: ContextInput, full_idx: str, filtered_blocks: list, last_post_id: int, rql: int):
+        session_id = get_session_id()
+        cache_key = self._context_cache_key(ci.actor.user_id, ci.chat_id, session_id)
+        current_fp = {
+            "pre_prompt_hash": self._hash_text(self.pre_prompt),
+            "index_hash": self._hash_text(full_idx),
+            "blocks_signature": self._build_blocks_signature(filtered_blocks),
+            "last_post_id": int(last_post_id or 0),
+            "blocks_count": len(filtered_blocks),
+            "rql": int(rql),
+            "session_id": session_id or "",
+            "updated_at": int(datetime.datetime.now().timestamp()),
+        }
+        mode, reason = self._decide_cache_mode(cache_key, current_fp)
+        self.context_fp_cache[cache_key] = current_fp
+        log.info(
+            "ContextCacheDecision mode=%s reason=%s actor_id=%d chat_id=%d rql=%d session=%s last_post_id=%d blocks=%d",
+            mode,
+            reason,
+            ci.actor.user_id,
+            ci.chat_id,
+            rql,
+            (session_id[:8] if session_id else "-"),
+            current_fp["last_post_id"],
+            current_fp["blocks_count"],
         )
 
     @staticmethod
@@ -236,6 +305,7 @@ class LLMInteractor(ContextAssembler):
             context += f"\n<focus>\n{focus}\n</focus>"  # подстраховка для моделей, что ценят больше последние символы контекста
 
             log.debug("Контекст сгенерирован, длина %d символов, индекс кэширован", len(context))
+            self._log_context_fingerprint(ci, full_idx, filtered_blocks, last_post_id, rql)
             self._write_context_stats(filtered_blocks, actor.user_name, ci.chat_id, result['index'])
             return context
         except Exception as e:

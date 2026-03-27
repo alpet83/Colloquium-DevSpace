@@ -259,6 +259,106 @@ def _scan_state(project_id: int, project_name: str | None = None) -> dict:
     }
 
 
+def _collect_project_problems(project_id: int, project_name: str) -> tuple[list[dict], dict, dict, int]:
+    problems: list[dict] = []
+
+    scan = _scan_state(project_id, project_name)
+    index = get_project_index_status(project_id, project_name)
+    ttl = g.file_manager.ttl_status(project_id=project_id, sample_limit=10)
+
+    if scan.get('running'):
+        problems.append(
+            {
+                'code': 'scan_running',
+                'severity': 'info',
+                'message': 'Project scan is currently running',
+                'details': {
+                    'started_at': scan.get('started_at'),
+                    'project_id': project_id,
+                },
+            }
+        )
+
+    if scan.get('error'):
+        problems.append(
+            {
+                'code': 'scan_error',
+                'severity': 'error',
+                'message': 'Project scan finished with error',
+                'details': {
+                    'error': scan.get('error'),
+                    'project_id': project_id,
+                },
+            }
+        )
+    elif scan.get('stale'):
+        problems.append(
+            {
+                'code': 'scan_stale',
+                'severity': 'warning',
+                'message': 'Project scan state is stale',
+                'details': {
+                    'reason': scan.get('reason'),
+                    'updated_at': scan.get('updated_at'),
+                    'project_id': project_id,
+                },
+            }
+        )
+
+    if index.get('status') == 'missing':
+        problems.append(
+            {
+                'code': 'index_missing',
+                'severity': 'warning',
+                'message': 'Project index cache is missing',
+                'details': {
+                    'cache_path': index.get('cache_path'),
+                    'project_id': project_id,
+                },
+            }
+        )
+    elif index.get('status') == 'stale':
+        problems.append(
+            {
+                'code': 'index_stale',
+                'severity': 'warning',
+                'message': 'Project index cache is stale',
+                'details': {
+                    'cache_mtime': index.get('cache_mtime'),
+                    'latest_file_ts': index.get('latest_file_ts'),
+                    'project_id': project_id,
+                },
+            }
+        )
+
+    degraded_links = int(ttl.get('degraded_links') or 0)
+    ttl_zero_links = int(ttl.get('ttl_zero_links') or 0)
+    if degraded_links > 0:
+        severity = 'error' if ttl_zero_links > 0 else 'warning'
+        problems.append(
+            {
+                'code': 'file_links_degraded',
+                'severity': severity,
+                'message': f'{degraded_links} file links are degraded by TTL',
+                'details': {
+                    'degraded_links': degraded_links,
+                    'ttl_zero_links': ttl_zero_links,
+                    'ttl_max': ttl.get('ttl_max'),
+                    'sample': ttl.get('degraded_sample', []),
+                    'project_id': project_id,
+                },
+            }
+        )
+
+    severity_rank = {'ok': 0, 'info': 1, 'warning': 2, 'error': 3}
+    overall_rank = 0
+    for p in problems:
+        overall_rank = max(overall_rank, severity_rank.get(str(p.get('severity', 'ok')), 0))
+    overall = next((k for k, v in severity_rank.items() if v == overall_rank), 'ok')
+
+    return problems, scan, index, overall_rank
+
+
 async def _run_project_scan_refresh(project_id: int):
     state = _scan_state_store()
     current = state.get(project_id, {})
@@ -543,6 +643,49 @@ async def project_scan_state(request: Request, project_id: int = Query(...)):
         raise
 
 
+@router.get("/project/status")
+async def project_status(request: Request, project_id: int = Query(...)):
+    try:
+        g.check_session(request)
+        pm = ProjectManager.get(project_id)
+        if pm is None or pm.project_name is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+        problems, scan, index, _overall_rank = _collect_project_problems(project_id, pm.project_name)
+        overall = 'ok'
+        for candidate in ['info', 'warning', 'error']:
+            if any(str(p.get('severity')) == candidate for p in problems):
+                overall = candidate
+
+        stats = g.file_manager.project_stats(project_id=project_id)
+        payload = {
+            'project_id': project_id,
+            'project_name': pm.project_name,
+            'status': overall,
+            'problems': problems,
+            'scan': scan,
+            'index': index,
+            'links': g.file_manager.ttl_status(project_id=project_id, sample_limit=10),
+            'files': stats['files'],
+            'backups': stats['backups'],
+            'updated_at': int(time.time()),
+        }
+
+        log.debug(
+            g.with_session_tag(request, 'GET /project/status project_id=%d project_name=%s status=%s problems=%d'),
+            project_id,
+            pm.project_name,
+            overall,
+            len(problems),
+        )
+        return payload
+    except HTTPException:
+        raise
+    except Exception as e:
+        g.handle_exception("Ошибка в GET /project/status", e)
+        raise
+
+
 @router.post("/project/scan_refresh")
 async def project_scan_refresh(request: Request):
     try:
@@ -605,15 +748,29 @@ def code_index(
     """
     try:
         g.check_session(request)
-        _, project_name = _resolve_project(project_id)
+        pm, project_name = _resolve_project(project_id)
+
+        # Always refresh attached_files via ProjectManager before index regeneration.
+        scan_started = time.monotonic()
+        scanned_files = pm.scan_project_files() or []
+        scan_duration = round(time.monotonic() - scan_started, 3)
+
         index_data, files_count, blocks_count, entities_count, cache_path = _build_project_index_sync(
             project_id,
             project_name,
         )
 
         log.debug(
-            g.with_session_tag(request, "GET /project/code_index: project_id=%d, project_name=%s, timeout=%ds, files=%d, blocks=%d, entities=%d, cache=%s"),
-            project_id, project_name, timeout, files_count, blocks_count, entities_count, cache_path
+            g.with_session_tag(request, "GET /project/code_index: project_id=%d, project_name=%s, timeout=%ds, scan_files=%d, scan_sec=%.3f, files=%d, blocks=%d, entities=%d, cache=%s"),
+            project_id,
+            project_name,
+            timeout,
+            len(scanned_files),
+            scan_duration,
+            files_count,
+            blocks_count,
+            entities_count,
+            cache_path,
         )
         return index_data
     except HTTPException:

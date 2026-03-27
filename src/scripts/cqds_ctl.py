@@ -7,7 +7,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -28,10 +28,20 @@ FAIL_PATTERNS = [
 ]
 
 STABLE_LOG_PATTERNS = {
-    'colloquium-core': [re.compile(r'uvicorn', re.IGNORECASE)],
+    'colloquium-core': [
+        re.compile(r'application startup complete', re.IGNORECASE),
+        re.compile(r'uvicorn running on', re.IGNORECASE),
+    ],
     'postgres': [re.compile(r'database system is ready to accept connections', re.IGNORECASE)],
-    'frontend': [re.compile(r'ready', re.IGNORECASE)],
-    'nginx-router': [re.compile(r'start worker process', re.IGNORECASE)],
+    'frontend': [
+        re.compile(r'vite v\S+\s+ready in', re.IGNORECASE),
+        re.compile(r'local:\s+http://', re.IGNORECASE),
+    ],
+    'nginx-router': [
+        re.compile(r'start worker process', re.IGNORECASE),
+        re.compile(r'configuration complete; ready for start up', re.IGNORECASE),
+    ],
+    'mcp-sandbox': [re.compile(r'server initialization finished', re.IGNORECASE)],
 }
 
 BENIGN_LOG_PATTERNS = [
@@ -86,25 +96,45 @@ class CqdsCtl:
     def __init__(self, root: Path):
         self.root = root
 
-    def _run(self, args: list[str], check: bool = True) -> subprocess.CompletedProcess:
-        result = subprocess.run(
-            args,
-            cwd=self.root,
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-        )
+    def _run(self, args: list[str], check: bool = True, timeout: int = 30) -> subprocess.CompletedProcess:
+        proc: subprocess.Popen[str] | None = None
+        try:
+            proc = subprocess.Popen(
+                args,
+                cwd=self.root,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+            )
+            stdout, stderr = proc.communicate(timeout=timeout)
+            result = subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
+        except subprocess.TimeoutExpired:
+            if proc is not None:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+            else:
+                stdout, stderr = '', ''
+            if check:
+                raise CommandError(f'command timed out after {timeout}s: {" ".join(args)}')
+            return subprocess.CompletedProcess(
+                args,
+                returncode=-1,
+                stdout=stdout,
+                stderr=((stderr + '\n') if stderr else '') + f'timeout after {timeout}s',
+            )
         if check and result.returncode != 0:
             stderr = (result.stderr or result.stdout).strip()
             raise CommandError(f'command failed: {" ".join(args)} :: {stderr}')
         return result
 
-    def compose(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-        return self._run(['docker', 'compose', *args], check=check)
+    def compose(self, *args: str, check: bool = True, timeout: int = 30) -> subprocess.CompletedProcess:
+        return self._run(['docker', 'compose', *args], check=check, timeout=timeout)
 
-    def docker(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-        return self._run(['docker', *args], check=check)
+    def docker(self, *args: str, check: bool = True, timeout: int = 30) -> subprocess.CompletedProcess:
+        return self._run(['docker', *args], check=check, timeout=timeout)
 
     def list_services(self) -> list[str]:
         result = self.compose('config', '--services')
@@ -120,11 +150,67 @@ class CqdsCtl:
         payload = json.loads(result.stdout)
         return payload[0] if payload else {}
 
+    def _tail_log_lines_via_container(self, log_dir: str, log_file: str, tail: int) -> tuple[list[str], str | None]:
+        """Read the tail of a Docker json-file log from inside the Docker VM."""
+        try:
+            r = subprocess.run(
+                ['docker', 'run', '--rm', '--privileged',
+                 '-v', f'{log_dir}:/ld:ro',
+                 _LOG_HELPER_IMAGE, 'sh', '-c', f'tail -n {tail} /ld/{log_file}'],
+                capture_output=True, text=True, timeout=20,
+            )
+            if r.returncode != 0:
+                return [], (r.stderr or r.stdout).strip()[:200]
+            return [line.rstrip() for line in (r.stdout or '').splitlines() if line.strip()], None
+        except Exception as exc:
+            return [], str(exc)[:120]
+
+    def _parse_log_since(self, raw_line: str, since_dt: datetime | None) -> str | None:
+        try:
+            payload = json.loads(raw_line)
+        except Exception:
+            return raw_line
+        message = str(payload.get('log', '')).rstrip()
+        if not message:
+            return None
+        if since_dt is None:
+            return message
+        raw_ts = payload.get('time')
+        if not isinstance(raw_ts, str):
+            return message
+        try:
+            line_dt = datetime.fromisoformat(raw_ts.replace('Z', '+00:00'))
+        except ValueError:
+            return message
+        return message if line_dt >= since_dt else None
+
     def get_recent_logs(self, service: str, since: str | None = None, tail: int = 120) -> list[str]:
-        extra = ['--since', since] if since else []
-        result = self.compose('logs', '--no-color', f'--tail={tail}', *extra, service, check=False)
-        content = (result.stdout or '') + ('\n' + result.stderr if result.stderr else '')
-        return [line.rstrip() for line in content.splitlines() if line.strip()]
+        container_id = self.container_id(service)
+        if not container_id:
+            return []
+        log_path = self.get_log_path(container_id)
+        if not log_path:
+            return []
+        since_dt: datetime | None = None
+        if since:
+            # Cap log scan window to 30 minutes to avoid scanning large log files
+            cap = datetime.now(timezone.utc) - timedelta(minutes=30)
+            try:
+                since_dt = datetime.fromisoformat(since.replace('Z', '+00:00'))
+                if since_dt < cap:
+                    since_dt = cap
+            except (ValueError, TypeError):
+                since_dt = None
+        log_dir, log_file = log_path.rsplit('/', 1)
+        raw_lines, err = self._tail_log_lines_via_container(log_dir, log_file, tail)
+        if err:
+            raise CommandError(f'failed reading log tail for {service}: {err}')
+        lines: list[str] = []
+        for raw_line in raw_lines:
+            parsed = self._parse_log_since(raw_line, since_dt)
+            if parsed:
+                lines.append(parsed)
+        return lines
 
     def summarize_logs(self, service: str, lines: list[str]) -> dict:
         failures = [
@@ -284,8 +370,15 @@ class CqdsCtl:
 
         # Only fetch logs from the current container run to avoid stale failure lines
         since = started_at if raw_state == 'running' else None
-        logs = self.get_recent_logs(service, since=since)
-        log_summary = self.summarize_logs(service, logs)
+        try:
+            logs = self.get_recent_logs(service, since=since)
+            log_summary = self.summarize_logs(service, logs)
+        except CommandError as exc:
+            log_summary = {
+                'failure_lines': [],
+                'stable_lines': [],
+            }
+            status['warnings'].append(f'Log collection skipped: {exc}')
         status['log_summary'] = log_summary
 
         # Active live probes (only for running containers)

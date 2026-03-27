@@ -12,6 +12,16 @@ from lib.basic_logger import BasicLogger
 log = globals.get_logger("fileman")
 
 
+def _safe_int_env(name: str, default: int, min_value: int = 0) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return max(int(raw), min_value)
+    except Exception:
+        return default
+
+
 def _mark_project_scan_stale(project_id: int, reason: str):
     try:
         ProjectManager.mark_scan_stale(project_id, reason=reason)
@@ -37,6 +47,8 @@ def _mod_time(file_name: str, project_id: int):
 
 class FileManager:
     def __init__(self):
+        self._missing_ttl_max = _safe_int_env("FILE_LINK_TTL_MAX", 3, 1)
+        self._missing_probe_cooldown_sec = _safe_int_env("FILE_LINK_TTL_CHECK_COOLDOWN_SEC", 120, 0)
         self.db = Database.get_database()
         self.files_table = DataTable(
             table_name="attached_files",
@@ -45,6 +57,8 @@ class FileManager:
                 "content BLOB",
                 "ts INTEGER",
                 "file_name TEXT",
+                f"missing_ttl INTEGER DEFAULT {self._missing_ttl_max}",
+                "missing_checked_ts INTEGER DEFAULT 0",
                 "project_id INTEGER",
                 "FOREIGN KEY (project_id) REFERENCES projects(id)"
             ]
@@ -79,6 +93,7 @@ class FileManager:
             lock.release()
 
     def check(self):
+        self._initialize_missing_ttl()
         rows = self.files_table.select_from(
             columns=['id', 'file_name', 'content', 'project_id', 'ts']
         )
@@ -94,6 +109,76 @@ class FileManager:
                 file_name = f"@{file_name}"
             if is_link and not self.link_valid(file_id) and project_id is not None:
                 log.warn("Для проекта %3d, @%5d: %s  более не существует на диске", int(project_id), file_id, file_name)
+
+    def _initialize_missing_ttl(self):
+        try:
+            self.db.execute(
+                "UPDATE attached_files "
+                "SET missing_ttl = :ttl "
+                "WHERE missing_ttl IS NULL OR missing_ttl < 0",
+                {'ttl': self._missing_ttl_max},
+            )
+            self.db.execute(
+                "UPDATE attached_files "
+                "SET missing_checked_ts = 0 "
+                "WHERE missing_checked_ts IS NULL OR missing_checked_ts < 0",
+                {},
+            )
+        except Exception as e:
+            log.warn("Не удалось инициализировать TTL для attached_files: %s", str(e))
+
+    def _set_missing_ttl(self, file_id: int, ttl: int, checked_ts: int | None = None):
+        checked_value = int(time.time()) if checked_ts is None else int(checked_ts)
+        self.db.execute(
+            "UPDATE attached_files SET missing_ttl = :ttl, missing_checked_ts = :checked WHERE id = :id",
+            {'ttl': max(0, min(int(ttl), self._missing_ttl_max)), 'checked': checked_value, 'id': int(file_id)},
+        )
+
+    def _mark_link_healthy(self, file_id: int):
+        row = self.db.fetch_one(
+            "SELECT COALESCE(missing_ttl, :ttl) FROM attached_files WHERE id = :id",
+            {'id': int(file_id), 'ttl': self._missing_ttl_max},
+        )
+        prev_ttl = int(row[0]) if row else self._missing_ttl_max
+        self._set_missing_ttl(file_id, self._missing_ttl_max)
+        if prev_ttl < self._missing_ttl_max:
+            log.info("TTL-recover link id=%d ttl=%d->%d", int(file_id), prev_ttl, self._missing_ttl_max)
+
+    def _link_health_state(self, file_id: int, mutate: bool = True) -> tuple[bool, int]:
+        row = self.db.fetch_one(
+            "SELECT file_name, project_id, COALESCE(missing_ttl, :ttl), COALESCE(missing_checked_ts, 0) "
+            "FROM attached_files WHERE id = :id",
+            {'id': int(file_id), 'ttl': self._missing_ttl_max},
+        )
+        if not row:
+            return False, 0
+
+        file_name, project_id, missing_ttl, missing_checked_ts = row
+        missing_ttl = max(0, min(int(missing_ttl), self._missing_ttl_max))
+        missing_checked_ts = int(missing_checked_ts or 0)
+
+        clean_name = str(file_name).lstrip('@')
+        file_path = _qfn(clean_name, project_id)
+        path_exists = os.path.exists(file_path)
+
+        # If TTL is degraded, keep link hidden until explicit rescan restores it.
+        if path_exists and missing_ttl < self._missing_ttl_max:
+            return False, missing_ttl
+
+        if path_exists:
+            return True, missing_ttl
+
+        now_ts = int(time.time())
+        should_degrade = mutate and (now_ts - missing_checked_ts >= self._missing_probe_cooldown_sec)
+        if should_degrade and missing_ttl > 0:
+            next_ttl = missing_ttl - 1
+            self._set_missing_ttl(file_id, next_ttl, now_ts)
+            log.warn("TTL-degrade link id=%d qfn=%s ttl=%d->%d", int(file_id), str(file_path), missing_ttl, next_ttl)
+            missing_ttl = next_ttl
+        elif mutate and should_degrade:
+            self._set_missing_ttl(file_id, 0, now_ts)
+
+        return False, missing_ttl
 
     def _dedup(self, project_id: int = None):
         conditions = {'project_id': project_id} if project_id is not None else {}
@@ -136,12 +221,13 @@ class FileManager:
         rec = self.get_record(file_id)
         if rec is None:
             return False
+        is_valid, missing_ttl = self._link_health_state(file_id, mutate=True)
+        if is_valid:
+            return True
         file_name = rec[1]
         project_id = rec[4]
         qfn = _qfn(file_name, project_id)
-        if os.path.exists(qfn):
-            return True
-        log.warn("link_valid: Не найден %d: %s ", file_id, qfn)
+        log.warn("link_valid: Не найден/скрыт %d: %s (ttl=%d)", file_id, qfn, missing_ttl)
         return False
 
     def get_record(self, file_id: int, err_fmt: str = "Failed get_record for %d"):
@@ -205,6 +291,8 @@ class FileManager:
         # exists() returns bool, but add_file must work with numeric id.
         file_id = self.find(file_name, project_id=project_id)
         if file_id is not None:
+            # Preserve file_id and re-activate degraded link during scan/update paths.
+            self._mark_link_healthy(file_id)
             return file_id
         if timestamp is None:
             timestamp = int(time.time())
@@ -229,6 +317,8 @@ class FileManager:
                 'content': None,
                 'ts': timestamp,
                 'file_name': f"@{file_name}",
+                'missing_ttl': self._missing_ttl_max,
+                'missing_checked_ts': int(time.time()),
                 'project_id': project_id
             },
             ignore=True
@@ -268,6 +358,8 @@ class FileManager:
                     'content': None,
                     'file_name': f"@{file_name}",
                     'ts': timestamp,
+                    'missing_ttl': self._missing_ttl_max,
+                    'missing_checked_ts': int(time.time()),
                     'project_id': project_id
                 }
             )
@@ -321,6 +413,8 @@ class FileManager:
                 values={
                     'file_name': effective_new_name,
                     'ts': int(time.time()),
+                    'missing_ttl': self._missing_ttl_max,
+                    'missing_checked_ts': int(time.time()),
                     'project_id': project_id
                 }
             )
@@ -463,11 +557,12 @@ class FileManager:
             file_id, file_name, ts, project_id = row
             clean_file_name = file_name.lstrip('@')
             if file_name.startswith('@'):
-                file_path = _qfn(clean_file_name, project_id)
-                if not file_path.exists():
+                is_valid, missing_ttl = self._link_health_state(file_id, mutate=True)
+                if not is_valid:
+                    file_path = _qfn(clean_file_name, project_id)
                     log.warn("Имеется отсутствующая ссылка: id=%3d, project_id=%2d, qfn=%s",
                              file_id or -1, project_id or -1, str(file_path))
-                    orphaned.append(file_id)
+                    orphaned.append(f"{file_id}:ttl={missing_ttl}")
                     continue
             files[file_id] = {'id': file_id, 'file_name': clean_file_name, 'ts': ts, 'project_id': project_id}
         if orphaned:
@@ -495,6 +590,8 @@ class FileManager:
         if file_ids:
             safe_ids = ','.join(str(int(i)) for i in file_ids)  # int cast prevents injection
             clauses.append(f'id IN ({safe_ids})')
+        clauses.append('COALESCE(missing_ttl, :missing_ttl_max) >= :missing_ttl_max')
+        params['missing_ttl_max'] = self._missing_ttl_max
         query = (
             f"SELECT id, file_name, ts, project_id FROM attached_files "
             f"WHERE {' AND '.join(clauses)} ORDER BY file_name"
@@ -504,6 +601,10 @@ class FileManager:
         for row in rows:
             file_id, file_name, ts, proj_id = row
             clean_name = file_name.lstrip('@')
+            if file_name.startswith('@'):
+                is_valid, _ttl = self._link_health_state(file_id, mutate=True)
+                if not is_valid:
+                    continue
             entry = {'id': file_id, 'file_name': clean_name, 'ts': ts, 'project_id': proj_id}
             if include_size and file_name.startswith('@'):
                 try:
@@ -514,4 +615,117 @@ class FileManager:
                     pass
             result.append(entry)
         return result
+
+    def ttl_status(self, project_id: int = None, sample_limit: int = 10) -> dict:
+        ttl_max = self._missing_ttl_max
+        sample_limit = max(1, min(int(sample_limit), 50))
+
+        clauses = ["file_name LIKE '@%'"]
+        params = {'ttl_max': ttl_max}
+        if project_id is not None:
+            clauses.append('project_id = :project_id')
+            params['project_id'] = project_id
+        where_sql = ' AND '.join(clauses)
+
+        summary_row = self.db.fetch_one(
+            (
+                "SELECT "
+                "COUNT(*) AS total_links, "
+                "SUM(CASE WHEN COALESCE(missing_ttl, :ttl_max) < :ttl_max THEN 1 ELSE 0 END) AS degraded_links, "
+                "SUM(CASE WHEN COALESCE(missing_ttl, :ttl_max) = 0 THEN 1 ELSE 0 END) AS ttl_zero_links "
+                "FROM attached_files "
+                f"WHERE {where_sql}"
+            ),
+            params,
+        )
+
+        degraded_rows = self.db.fetch_all(
+            (
+                "SELECT id, file_name, project_id, COALESCE(missing_ttl, :ttl_max) AS ttl, "
+                "COALESCE(missing_checked_ts, 0) AS checked_ts "
+                "FROM attached_files "
+                f"WHERE {where_sql} AND COALESCE(missing_ttl, :ttl_max) < :ttl_max "
+                "ORDER BY ttl ASC, checked_ts ASC "
+                f"LIMIT {sample_limit}"
+            ),
+            params,
+        )
+
+        problems = []
+        for row in degraded_rows:
+            file_id, file_name, proj_id, ttl, checked_ts = row
+            problems.append(
+                {
+                    'id': int(file_id),
+                    'file_name': str(file_name).lstrip('@'),
+                    'project_id': proj_id,
+                    'missing_ttl': int(ttl),
+                    'missing_checked_ts': int(checked_ts or 0),
+                }
+            )
+
+        total_links = int(summary_row[0] or 0) if summary_row else 0
+        degraded_links = int(summary_row[1] or 0) if summary_row else 0
+        ttl_zero_links = int(summary_row[2] or 0) if summary_row else 0
+
+        return {
+            'ttl_max': ttl_max,
+            'total_links': total_links,
+            'degraded_links': degraded_links,
+            'ttl_zero_links': ttl_zero_links,
+            'sample_limit': sample_limit,
+            'degraded_sample': problems,
+        }
+
+    def project_stats(self, project_id: int) -> dict:
+        """Return file link counts and backup/undo stack stats for a project."""
+        ttl_max = self._missing_ttl_max
+        row = self.db.fetch_one(
+            "SELECT "
+            "COUNT(*) AS total, "
+            "SUM(CASE WHEN COALESCE(missing_ttl, :ttl) >= :ttl THEN 1 ELSE 0 END) AS active "
+            "FROM attached_files WHERE project_id = :pid AND file_name LIKE '@%'",
+            {'pid': project_id, 'ttl': ttl_max},
+        )
+        total_links = int(row[0] or 0) if row else 0
+        active_links = int(row[1] or 0) if row else 0
+
+        backup_count = 0
+        backup_size = 0
+        oldest_ts: int | None = None
+        newest_ts: int | None = None
+
+        pm = ProjectManager.get(project_id)
+        if pm and pm.projects_dir and pm.project_name:
+            backup_dir = Path(pm.projects_dir) / 'backups' / pm.project_name
+            if backup_dir.exists():
+                for f in backup_dir.rglob('*'):
+                    if not f.is_file():
+                        continue
+                    backup_count += 1
+                    try:
+                        st = f.stat()
+                        backup_size += st.st_size
+                        ts_part = f.name.rsplit('.', 1)[-1]
+                        if ts_part.isdigit():
+                            ts = int(ts_part)
+                            if oldest_ts is None or ts < oldest_ts:
+                                oldest_ts = ts
+                            if newest_ts is None or ts > newest_ts:
+                                newest_ts = ts
+                    except OSError:
+                        pass
+
+        return {
+            'files': {
+                'total_links': total_links,
+                'active_links': active_links,
+            },
+            'backups': {
+                'count': backup_count,
+                'size_bytes': backup_size,
+                'oldest_ts': oldest_ts,
+                'newest_ts': newest_ts,
+            },
+        }
 

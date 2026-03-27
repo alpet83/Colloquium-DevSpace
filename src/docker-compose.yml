@@ -61,6 +61,8 @@ services:
       - PGUSER=cqds
       - PGPASSWORD_FILE=/run/secrets/cqds_db_password
       - PGDATABASE=cqds
+      - MCP_SERVER_URL=http://mcp-sandbox:8084
+      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:?MCP_AUTH_TOKEN is required}
     command: >
       sh -c "python /app/postgres/migrate_sqlite_to_postgres.py && python3 /app/agent/server.py"
     restart: on-failure
@@ -79,6 +81,8 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: mcp-sandbox
+    ports:
+      - "8084:8084"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs

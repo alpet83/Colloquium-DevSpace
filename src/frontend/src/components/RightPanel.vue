@@ -9,8 +9,21 @@
       <button v-if="selectedProject" @click="openEditProjectModal">Редактировать проект</button>
       <select v-model="selectedProject" @change="selectProject">
         <option value="">Все файлы</option>
-        <option v-for="project in projects" :value="project.id" :key="project.id">{{ project.project_name }}</option>
+        <option
+          v-for="project in projects"
+          :value="project.id"
+          :key="project.id"
+          :title="projectStatusTip(project.id)"
+        >{{ projectStatusIcon(project.id) }}{{ project.project_name }}</option>
       </select>
+      <div v-if="selectedProjectProblems.length" class="project-problems">
+        <span
+          v-for="p in selectedProjectProblems"
+          :key="p.code"
+          :class="'problem-badge problem-' + p.severity"
+          :title="p.code"
+        >{{ p.message }}</span>
+      </div>
       <div class="search-settings" :class="{ collapsed: !isDisplayedSS }">
         <h3><u @click="toggleDisplaySS">Настройки поиска {{ isDisplayedSS ? '' : '>>' }}</u></h3>        
         <label>Режим поиска:</label>
@@ -101,7 +114,15 @@ export default defineComponent({
         sources: ['web', 'x', 'news'],
         max_search_results: 20
       },
-      fileTrees: []
+      fileTrees: [],
+      projectStatuses: {}
+    }
+  },
+  computed: {
+    selectedProjectProblems() {
+      if (!this.selectedProject) return []
+      const st = this.projectStatuses[this.selectedProject]
+      return st?.problems || []
     }
   },
   setup() {
@@ -125,6 +146,33 @@ export default defineComponent({
     clearTimeout(this.debounceLoadFiles)
   },
   methods: {
+    projectStatusIcon(projectId) {
+      const st = this.projectStatuses[projectId]
+      if (!st || st.status === 'ok') return ''
+      return st.status === 'error' ? '🔴 ' : '⚠ '
+    },
+    projectStatusTip(projectId) {
+      const st = this.projectStatuses[projectId]
+      if (!st || !st.problems?.length) return ''
+      return st.problems.map(p => `[${p.severity}] ${p.message}`).join('\n')
+    },
+    async fetchProjectStatuses() {
+      const statuses = {}
+      await Promise.allSettled(
+        this.projects.map(async (project) => {
+          try {
+            const res = await fetch(
+              this.fileStore.apiUrl + '/project/status?project_id=' + project.id,
+              { credentials: 'include' }
+            )
+            if (res.ok) statuses[project.id] = await res.json()
+          } catch (e) {
+            log_error(this, e, 'fetch project status ' + project.id)
+          }
+        })
+      )
+      this.projectStatuses = statuses
+    },
     async fetchProjects() {
       try {
         log_msg('FILE', 'Fetching projects:', this.fileStore.apiUrl + '/project/list')
@@ -136,6 +184,7 @@ export default defineComponent({
           this.projects = (await res.json()).filter(project => project.id > 0) // Исключаем project_id=0 (.chat-meta)
           if (this.selectedProject === '0') this.selectedProject = '' // Сбрасываем выбор .chat-meta
           log_msg('FILE', 'Fetched projects:', JSON.stringify(this.projects, null, 2))
+          this.fetchProjectStatuses()
         } else {
           log_error(this, new Error('Failed to fetch projects'), 'fetch projects')
         }
@@ -452,5 +501,28 @@ export default defineComponent({
   .search-settings .sources label {
     color: #333;
   }
+}
+.project-problems {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 4px 0 6px;
+}
+.problem-badge {
+  display: block;
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.problem-info    { background: #3a3a5a; color: #aac; }
+.problem-warning { background: #5a4a00; color: #fd3; }
+.problem-error   { background: #5a1a1a; color: #f88; }
+@media (prefers-color-scheme: light) {
+  .problem-info    { background: #e8e8ff; color: #335; }
+  .problem-warning { background: #fff4cc; color: #764; }
+  .problem-error   { background: #ffe8e8; color: #800; }
 }
 </style>

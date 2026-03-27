@@ -2,6 +2,9 @@ services:
   postgres:
     volumes:
       - /opt/data/pgdata:/var/lib/postgresql/data    
+    environment:
+      - POSTGRES_PASSWORD=dummy1248
+      - POSTGRES_ROOT_PASSWORD=dummy1248
   colloquium-core:
     environment:
       - PYTHONUNBUFFERED=1
