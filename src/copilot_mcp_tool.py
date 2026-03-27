@@ -351,6 +351,126 @@ def _xml_undo(file_id: int, time_back: int = 3600) -> str:
     return f'<undo file_id={file_id} time_back={time_back}>'
 
 
+def _unwrap_exec_output(raw_output: str) -> dict[str, str]:
+    text = str(raw_output or "")
+    stdout_match = re.search(r"<stdout>(.*?)</stdout>", text, flags=re.DOTALL)
+    stderr_match = re.search(r"<stderr>(.*?)</stderr>", text, flags=re.DOTALL)
+
+    if stdout_match or stderr_match:
+        return {
+            "stdout": (stdout_match.group(1) if stdout_match else "").strip(),
+            "stderr": (stderr_match.group(1) if stderr_match else "").strip(),
+        }
+
+    return {
+        "stdout": text.strip(),
+        "stderr": "",
+    }
+
+
+def _normalize_exec_result(result: dict[str, Any], command: str, timeout: int) -> dict[str, Any]:
+    output_raw = str(result.get("output", ""))
+    streams = _unwrap_exec_output(output_raw)
+    normalized: dict[str, Any] = {
+        "status": result.get("status"),
+        "project": result.get("project"),
+        "command": command,
+        "timeout": timeout,
+        "stdout": streams["stdout"],
+        "stderr": streams["stderr"],
+        "output": streams["stdout"],
+        "output_raw": output_raw,
+    }
+    for key in ("exit_code", "signal", "duration_ms"):
+        if key in result:
+            normalized[key] = result[key]
+    return normalized
+
+
+def _parse_exec_commands(
+    command_arg: Any,
+    default_timeout: int,
+) -> list[tuple[str, int]]:
+    if isinstance(command_arg, str):
+        candidate = command_arg.strip()
+        if candidate.startswith("{") or candidate.startswith("["):
+            try:
+                parsed = json.loads(candidate)
+                return _parse_exec_commands(parsed, default_timeout)
+            except Exception:
+                pass
+        if not candidate:
+            raise ValueError("command must be non-empty")
+        return [(candidate, default_timeout)]
+
+    def normalize_item(item: Any) -> tuple[str, int]:
+        if isinstance(item, str):
+            cmd = item.strip()
+            if not cmd:
+                raise ValueError("command item must be non-empty")
+            return cmd, default_timeout
+        if isinstance(item, dict):
+            cmd = str(item.get("command", "")).strip()
+            if not cmd:
+                raise ValueError("command item dict requires non-empty 'command'")
+            cmd_timeout = int(item.get("timeout", default_timeout))
+            cmd_timeout = max(1, min(cmd_timeout, 300))
+            return cmd, cmd_timeout
+        raise ValueError("command item must be string or object")
+
+    if isinstance(command_arg, list):
+        if not command_arg:
+            raise ValueError("command list must be non-empty")
+        return [normalize_item(item) for item in command_arg]
+
+    if isinstance(command_arg, dict):
+        if "commands" in command_arg:
+            commands = command_arg["commands"]
+            if not isinstance(commands, list) or not commands:
+                raise ValueError("command.commands must be a non-empty array")
+            return [normalize_item(item) for item in commands]
+        if "command" in command_arg:
+            return [normalize_item(command_arg)]
+        raise ValueError("command object must contain 'command' or 'commands'")
+
+    raise ValueError("command must be string, object, or array")
+
+
+def _build_spawn_script_command(script_payload: dict[str, Any]) -> str:
+    encoded = base64.b64encode(json.dumps(script_payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
+    return (
+        "python3 - <<'PY'\n"
+        "import base64, json, os, subprocess, tempfile\n"
+        f"cfg = json.loads(base64.b64decode('{encoded}').decode('utf-8'))\n"
+        "engine = cfg.get('engine', 'bash')\n"
+        "commands = cfg.get('commands', [])\n"
+        "script_name = cfg.get('script_name') or f'cq_spawn_{os.getpid()}'\n"
+        "keep_file = bool(cfg.get('keep_file', False))\n"
+        "if engine not in ('bash', 'python'):\n"
+        "    raise SystemExit('Unsupported engine, expected bash or python')\n"
+        "suffix = '.py' if engine == 'python' else '.sh'\n"
+        "runner = 'python3' if engine == 'python' else '/bin/bash'\n"
+        "script_text = '\n'.join(commands) + '\n'\n"
+        "tmp_path = os.path.join(tempfile.gettempdir(), script_name + suffix)\n"
+        "with open(tmp_path, 'w', encoding='utf-8') as handle:\n"
+        "    handle.write(script_text)\n"
+        "if engine == 'bash':\n"
+        "    os.chmod(tmp_path, 0o755)\n"
+        "proc = subprocess.run([runner, tmp_path], capture_output=True, text=True)\n"
+        "if (not keep_file) and os.path.exists(tmp_path):\n"
+        "    os.remove(tmp_path)\n"
+        "print(json.dumps({\n"
+        "    'script_path': tmp_path,\n"
+        "    'engine': engine,\n"
+        "    'returncode': proc.returncode,\n"
+        "    'stdout': proc.stdout,\n"
+        "    'stderr': proc.stderr,\n"
+        "    'kept': keep_file,\n"
+        "}, ensure_ascii=False))\n"
+        "PY"
+    )
+
+
 # ---------------------------------------------------------------------------
 # MCP server
 # ---------------------------------------------------------------------------
@@ -622,6 +742,7 @@ TOOLS: list[Tool] = [
         name="cq_exec",
         description=(
             "Execute a shell command in a project's working directory and return stdout/stderr immediately. "
+            "Supports string command or JSON command batches in a single call. "
             "Direct call — no LLM or chat round-trip required. "
             "Use cq_list_projects to find project_id. "
             "Returns {status, output, project}. Max timeout 300s."
@@ -634,16 +755,108 @@ TOOLS: list[Tool] = [
                     "description": "Project ID (from cq_list_projects).",
                 },
                 "command": {
-                    "type": "string",
-                    "description": "Shell command to execute (bash).",
+                    "oneOf": [
+                        {
+                            "type": "string",
+                            "description": "Single shell command (bash).",
+                        },
+                        {
+                            "type": "array",
+                            "items": {
+                                "oneOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "command": {"type": "string"},
+                                            "timeout": {"type": "integer"},
+                                        },
+                                        "required": ["command"],
+                                    },
+                                ],
+                            },
+                            "description": "Batch commands, executed sequentially.",
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "commands": {
+                                    "type": "array",
+                                    "items": {
+                                        "oneOf": [
+                                            {"type": "string"},
+                                            {
+                                                "type": "object",
+                                                "properties": {
+                                                    "command": {"type": "string"},
+                                                    "timeout": {"type": "integer"},
+                                                },
+                                                "required": ["command"],
+                                            },
+                                        ],
+                                    },
+                                },
+                            },
+                            "required": ["commands"],
+                            "description": "Object form for batch execution.",
+                        },
+                    ],
+                    "description": "Command input: string or JSON batch payload.",
                 },
                 "timeout": {
                     "type": "integer",
                     "description": "Max execution time in seconds (1-300, default 30).",
                     "default": 30,
                 },
+                "continue_on_error": {
+                    "type": "boolean",
+                    "description": "For batch commands: continue after a failed command (default true).",
+                    "default": True,
+                },
             },
             "required": ["project_id", "command"],
+        },
+    ),
+    Tool(
+        name="cq_spawn_script",
+        description=(
+            "Create and run a temporary script in mcp-sandbox in one call. "
+            "Supports bash or python script engines. Useful for grouped commands without many cq_exec calls."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "integer",
+                    "description": "Project ID (from cq_list_projects).",
+                },
+                "engine": {
+                    "type": "string",
+                    "enum": ["bash", "python"],
+                    "description": "Script engine (default bash).",
+                    "default": "bash",
+                },
+                "commands": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Script lines to write and execute.",
+                },
+                "script_name": {
+                    "type": "string",
+                    "description": "Optional temp script base name.",
+                },
+                "keep_file": {
+                    "type": "boolean",
+                    "description": "Keep temporary script after run (default false).",
+                    "default": False,
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Execution timeout in seconds (1-300, default 60).",
+                    "default": 60,
+                },
+            },
+            "required": ["project_id", "commands"],
         },
     ),
     Tool(
@@ -793,6 +1006,157 @@ TOOLS: list[Tool] = [
                 },
             },
             "required": ["project_id", "file_id", "old", "new"],
+        },
+    ),
+    Tool(
+        name="cq_process_spawn",
+        description=(
+            "Spawn a subprocess in mcp_server.py and return process_guid (opaque UUID, not OS pid). "
+            "Supports bash or python scripts with custom cwd/env/timeout."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "integer",
+                    "description": "Project ID (for logging and process isolation).",
+                },
+                "command": {
+                    "type": "string",
+                    "description": "Shell command or python code (depending on engine).",
+                },
+                "engine": {
+                    "type": "string",
+                    "enum": ["bash", "python"],
+                    "description": "Execution engine (bash or python).",
+                    "default": "bash",
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory (default: current).",
+                },
+                "env": {
+                    "type": "object",
+                    "description": "Environment variables as dict (default: inherit parent).",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "TTL timeout in seconds (1-7200, default 3600).",
+                    "default": 3600,
+                },
+            },
+            "required": ["project_id", "command"],
+        },
+    ),
+    Tool(
+        name="cq_process_io",
+        description=(
+            "Read from and/or write to a running process via process_guid. "
+            "Returns recent stdout/stderr fragments and current status."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "process_guid": {
+                    "type": "string",
+                    "description": "Process GUID (returned by cq_process_spawn).",
+                },
+                "input": {
+                    "type": "string",
+                    "description": "Optional data to write to process stdin (base64 encoded or plain text).",
+                },
+                "read_timeout_ms": {
+                    "type": "integer",
+                    "description": "Read timeout in milliseconds (default 5000).",
+                    "default": 5000,
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "description": "Max bytes to return from each buffer (default 65536).",
+                    "default": 65536,
+                },
+            },
+            "required": ["process_guid"],
+        },
+    ),
+    Tool(
+        name="cq_process_kill",
+        description=(
+            "Terminate a running process by sending a signal (SIGTERM or SIGKILL)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "process_guid": {
+                    "type": "string",
+                    "description": "Process GUID to terminate.",
+                },
+                "signal": {
+                    "type": "string",
+                    "enum": ["SIGTERM", "SIGKILL"],
+                    "description": "Signal to send (default SIGTERM).",
+                    "default": "SIGTERM",
+                },
+            },
+            "required": ["process_guid"],
+        },
+    ),
+    Tool(
+        name="cq_process_status",
+        description=(
+            "Get current status of a process (alive, exit_code, timestamps, runtime_ms, cpu_time_ms)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "process_guid": {
+                    "type": "string",
+                    "description": "Process GUID to query.",
+                },
+            },
+            "required": ["process_guid"],
+        },
+    ),
+    Tool(
+        name="cq_process_list",
+        description=(
+            "List all processes, optionally filtered by project_id."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "integer",
+                    "description": "Optional project ID to filter processes.",
+                },
+            },
+        },
+    ),
+    Tool(
+        name="cq_process_wait",
+        description=(
+            "Wait for a process condition (output or exit) with timeout. Non-blocking poll."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "process_guid": {
+                    "type": "string",
+                    "description": "Process GUID to wait for.",
+                },
+                "wait_timeout_ms": {
+                    "type": "integer",
+                    "description": "Wait timeout in milliseconds (default 30000).",
+                    "default": 30000,
+                },
+                "wait_condition": {
+                    "type": "string",
+                    "enum": ["any_output", "finished"],
+                    "description": "Condition: any_output (stdout/stderr available) or finished (process exited).",
+                    "default": "any_output",
+                },
+            },
+            "required": ["process_guid"],
         },
     ),
 ]
@@ -1122,10 +1486,76 @@ async def run_server(client: ColloquiumClient) -> None:
             # ---- exec command ----
             elif name == "cq_exec":
                 project_id = int(arguments["project_id"])
-                command = str(arguments["command"])
                 timeout = int(arguments.get("timeout", 30))
-                result = await client.exec_command(project_id, command, timeout)
-                return _json_text(result)
+                timeout = max(1, min(timeout, 300))
+                continue_on_error = bool(arguments.get("continue_on_error", True))
+                command_plan = _parse_exec_commands(arguments.get("command"), timeout)
+
+                results: list[dict[str, Any]] = []
+                for command_text, command_timeout in command_plan:
+                    raw_result = await client.exec_command(project_id, command_text, command_timeout)
+                    normalized = _normalize_exec_result(raw_result, command_text, command_timeout)
+                    results.append(normalized)
+
+                    failed = str(normalized.get("status", "")).lower() not in {"success", "ok"}
+                    if failed and not continue_on_error:
+                        break
+
+                if len(results) == 1:
+                    return _json_text(results[0])
+
+                failures = [item for item in results if str(item.get("status", "")).lower() not in {"success", "ok"}]
+                return _json_text(
+                    {
+                        "status": "partial" if failures else "success",
+                        "project_id": project_id,
+                        "count": len(results),
+                        "failures": len(failures),
+                        "results": results,
+                    }
+                )
+
+            # ---- spawn temp script ----
+            elif name == "cq_spawn_script":
+                project_id = int(arguments["project_id"])
+                commands_raw = arguments.get("commands")
+                if not isinstance(commands_raw, list) or not commands_raw:
+                    raise ValueError("commands must be a non-empty array of strings")
+                commands = [str(line) for line in commands_raw]
+                engine = str(arguments.get("engine", "bash")).strip().lower()
+                if engine not in {"bash", "python"}:
+                    raise ValueError("engine must be 'bash' or 'python'")
+                script_name = str(arguments.get("script_name", "")).strip() or None
+                keep_file = bool(arguments.get("keep_file", False))
+                timeout = int(arguments.get("timeout", 60))
+                timeout = max(1, min(timeout, 300))
+
+                payload = {
+                    "engine": engine,
+                    "commands": commands,
+                    "script_name": script_name,
+                    "keep_file": keep_file,
+                }
+                runner_command = _build_spawn_script_command(payload)
+                raw_result = await client.exec_command(project_id, runner_command, timeout)
+                normalized = _normalize_exec_result(raw_result, f"cq_spawn_script:{engine}", timeout)
+
+                script_result: dict[str, Any] | None = None
+                try:
+                    if normalized.get("stdout"):
+                        script_result = json.loads(str(normalized["stdout"]))
+                except Exception:
+                    script_result = None
+
+                return _json_text(
+                    {
+                        "status": normalized.get("status"),
+                        "project": normalized.get("project"),
+                        "engine": engine,
+                        "script": script_result,
+                        "exec": normalized,
+                    }
+                )
 
             # ---- query DB (read-only) ----
             elif name == "cq_query_db":
@@ -1320,7 +1750,154 @@ async def run_server(client: ColloquiumClient) -> None:
                 )
                 return _json_text(result)
 
+            # ---- process management ----
+            elif name == "cq_process_spawn":
+                project_id = int(arguments["project_id"])
+                command = str(arguments["command"])
+                engine = str(arguments.get("engine", "bash"))
+                cwd = arguments.get("cwd")
+                env = arguments.get("env")
+                timeout = int(arguments.get("timeout", 3600))
+                
+                # Call mcp_server endpoint
+                mcp_server_url = os.environ.get("MCP_SERVER_URL", "http://localhost:8084")
+                mcp_auth_token = os.environ.get("MCP_AUTH_TOKEN", "")
+                
+                resp = await httpx.AsyncClient().post(
+                    f"{mcp_server_url}/process/spawn",
+                    json={
+                        "project_id": project_id,
+                        "command": command,
+                        "engine": engine,
+                        "cwd": cwd,
+                        "env": env,
+                        "timeout": timeout,
+                    },
+                    headers={"Authorization": f"Bearer {mcp_auth_token}"},
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                return _json_text(resp.json())
+
+            elif name == "cq_process_io":
+                process_guid = str(arguments.get("process_guid") or "")
+                if not process_guid:
+                    return _text("Missing required argument: process_guid")
+                input_data = arguments.get("input")
+                read_timeout_ms = int(arguments.get("read_timeout_ms", 5000))
+                max_bytes = int(arguments.get("max_bytes", 65536))
+                
+                mcp_server_url = os.environ.get("MCP_SERVER_URL", "http://localhost:8084")
+                mcp_auth_token = os.environ.get("MCP_AUTH_TOKEN", "")
+                
+                resp = await httpx.AsyncClient().post(
+                    f"{mcp_server_url}/process/io",
+                    json={
+                        "process_guid": process_guid,
+                        "input": input_data,
+                        "read_timeout_ms": read_timeout_ms,
+                        "max_bytes": max_bytes,
+                    },
+                    headers={"Authorization": f"Bearer {mcp_auth_token}"},
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                result = resp.json()
+                # Decode base64 fragments for display
+                if result.get("stdout_fragment"):
+                    try:
+                        result["stdout_fragment"] = base64.b64decode(result["stdout_fragment"]).decode("utf-8", errors="replace")
+                    except:
+                        pass
+                if result.get("stderr_fragment"):
+                    try:
+                        result["stderr_fragment"] = base64.b64decode(result["stderr_fragment"]).decode("utf-8", errors="replace")
+                    except:
+                        pass
+                return _json_text(result)
+
+            elif name == "cq_process_kill":
+                process_guid = str(arguments.get("process_guid") or "")
+                if not process_guid:
+                    return _text("Missing required argument: process_guid")
+                signal_name = str(arguments.get("signal", "SIGTERM"))
+                
+                mcp_server_url = os.environ.get("MCP_SERVER_URL", "http://localhost:8084")
+                mcp_auth_token = os.environ.get("MCP_AUTH_TOKEN", "")
+                
+                resp = await httpx.AsyncClient().post(
+                    f"{mcp_server_url}/process/kill",
+                    json={
+                        "process_guid": process_guid,
+                        "signal": signal_name,
+                    },
+                    headers={"Authorization": f"Bearer {mcp_auth_token}"},
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                return _json_text(resp.json())
+
+            elif name == "cq_process_status":
+                process_guid = str(arguments.get("process_guid") or "")
+                if not process_guid:
+                    return _text("Missing required argument: process_guid")
+                
+                mcp_server_url = os.environ.get("MCP_SERVER_URL", "http://localhost:8084")
+                mcp_auth_token = os.environ.get("MCP_AUTH_TOKEN", "")
+                
+                resp = await httpx.AsyncClient().get(
+                    f"{mcp_server_url}/process/status",
+                    params={"process_guid": process_guid},
+                    headers={"Authorization": f"Bearer {mcp_auth_token}"},
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                return _json_text(resp.json())
+
+            elif name == "cq_process_list":
+                project_id = arguments.get("project_id")
+                
+                mcp_server_url = os.environ.get("MCP_SERVER_URL", "http://localhost:8084")
+                mcp_auth_token = os.environ.get("MCP_AUTH_TOKEN", "")
+                
+                params = {}
+                if project_id:
+                    params["project_id"] = int(project_id)
+                
+                resp = await httpx.AsyncClient().get(
+                    f"{mcp_server_url}/process/list",
+                    params=params,
+                    headers={"Authorization": f"Bearer {mcp_auth_token}"},
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                return _json_text(resp.json())
+
+            elif name == "cq_process_wait":
+                process_guid = str(arguments.get("process_guid") or "")
+                if not process_guid:
+                    return _text("Missing required argument: process_guid")
+                wait_timeout_ms = int(arguments.get("wait_timeout_ms", 30000))
+                wait_condition = str(arguments.get("wait_condition", "any_output"))
+                
+                mcp_server_url = os.environ.get("MCP_SERVER_URL", "http://localhost:8084")
+                mcp_auth_token = os.environ.get("MCP_AUTH_TOKEN", "")
+                
+                resp = await httpx.AsyncClient().post(
+                    f"{mcp_server_url}/process/wait",
+                    json={
+                        "process_guid": process_guid,
+                        "wait_timeout_ms": wait_timeout_ms,
+                        "wait_condition": wait_condition,
+                    },
+                    headers={"Authorization": f"Bearer {mcp_auth_token}"},
+                    timeout=(wait_timeout_ms / 1000.0) + 10,  # Add 10s overhead
+                )
+                resp.raise_for_status()
+                return _json_text(resp.json())
+
             else:
+
                 return _text(f"Unknown tool: {name}")
 
         except httpx.HTTPStatusError as exc:
