@@ -1,4 +1,4 @@
-# copilot_mcp_tool — Интеграция GitHub Copilot с Colloquium-DevSpace
+CP# copilot_mcp_tool — Интеграция GitHub Copilot с Colloquium-DevSpace
 
 MCP-сервер (`copilot_mcp_tool.py`) транслирует инструменты GitHub Copilot Agent в HTTP-запросы к Colloquium-DevSpace, позволяя Copilot читать чаты, отправлять сообщения и управлять файлами проекта через Colloquium.
 
@@ -86,7 +86,18 @@ docker exec colloquium-core python3 /app/agent/create_user.py --list
 
 ## Настройка mcp.json
 
-В `.vscode/mcp.json` вашего проекта добавь секцию `colloquium`:
+### Где лежит конфиг
+
+| Редактор | Путь | Корневой ключ в JSON |
+|----------|------|----------------------|
+| VS Code (GitHub Copilot Agent) | `.vscode/mcp.json` | `servers` |
+| Cursor | `.cursor/mcp.json` | `mcpServers` |
+
+Содержимое секции сервера `colloquium` одно и то же; отличаются только обёртка и имя каталога. В Cursor для stdio-серверов нужно поле `"type": "stdio"` (см. [документацию Cursor по MCP](https://cursor.com/docs/context/mcp)).
+
+`copilot_mcp_tool.py` при поиске токена в файлах обходит вверх по дереву каталогов и читает **и** `.vscode/mcp.json`, **и** `.cursor/mcp.json`, в том числе блоки `servers` и `mcpServers`.
+
+### Пример для VS Code (фрагмент `servers`)
 
 ```json
 "colloquium": {
@@ -103,16 +114,73 @@ docker exec colloquium-core python3 /app/agent/create_user.py --list
 }
 ```
 
+### Пример для Cursor (фрагмент `mcpServers`)
+
+```json
+{
+  "mcpServers": {
+    "colloquium": {
+      "type": "stdio",
+      "command": "X:\\Python3\\python.exe",
+      "args": [
+        "X:\\docker\\cqds\\copilot_mcp_tool.py",
+        "--url",
+        "http://localhost:8008",
+        "--username",
+        "copilot"
+      ],
+      "env": {
+        "MCP_AUTH_TOKEN": "<токен_для_cqds_ctl>"
+      }
+    }
+  }
+}
+```
+
+### Секреты: не хранить токен в JSON в репозитории
+
+Литерал `MCP_AUTH_TOKEN` в закоммиченном `mcp.json` нежелателен. Практичный вариант:
+
+1. Один раз задать переменную окружения на машине (пользовательский профиль PowerShell, системные переменные Windows, CI — свой механизм). Удобное отдельное имя, например `COLLOQUIUM_MCP_TOKEN`, чтобы не путать с другими токенами.
+2. В `mcp.json` передать её в процесс MCP через `env` с **интерполяцией** (Cursor поддерживает синтаксис `${env:ИМЯ}` для полей вроде `command`, `args`, `env`):
+
+```json
+"env": {
+  "MCP_AUTH_TOKEN": "${env:COLLOQUIUM_MCP_TOKEN}"
+}
+```
+
+При старте Cursor подставит значение из окружения; в git остаётся только шаблон без секрета.
+
+Дополнительно в Cursor можно использовать `${workspaceFolder}` в путях к `python` и к `copilot_mcp_tool.py`, чтобы не дублировать абсолютный диск.
+
+> **VS Code**: наличие такой же интерполяции в MCP-конфиге зависит от версии и хоста Copilot. Если `${env:...}` не сработает, оставьте токен только в переменной окружения пользователя (хост всё равно передаёт `env` в дочерний процесс при явной настройке) или держите отдельный локальный `mcp.json` / фрагмент вне репозитория и добавьте путь в `.gitignore`.
+
 `MCP_AUTH_TOKEN` используется инструментом `cq_docker_control` для авторизации вызовов к `cqds_ctl.py` через localhost HTTP API.
-Если поле не задано, `copilot_mcp_tool.py` пробует прочитать токен из env-переменной `MCP_AUTH_TOKEN`,
-затем из самого `mcp.json`, и как последний fallback использует значение по умолчанию `Grok-xAI-Agent-The-Best`.
+Если значение не попало в окружение процесса, `copilot_mcp_tool.py` пробует прочитать токен из `mcp.json` (см. выше), и как последний fallback использует значение по умолчанию `Grok-xAI-Agent-The-Best`.
 
 > **Источники `MCP_AUTH_TOKEN` (по приоритету)**:
-> 1. `MCP_AUTH_TOKEN` env-переменная окружения
-> 2. поле `env.MCP_AUTH_TOKEN` в секции `colloquium` файла `mcp.json`
+> 1. `MCP_AUTH_TOKEN` env-переменная окружения **процесса MCP** (в т.ч. заданная через `env` в `mcp.json`, в том числе после интерполяции `${env:...}`)
+> 2. поле `env.MCP_AUTH_TOKEN` у сервера `colloquium` в найденном `.vscode/mcp.json` или `.cursor/mcp.json` (включая блоки `servers` / `mcpServers`)
 > 3. встроенный fallback `Grok-xAI-Agent-The-Best`
 
-Значение в `mcp.json` должно совпадать с токеном, настроенным в `cqds_ctl.py` / `scripts/cqds_ctl.py`.
+Значение токена должно совпадать с токеном, настроенным в `cqds_ctl.py` / `scripts/cqds_ctl.py`.
+
+### Перезапуск MCP после смены кода или `mcp.json`
+
+У **Cursor** нет отдельной штатной кнопки «Restart MCP server» для каждого stdio-сервера: процесс Python поднимает и держит сам редактор. Включение/выключение сервера в настройках (**Settings** → **Tools & MCP** или **Features → Model Context Protocol**, в зависимости от версии) иногда **не подхватывает** новый код так же надёжно, как полный цикл перезапуска.
+
+Рекомендуемый порядок (от мягкого к жёсткому):
+
+1. **Отключить сервер** в списке MCP → подождать пару секунд → **включить снова**. Имеет смысл, если зависло соединение; после правок в `copilot_mcp_tool.py` может оказаться недостаточно.
+2. **Reload Window** — палитра команд (`Ctrl+Shift+P` / `Cmd+Shift+P`) → **Developer: Reload Window**. Перезагружает окно редактора и часто **полностью пересоздаёт** stdio MCP-процессы без выхода из Cursor.
+3. **Полный выход из Cursor** (закрыть все окна приложения) и запуск заново — **самый надёжный** вариант после изменения `.cursor/mcp.json`, путей к `python`, аргументов, переменных окружения или когда пункты 1–2 не помогли.
+
+Дополнительно: **View → Output** → в выпадающем списке канал вроде **MCP** / **MCP Logs** — по логам видно, стартовал ли процесс и нет ли ошибки импорта/пути.
+
+**Логи вида `skipping invalid path file://p%3A` (Windows):** это обычно **не** `copilot_mcp_tool`, а клиент Cursor или MCP **filesystem**, когда в протокол передаётся корень рабочей папки как `file:`-URL. Символ `:` в диске (`P:`) кодируется как `%3A`; для части проверок такой URI **невалиден** (корректная форма для Windows чаще ближе к `file:///P:/...` с тремя слэшами и буквой диска). Сообщение означает «этот root пропускаем»; на **colloquium** и HTTP к CQDS это не влияет. Если страдает именно **filesystem** MCP, попробуй в `mcp.json` путь через **`${workspaceFolder}`**, букву диска в **верхнем регистре** в явном пути (`P:\\...`), либо открыть папку проекта так, чтобы корень workspace совпадал с аргументом сервера — см. также [issues по MCP filesystem на Windows](https://github.com/modelcontextprotocol/servers/issues).
+
+**VS Code** (GitHub Copilot + MCP): после правок `.vscode/mcp.json` или скрипта MCP обычно достаточно **Developer: Reload Window** или перезапуска VS Code.
 
 Предпочтительный локальный вариант: пароль хранится в отдельном файле рядом с `copilot_mcp_tool.py`
 или в другом защищённом месте на хосте.
@@ -198,12 +266,13 @@ Preview намеренно показывает только первые 2 си
 | `cq_send_message` | Отправить сообщение в чат (в sync-режиме ждёт финальный ответ, пропуская прогресс-заглушки) |
 | `cq_wait_reply` | Long-poll ответа AI (до 15 с) |
 | `cq_get_history` | Получить текущий срез истории чата без ожидания |
+| `cq_chat_stats` | Агрегированная статистика использования чата (calls/tokens/model/cost), опционально за период |
 | `cq_edit_file` | Записать файл через `<code_file>` (создать или перезаписать) |
 | `cq_patch_file` | Применить unified-diff через `<patch>` |
 | `cq_undo_file` | Откатить файл к бэкапу через `<undo>` |
 | `cq_list_projects` | Список проектов, зарегистрированных в Colloquium |
 | `cq_select_project` | Выбрать активный проект в сессии |
-| `cq_list_files` | Лёгкий индекс файлов проекта (без контента) |
+| `cq_list_files` | Лёгкий индекс файлов проекта (без контента); опционально `as_tree` → вложенное JSON-дерево по сегментам `file_name`, `include_flat` — плоский список рядом с деревом |
 | `cq_get_index` | Получить rich-index чата/проекта |
 | `cq_rebuild_index` | Пересобрать rich-index проекта по требованию |
 | `cq_get_code_index` | Совместимый alias для `cq_rebuild_index` |
@@ -212,8 +281,14 @@ Preview намеренно показывает только первые 2 си
 | `cq_query_db` | Выполнить read-only SQL через backend DB layer (debug) |
 | `cq_set_sync_mode` | Включить/выключить синхронный режим для `cq_send_message` |
 | `cq_smart_grep` | Поиск по наборам файлов (code/logs/docs/all) |
+| `cq_grep_entity` | Поиск строк индекса сущностей (только **объявления**: function/class/method/…), один или несколько regex, поля name/parent/qualified; опционально `ensure_index` |
 | `cq_grep_logs` | Сканирование одного/нескольких log-файлов по маскам с regex-фильтрацией |
 | `cq_docker_control` | Управление Docker Compose сервисами CQDS на хосте (status/restart/rebuild/clear-logs) |
+| `cq_docker_control_batch` | Пакетно то же, что `cq_docker_control`, через `cqds_ctl.py`: массив `requests`, `results` + `all_ok`, опционально `stop_on_error` |
+| `cq_docker_exec` | Пакетный **`docker exec`** на машине MCP (не `cqds_ctl`): `requests` с полями `container`, `command` (строка или argv), опционально `workdir`, `user`, `env`, `stdin`, `interactive`, `timeout_sec` |
+| `cq_host_process_spawn` | Subprocess на **локальном хосте MCP** (не sandbox): `command` строка или argv, `cwd`, `env`, `timeout` |
+| `cq_host_process_io` | Чтение накопленного stdout/stderr и опциональная запись в stdin (текст UTF-8) |
+| `cq_host_process_status` / `cq_host_process_list` / `cq_host_process_wait` / `cq_host_process_kill` | Аналоги инструментов семейства `cq_process`, но для хост-процессов |     
 | `cq_replace` | Точный replace в файле по `file_id` |
 | `cq_process_spawn` | Запустить subprocess в mcp-sandbox (возвращает `process_guid`) |
 | `cq_process_io` | Читать/писать stdin/stdout/stderr процесса по `process_guid` |
@@ -221,6 +296,8 @@ Preview намеренно показывает только первые 2 си
 | `cq_process_list` | Список процессов (опционально по `project_id`) |
 | `cq_process_wait` | Ожидание условия процесса (`any_output`/`finished`) |
 | `cq_process_kill` | Отправить сигнал процессу (`SIGTERM`/`SIGKILL`) |
+| `cq_spawn_script` | Создать и выполнить временный bash/python-скрипт в mcp-sandbox за один вызов |
+| `cq_project_status` | Диагностика состояния проекта (problems, links, backup/undo, scan/index cache) |
 
 ### Типичный рабочий цикл
 
@@ -552,6 +629,20 @@ wait     — для status: блокировать до stable/failed вмест
 → cq_docker_control command=clear-logs
   Очистить log-файлы всех контейнеров (нужно при зависании docker logs)
 ```
+
+## Инструмент `cq_docker_control_batch`
+
+Те же действия, что у `cq_docker_control`, но **несколько шагов за один вызов** через `scripts/cqds_ctl.py`: поле `requests` — JSON-массив объектов `{ command, services?, timeout?, wait? }`. Ответ: `results` (по порядку, у каждого `ok`, при успехе `response` — JSON от `cqds_ctl`, при ошибке `error` / `stdout` / `stderr`), плюс `all_ok` и `count`. Параметр `stop_on_error` (по умолчанию false): при `true` выполнение прерывается после первого `ok: false`.
+
+## Инструмент `cq_docker_exec`
+
+Пакетный вызов **`docker exec`** на той же машине, где запущен MCP (CLI из `PATH`). Каждый элемент `requests`: обязательные `container` и `command` (строка выполняется как `sh -c` **внутри контейнера**, массив строк — как argv без оболочки). Опционально: `workdir`, `user`, `env` (объект → флаги `-e`), `stdin` (UTF-8), `interactive` (флаг `-i`; если задан `stdin`, `-i` включается автоматически), `timeout_sec` (1–600, по умолчанию 120). Ответ: `results` с полями `ok`, `returncode`, `stdout`, `stderr`, `request`; плюс `all_ok`, `count`. Рабочий каталог процесса `docker` — корень репозитория cqds (рядом со `scripts/cqds_ctl.py`).
+
+## Хост-процессы: семейство `cq_host_process`
+
+Интерактивная модель как у семейства `cq_process`, но процесс создаётся **на хосте MCP** (`asyncio` subprocess), без HTTP в mcp-sandbox. После `cq_host_process_spawn` используйте `cq_host_process_io`, `cq_host_process_wait`, `cq_host_process_status`; завершение — `cq_host_process_kill` (запись удаляется из реестра; лимит одновременных записей ~48, буферы stdout/stderr усечены по объёму).
+
+**Пейджер (`more` / `less`) внутри контейнера через `docker exec`:** если запустить на хосте только `docker exec -i <id> more /path/to/file`, вывода в pipe часто не будет — утилита ждёт нормальный TTY. Обход: внутри контейнера обернуть вызов в псевдо-терминал, например `script -q -c 'more /path/to/file' /dev/null` (в образе должен быть `script`, обычно пакет `util-linux`). Тогда `cq_host_process_spawn` поднимает **на хосте** процесс `docker exec -i … sh -c '…'` (удобно передавать **argv-массивом**, без экранирования длинной строки для cmd), а `cq_host_process_io` читает накопленный stdout (в ответе — хвост буфера), шлёт в stdin пробел для следующей страницы и `q` для выхода из `more`.
 
 > **Примечание о `docker logs --tail`**: при ручной обрезке json-file логов контейнера
 > команда `docker logs --tail=N` начинает висеть бесконечно — известное поведение Docker.

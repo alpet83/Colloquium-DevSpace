@@ -203,6 +203,12 @@ class MultiChat:
         row = cur.fetchone()
         return row[0] if row else None
 
+    def get_user_name_by_id(self, user_id):
+        cur = self.conn.cursor()
+        cur.execute('SELECT user_name FROM users WHERE user_id = ?', (user_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
     def get_history(self, chat_id, limit=50):
         hierarchy = self.get_chat_hierarchy(chat_id)
         all_history = []
@@ -238,7 +244,12 @@ class MultiChat:
 
     def list_chats(self, user_id):
         cur = self.conn.cursor()
-        cur.execute('SELECT chat_id, chat_description, user_list, parent_msg_id FROM chats WHERE user_list = "all" OR user_list LIKE ?', (f'%{user_id}%',))
+        # Admin (user_name='admin') can see all chats, others see only their own + shared
+        user_name = self.get_user_name_by_id(user_id)
+        if user_name == 'admin':
+            cur.execute('SELECT chat_id, chat_description, user_list, parent_msg_id FROM chats')
+        else:
+            cur.execute('SELECT chat_id, chat_description, user_list, parent_msg_id FROM chats WHERE user_list = "all" OR user_list LIKE ?', (f'%{user_id}%',))
         chats = cur.fetchall()
         return [{"chat_id": chat[0], "description": chat[1], "user_list": chat[2], "parent_msg_id": chat[3]} for chat in chats]
 

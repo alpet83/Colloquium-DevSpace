@@ -1,0 +1,43 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "P:\\opt\\docker\\cqds"
+      ],
+      "type": "stdio"
+    },
+    "git": {
+      "command": "uvx",
+      "args": [
+        "mcp-server-git",
+        "--repository",
+        "P:\\opt\\docker\\cqds"
+      ],
+      "type": "stdio"
+    },
+    "cqds": {
+      "command": "C:\\Apps\\Python3\\python.exe",
+      "args": [
+        "P:\\opt\\docker\\cqds\\copilot_mcp_tool.py",
+        "--url",
+        "http://localhost:8008",
+        "--username",
+        "copilot"
+      ],
+      "env": {
+        "MCP_AUTH_TOKEN": "Grok-xAI-Agent-The-Best"
+      },
+      "type": "stdio"
+    },
+    "gitbash": {
+      "command": "C:\\Apps\\Python3\\python.exe",
+      "args": [
+        "P:\\opt\\docker\\cqds\\mcp_gitbash_stdio.py"
+      ],
+      "type": "stdio"
+    }
+  }
+}

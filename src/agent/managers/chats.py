@@ -231,9 +231,10 @@ class ChatManager:
         )
         result = []
         active = self.active_chat(user_id)
+        is_admin = g.user_manager.get_user_role(user_id) == 'admin'
         for chat in chats:
             user_list = chat[2].split(',')
-            if str(user_id) in user_list or 'all' in user_list:
+            if is_admin or str(user_id) in user_list or 'all' in user_list:
                 result.append({"chat_id": chat[0], "description": chat[1],
                                "user_list": user_list, "parent_msg_id": chat[3], "active": active == chat[0]})
             else:

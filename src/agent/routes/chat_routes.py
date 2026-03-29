@@ -2,6 +2,7 @@
 import math
 
 from fastapi import APIRouter, Request, HTTPException
+from typing import Optional
 import asyncio
 import time
 import re
@@ -12,6 +13,108 @@ from globals import check_session, handle_exception
 
 router = APIRouter()
 log = g.get_logger("chatman")
+
+
+def _row_get(row, index: int, key: str, default=None):
+    try:
+        return row[index]
+    except Exception:
+        pass
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        return mapping.get(key, default)
+    return default
+
+
+def _collect_chat_usage_stats(chat_id: int, since_seconds: Optional[int] = None) -> dict:
+    """Aggregate token/cost stats for a chat from llm_usage table."""
+    conditions = [('chat_id', '=', chat_id)]
+    rows = g.replication_manager.llm_usage_table.select_from(
+        columns=[
+            'model',
+            'used_tokens',
+            'output_tokens',
+            'sources_used',
+            'input_token_cost',
+            'output_token_cost',
+            'token_cost',
+            'ts'
+        ],
+        conditions=conditions,
+        order_by='ts ASC'
+    )
+    cutoff_ts = int(time.time()) - int(since_seconds) if since_seconds is not None and since_seconds > 0 else None
+
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_sources_used = 0
+    total_input_cost = 0.0
+    total_output_cost = 0.0
+    total_cost = 0.0
+    models_used: set[str] = set()
+    model_breakdown: dict[str, dict] = {}
+
+    for row in rows:
+        if cutoff_ts is not None:
+            raw_ts = _row_get(row, 7, 'ts', 0)
+            ts_value = 0
+            try:
+                if hasattr(raw_ts, 'timestamp'):
+                    ts_value = int(raw_ts.timestamp())
+                else:
+                    ts_value = int(raw_ts or 0)
+            except Exception:
+                ts_value = 0
+            if ts_value < cutoff_ts:
+                continue
+
+        model = row[0] or 'unknown'
+        used_tokens = int(row[1] or 0)
+        output_tokens = int(row[2] or 0)
+        sources_used = int(row[3] or 0)
+        input_cost = float(row[4] or 0.0)
+        output_cost = float(row[5] or 0.0)
+        row_total_cost = float(row[6] or 0.0)
+
+        total_input_tokens += used_tokens
+        total_output_tokens += output_tokens
+        total_sources_used += sources_used
+        total_input_cost += input_cost
+        total_output_cost += output_cost
+        total_cost += row_total_cost
+        models_used.add(model)
+
+        if model not in model_breakdown:
+            model_breakdown[model] = {
+                'calls': 0,
+                'input_tokens': 0,
+                'output_tokens': 0,
+                'input_cost': 0.0,
+                'output_cost': 0.0,
+                'total_cost': 0.0,
+            }
+
+        model_breakdown[model]['calls'] += 1
+        model_breakdown[model]['input_tokens'] += used_tokens
+        model_breakdown[model]['output_tokens'] += output_tokens
+        model_breakdown[model]['input_cost'] += input_cost
+        model_breakdown[model]['output_cost'] += output_cost
+        model_breakdown[model]['total_cost'] += row_total_cost
+
+    return {
+        'chat_id': chat_id,
+        'calls': len(rows),
+        'since_seconds': since_seconds,
+        'total_input_tokens': total_input_tokens,
+        'total_output_tokens': total_output_tokens,
+        'num_sources_used': total_sources_used,
+        'input_tokens_cost': round(total_input_cost, 8),
+        'output_tokens_cost': round(total_output_cost, 8),
+        'estimated_cost_usd': round(total_cost, 8),
+        'models_used': sorted(models_used),
+        'model_breakdown': model_breakdown,
+        'status': 'ok',
+    }
 
 @router.get("/chat/list")
 async def list_chats(request: Request):
@@ -194,7 +297,7 @@ async def delete_post(request: Request):
         raise
 
 @router.get("/chat/get_stats")
-async def get_chat_stats(request: Request, chat_id: int):
+async def get_chat_stats(request: Request, chat_id: int, since_seconds: Optional[int] = None):
     # NOLOG!
     try:
         user_id = check_session(request)
@@ -205,19 +308,66 @@ async def get_chat_stats(request: Request, chat_id: int):
         if not chat:
             log.info(g.with_session_tag(request, "Чат chat_id=%d не найден для user_id=%d"), chat_id, user_id)
             raise HTTPException(status_code=404, detail="Chat not found")
-        stats_row = g.replication_manager.llm_usage_table.select_row(
-            columns=['used_tokens', 'sources_used'],
-            conditions=[('chat_id', '=', chat_id)],
-            order_by='ts DESC'
-        )
+        aggregated = _collect_chat_usage_stats(chat_id, since_seconds)
         stats = {
             "chat_id": chat_id,
-            "tokens": stats_row[0] if stats_row else 0,
-            "num_sources_used": stats_row[1] if stats_row else 0
+            "tokens": aggregated["total_input_tokens"],
+            "output_tokens": aggregated["total_output_tokens"],
+            "num_sources_used": aggregated["num_sources_used"],
+            "input_tokens_cost": aggregated["input_tokens_cost"],
+            "output_tokens_cost": aggregated["output_tokens_cost"],
+            "estimated_cost_usd": aggregated["estimated_cost_usd"],
+            "models_used": aggregated["models_used"],
+            "calls": aggregated["calls"],
+            "since_seconds": aggregated["since_seconds"],
+            "status": aggregated["status"],
         }
         return stats
     except Exception as e:
         handle_exception("Ошибка в GET /chat/get_stats", e)
+        raise
+
+@router.get("/chat/stats")
+async def get_chat_stats_new(request: Request, chat_id: int, since_seconds: Optional[int] = None):
+    """Get detailed chat usage statistics including input/output token costs.
+
+    Optional query param: since_seconds=<N> — restrict stats to last N seconds.
+    Useful for getting per-iteration cost feedback.
+    """
+    # NOLOG!
+    try:
+        user_id = check_session(request)
+
+        # Check chat exists
+        chat = g.chat_manager.chats_table.select_row(
+            conditions=[('chat_id', '=', chat_id)],
+            columns=['chat_id', 'chat_description']
+        ) if hasattr(g.chat_manager, 'chats_table') else None
+
+        if not chat:
+            log.info(g.with_session_tag(request, "Чат chat_id=%d не найден для user_id=%d"), chat_id, user_id)
+            raise HTTPException(status_code=404, detail="Chat not found")
+
+        aggregated = _collect_chat_usage_stats(chat_id, since_seconds)
+        chat_description = _row_get(chat, 1, 'chat_description')
+        stats = {
+            "chat_id": chat_id,
+            "description": chat_description,
+            "calls": aggregated["calls"],
+            "since_seconds": aggregated["since_seconds"],
+            "total_input_tokens": aggregated["total_input_tokens"],
+            "total_output_tokens": aggregated["total_output_tokens"],
+            "input_tokens_cost": aggregated["input_tokens_cost"],
+            "output_tokens_cost": aggregated["output_tokens_cost"],
+            "estimated_cost_usd": aggregated["estimated_cost_usd"],
+            "num_sources_used": aggregated["num_sources_used"],
+            "models_used": aggregated["models_used"],
+            "model_breakdown": aggregated["model_breakdown"],
+            "status": aggregated["status"],
+        }
+        return stats
+    except Exception as e:
+        handle_exception("Ошибка в GET /chat/stats", e)
         raise
 
 @router.get("/chat/get_parent_msg")

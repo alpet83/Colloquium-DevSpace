@@ -20,7 +20,8 @@ class UserManager:
                 "llm_class TEXT",
                 "llm_token TEXT",
                 "tokens_limit INTEGER DEFAULT 131072",
-                "tokens_cost FLOAT",  # Стоимость за 1 млн. токенов
+                "tokens_input_cost FLOAT",  # Стоимость входящих токенов за 1 млн.
+                "tokens_output_cost FLOAT",  # Стоимость выходящих токенов за 1 млн.
                 "llm_reasoning_eff TEXT DEFAULT 'medium'",  # low / medium / high / none
                 "password_hash TEXT",
                 "salt TEXT"
@@ -140,14 +141,17 @@ class UserManager:
 
     def get_user_token_limits(self, user_id):
         row = self.users_table.select_row(
-            columns=["tokens_limit", "tokens_cost"],
+            columns=["tokens_limit", "tokens_input_cost", "tokens_output_cost"],
             conditions={"user_id": user_id}
         )
         if not row:
             log.warn("Пользователь user_id=%d не найден, используются значения по умолчанию", user_id)
-            return 131072, 0.0
-        tokens_limit, tokens_cost = row
-        return tokens_limit or 131072, tokens_cost or 0.0
+            return 131072, 0.0, 0.0
+
+        tokens_limit, tokens_input_cost, tokens_output_cost = row
+        in_cost = tokens_input_cost or 0.0
+        out_cost = tokens_output_cost or 0.0
+        return tokens_limit or 131072, in_cost, out_cost
 
     def get_user_reasoning_eff(self, user_id) -> str:
         row = self.users_table.select_row(

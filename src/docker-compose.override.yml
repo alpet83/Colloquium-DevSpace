@@ -13,9 +13,12 @@ services:
       # Local deployment-only bind mounts for real project trees.
       - P:/vps.alpet.me/sigsys-ts:/app/projects/sigsys-ts
       - P:/opt/docker:/app/projects/Colloquium-DevSpace     
-
+      - P:/opt/docker/trading-platform-php:/app/projects/trading-platform-php
+      - P:/GitHub/alpet-libs-php:/app/projects/alpet-libs-php
   mcp-sandbox:
     volumes:
       # Keep sandbox view consistent with core.
       - P:/vps.alpet.me/sigsys-ts:/app/projects/sigsys-ts
       - P:/opt/docker:/app/projects/Colloquium-DevSpace
+      - P:/opt/docker/trading-platform-php:/app/projects/trading-platform-php
+      - P:/GitHub/alpet-libs-php:/app/projects/alpet-libs-php

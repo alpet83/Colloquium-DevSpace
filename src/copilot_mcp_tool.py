@@ -17,15 +17,19 @@ import argparse
 import asyncio
 import base64
 from contextvars import ContextVar
+import ipaddress
 import json
 import logging
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import time
 import textwrap
+import uuid
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx  # type: ignore[import]
 from mcp.server import Server  # type: ignore[import]
@@ -71,16 +75,17 @@ def _setup_logging() -> Path:
 
 
 def _read_mcp_json_token() -> str | None:
-    """Walk up from cwd and script dir looking for .vscode/mcp.json with MCP_AUTH_TOKEN."""
+    """Walk up from cwd/script dir for .vscode/mcp.json and .cursor/mcp.json (MCP_AUTH_TOKEN)."""
     script_path = str(Path(__file__).resolve())
     seen: set[Path] = set()
     candidates: list[Path] = []
     for base in (Path.cwd(), Path(__file__).resolve().parent):
         for parent in (base, *base.parents):
-            p = parent / ".vscode" / "mcp.json"
-            if p not in seen:
-                seen.add(p)
-                candidates.append(p)
+            for rel in (".vscode/mcp.json", ".cursor/mcp.json"):
+                p = parent / rel
+                if p not in seen:
+                    seen.add(p)
+                    candidates.append(p)
     for path in candidates:
         if not path.is_file():
             continue
@@ -92,16 +97,23 @@ def _read_mcp_json_token() -> str | None:
         token = (data.get("env") or {}).get("MCP_AUTH_TOKEN")
         if token:
             return str(token)
-        # Per-server env block — match by script path in args or server name
-        for server_name, server_cfg in (data.get("servers") or {}).items():
-            if not isinstance(server_cfg, dict):
+        # Per-server env: VS Code uses "servers", Cursor uses "mcpServers"
+        for key in ("servers", "mcpServers"):
+            block = data.get(key) or {}
+            if not isinstance(block, dict):
                 continue
-            args = server_cfg.get("args") or []
-            if not (any(script_path in str(a) for a in args) or server_name == "colloquium"):
-                continue
-            token = (server_cfg.get("env") or {}).get("MCP_AUTH_TOKEN")
-            if token:
-                return str(token)
+            for server_name, server_cfg in block.items():
+                if not isinstance(server_cfg, dict):
+                    continue
+                args = server_cfg.get("args") or []
+                if not (
+                    any(script_path in str(a) for a in args)
+                    or server_name in ("cqds", "colloquium")
+                ):
+                    continue
+                token = (server_cfg.get("env") or {}).get("MCP_AUTH_TOKEN")
+                if token:
+                    return str(token)
     return None
 
 
@@ -167,6 +179,26 @@ class ColloquiumClient:
         self._logged_in = False
         self._sync_timeout: int = 0
 
+    def is_local_or_private_endpoint(self) -> bool:
+        """Allow elevated DB actions only for local/private Colloquium endpoints."""
+        try:
+            host = (urlparse(self._base).hostname or "").strip().lower()
+        except Exception:
+            return False
+
+        if not host:
+            return False
+
+        if host in {"localhost", "127.0.0.1", "::1", "host.docker.internal"}:
+            return True
+
+        try:
+            ip = ipaddress.ip_address(host)
+            return ip.is_loopback or ip.is_private
+        except ValueError:
+            # Non-IP hostname: treat as local only for common local suffixes.
+            return host.endswith(".local") or host.endswith(".lan")
+
     async def _log_request(self, request: httpx.Request) -> None:
         LOGGER.info("HTTP -> %s %s", request.method, request.url)
 
@@ -228,6 +260,28 @@ class ColloquiumClient:
             params={"chat_id": chat_id, "wait_changes": 0},
             timeout=15.0,
         )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_chat_stats(self, chat_id: int, since_seconds: int | None = None) -> dict:
+        """Fetch aggregated usage stats for a chat via /api/chat/stats (with legacy fallback)."""
+        await self._ensure_login()
+        params: dict[str, Any] = {"chat_id": chat_id}
+        if since_seconds is not None and since_seconds > 0:
+            params["since_seconds"] = since_seconds
+
+        resp = await self._client.get(
+            "/api/chat/stats",
+            params=params,
+            timeout=30.0,
+        )
+        if resp.status_code == 404:
+            # Backward compatibility for older runtime images.
+            resp = await self._client.get(
+                "/api/chat/get_stats",
+                params=params,
+                timeout=30.0,
+            )
         resp.raise_for_status()
         return resp.json()
 
@@ -534,7 +588,11 @@ def _build_spawn_script_command(script_payload: dict[str, Any]) -> str:
 TOOLS: list[Tool] = [
     Tool(
         name="cq_list_chats",
-        description="List all chats available in Colloquium-DevSpace.",
+        description=(
+            "List all chats available in Colloquium-DevSpace. "
+            "Use when you need chat_id for cq_send_message or history tools; "
+            "not a substitute for cq_list_projects (projects vs chats)."
+        ),
         inputSchema={
             "type": "object",
             "properties": {},
@@ -543,7 +601,10 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="cq_create_chat",
-        description="Create a new chat in Colloquium-DevSpace. Returns the new chat_id.",
+        description=(
+            "Create a new chat in Colloquium-DevSpace. Returns the new chat_id. "
+            "Use before cq_edit_file/cq_patch_file/cq_undo_file when those must post via chat messages."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -559,7 +620,8 @@ TOOLS: list[Tool] = [
         name="cq_send_message",
         description=(
             "Send a plain text message to a Colloquium chat and return immediately. "
-            "Use colloquium_wait_reply to get the AI response."
+            "Use cq_wait_reply (or cq_get_history) to read the AI response; "
+            "or cq_set_sync_mode with timeout>0 so cq_send_message waits for the reply."
         ),
         inputSchema={
             "type": "object",
@@ -601,11 +663,33 @@ TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="cq_chat_stats",
+        description=(
+            "Get aggregated chat usage stats (calls, tokens, model breakdown, costs). "
+            "Optional since_seconds limits stats to the last N seconds."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "integer",
+                    "description": "Chat ID to aggregate stats for.",
+                },
+                "since_seconds": {
+                    "type": "integer",
+                    "description": "Optional lookback window in seconds (0 = full history).",
+                    "default": 0,
+                },
+            },
+            "required": ["chat_id"],
+        },
+    ),
+    Tool(
         name="cq_edit_file",
         description=(
             "Ask Colloquium to write (create or overwrite) a file inside the active project. "
-            "Sends a <code_file> XML block as a chat message, which the backend processes "
-            "and saves to disk on the Colloquium host."
+            "Sends a <code_file> XML block as a chat message (requires chat_id). "
+            "For mechanical edits without Colloquium chat messages, prefer cq_replace when a full-file rewrite is not needed."
         ),
         inputSchema={
             "type": "object",
@@ -621,7 +705,8 @@ TOOLS: list[Tool] = [
         name="cq_patch_file",
         description=(
             "Ask Colloquium to apply a unified-diff patch to a project file. "
-            "Sends a <patch> XML block as a chat message."
+            "Sends a <patch> XML block as a chat message (requires chat_id). "
+            "For mechanical edits without chat, consider cq_replace (by file_id) when a simple replace suffices."
         ),
         inputSchema={
             "type": "object",
@@ -655,7 +740,10 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="cq_list_projects",
-        description="List all projects registered in Colloquium-DevSpace.",
+        description=(
+            "List all projects registered in Colloquium-DevSpace with id and metadata. "
+            "Typical first step before cq_select_project, cq_exec, cq_smart_grep, or cq_list_files."
+        ),
         inputSchema={
             "type": "object",
             "properties": {},
@@ -689,7 +777,9 @@ TOOLS: list[Tool] = [
             "  \u2022 recently modified \u2014 set modified_since to a Unix timestamp (files with ts \u2265 value)\n"
             "  \u2022 specific files \u2014 set file_ids as comma-separated DB IDs, e.g. '42,57,103'\n"
             "The 'id' field is the DB file_id required by cq_patch_file and cq_undo_file.\n"
-            "NOTE: these IDs are NOT the same as sandwich-pack index numbers."
+            "NOTE: these IDs are NOT the same as sandwich-pack index numbers.\n"
+            "Set as_tree=true to get JSON tree (kind dir/file, path, children) built from file_name paths; "
+            "optional include_flat=true adds the flat list alongside the tree."
         ),
         inputSchema={
             "type": "object",
@@ -709,6 +799,16 @@ TOOLS: list[Tool] = [
                 "include_size": {
                     "type": "boolean",
                     "description": "Set to true to include size_bytes. Slower (~1s for 177 files on Docker FS). Default false.",
+                },
+                "as_tree": {
+                    "type": "boolean",
+                    "description": "If true, wrap response as {tree, file_count} with nested dirs/files from path segments.",
+                    "default": False,
+                },
+                "include_flat": {
+                    "type": "boolean",
+                    "description": "When as_tree is true, also include the flat files array in the response.",
+                    "default": False,
                 },
             },
             "required": ["project_id"],
@@ -803,6 +903,70 @@ TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="cq_grep_entity",
+        description=(
+            "Search parsed definition entries in the project code index (sandwiches_index entities). "
+            "The index lists declaration sites (function, class, method, variable, …) — not call sites. "
+            "Supply one or more regex patterns; a row matches if any pattern matches the chosen field. "
+            "Uses cached project index from cq_get_index unless ensure_index triggers cq_rebuild_index. "
+            "Limitation: entity CSV rows must split cleanly on commas (names/parents with commas are not supported)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "integer",
+                    "description": "Project ID (use cq_list_projects).",
+                },
+                "patterns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Regex patterns (OR). Alternatively pass a single string via 'pattern'.",
+                },
+                "pattern": {
+                    "type": "string",
+                    "description": "Single regex pattern (convenience if only one). Ignored if patterns is non-empty.",
+                },
+                "match_field": {
+                    "type": "string",
+                    "description": "Which field to match: name | parent | qualified (parent::name, or name if no parent).",
+                    "default": "name",
+                },
+                "entity_types": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional whitelist of entity type strings (e.g. function, class, method). Omit for all types.",
+                },
+                "is_regex": {
+                    "type": "boolean",
+                    "description": "If false, patterns are literal substrings (escaped).",
+                    "default": True,
+                },
+                "case_sensitive": {
+                    "type": "boolean",
+                    "description": "Regex case sensitivity (default false).",
+                    "default": False,
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Cap on returned matches (1..500, default 100).",
+                    "default": 100,
+                },
+                "ensure_index": {
+                    "type": "boolean",
+                    "description": "If true and cached index has no entities, run cq_rebuild_index-equivalent sync build.",
+                    "default": False,
+                },
+                "ensure_index_timeout": {
+                    "type": "integer",
+                    "description": "Seconds for ensure_index build (30..300, default 120).",
+                    "default": 120,
+                },
+            },
+            "required": ["project_id"],
+        },
+    ),
+    Tool(
         name="cq_read_file",
         description=(
             "Read the contents of a project file directly by its DB file_id. "
@@ -824,10 +988,10 @@ TOOLS: list[Tool] = [
     Tool(
         name="cq_exec",
         description=(
-            "Execute a shell command in a project's working directory and return stdout/stderr immediately. "
+            "Execute a shell command in a project's working directory on the Colloquium/CQDS side and return stdout/stderr. "
+            "Environment is Linux/bash (project container or agent workspace), not the Windows PowerShell host. "
             "Supports string command or JSON command batches in a single call. "
-            "Direct call — no LLM or chat round-trip required. "
-            "Use cq_list_projects to find project_id. "
+            "Direct HTTP — no LLM or chat round-trip. Use cq_list_projects for project_id. "
             "Returns {status, output, project}. Max timeout 300s."
         ),
         inputSchema={
@@ -945,8 +1109,9 @@ TOOLS: list[Tool] = [
     Tool(
         name="cq_query_db",
         description=(
-            "Execute a read-only SQL query through Colloquium backend DB layer and return rows as JSON. "
-            "Designed for debugging. SELECT/EXPLAIN/WITH only; mutating SQL is rejected."
+            "Execute SQL query through Colloquium backend DB layer and return rows as JSON. "
+            "By default only read-only SQL is allowed (SELECT/EXPLAIN/WITH). "
+            "Mutating SQL can be enabled only with allow_write=true and only for local/private endpoints."
         ),
         inputSchema={
             "type": "object",
@@ -957,7 +1122,12 @@ TOOLS: list[Tool] = [
                 },
                 "query": {
                     "type": "string",
-                    "description": "Read-only SQL query (SELECT/EXPLAIN/WITH).",
+                    "description": "SQL query string.",
+                },
+                "allow_write": {
+                    "type": "boolean",
+                    "description": "Allow mutating SQL (INSERT/UPDATE/DELETE/ALTER/etc). Works only for local/private Colloquium endpoints.",
+                    "default": False,
                 },
                 "timeout": {
                     "type": "integer",
@@ -991,8 +1161,9 @@ TOOLS: list[Tool] = [
     Tool(
         name="cq_smart_grep",
         description=(
-            "Search text or regex in predefined project file sets (code/logs/docs/all) in one direct call. "
-            "Useful for fast code/log analysis without LLM chat loop."
+            "Search text or regex in predefined project file sets (code/logs/docs/all) on the CQDS project tree in one call. "
+            "Prefer this over running grep/find in the IDE terminal on Windows when the task targets Colloquium-attached sources. "
+            "Direct call — no LLM chat loop."
         ),
         inputSchema={
             "type": "object",
@@ -1030,7 +1201,8 @@ TOOLS: list[Tool] = [
         name="cq_grep_logs",
         description=(
             "Scan one or more log files inside the selected project container context using regex filtering. "
-            "Accepts file masks (glob array) and returns JSON map: {logname: [matched lines]}."
+            "Accepts file masks (glob array) and/or docker service pseudo-masks like 'docker:colloquium-core', "
+            "returns JSON map: {source: [matched lines]}."
         ),
         inputSchema={
             "type": "object",
@@ -1046,7 +1218,7 @@ TOOLS: list[Tool] = [
                 "log_masks": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "One or more glob masks, e.g. ['logs/*.log', 'logs/**/*.txt'].",
+                    "description": "Sources to scan: file globs (e.g. ['logs/*.log']) and/or docker targets (e.g. ['docker:colloquium-core']).",
                 },
                 "tail_lines": {
                     "type": "integer",
@@ -1064,14 +1236,15 @@ TOOLS: list[Tool] = [
                     "default": False,
                 },
             },
-            "required": ["project_id", "query", "log_masks"],
+            "required": ["project_id", "query"],
         },
     ),
     Tool(
         name="cq_replace",
         description=(
             "Replace text in one file directly by file_id, with optional regex mode. "
-            "No chat/LLM round-trip; safe for targeted mechanical edits."
+            "No chat/LLM round-trip (contrast: cq_edit_file/cq_patch_file post via chat messages). "
+            "Use cq_list_files or index filelist to resolve file_id."
         ),
         inputSchema={
             "type": "object",
@@ -1095,7 +1268,8 @@ TOOLS: list[Tool] = [
         name="cq_process_spawn",
         description=(
             "Spawn a subprocess in mcp_server.py and return process_guid (opaque UUID, not OS pid). "
-            "Supports bash or python scripts with custom cwd/env/timeout."
+            "Use for long-running or interactive jobs; pair with cq_process_io, cq_process_wait, cq_process_status, cq_process_kill. "
+            "For one-shot commands that finish quickly, cq_exec is usually simpler."
         ),
         inputSchema={
             "type": "object",
@@ -1304,6 +1478,221 @@ TOOLS: list[Tool] = [
             "required": ["command"],
         },
     ),
+    Tool(
+        name="cq_docker_control_batch",
+        description=(
+            "Batch CQDS Docker Compose control via cqds_ctl.py: pass a JSON array of requests, "
+            "get an array of results in order. Each request has the same fields as cq_docker_control "
+            "(command, optional services, timeout, wait). Steps run sequentially on the MCP host. "
+            "Use stop_on_error=true to abort after the first failure (default false: run all steps)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "requests": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "enum": ["status", "restart", "rebuild", "clear-logs"],
+                            },
+                            "services": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "timeout": {
+                                "type": "integer",
+                                "description": "Per-step timeout seconds (10–600, default 90).",
+                                "default": 90,
+                            },
+                            "wait": {
+                                "type": "boolean",
+                                "description": "For status: block until stable/failed.",
+                                "default": False,
+                            },
+                        },
+                        "required": ["command"],
+                    },
+                    "description": "Ordered list of cq_docker_control-equivalent operations.",
+                },
+                "stop_on_error": {
+                    "type": "boolean",
+                    "description": "If true, stop after the first failed step (remaining not run).",
+                    "default": False,
+                },
+            },
+            "required": ["requests"],
+        },
+    ),
+    Tool(
+        name="cq_docker_exec",
+        description=(
+            "Run `docker exec` on the MCP host (not cqds_ctl). Pass an ordered list of exec requests; "
+            "each step runs sequentially. Fields per request: container (required), command (string "
+            "→ `sh -c` inside the container, or argv array), optional workdir, user, env object, "
+            "stdin (string, UTF-8), interactive (bool; implied true when stdin is set), "
+            "timeout_sec (1–600, default 120). Uses the docker CLI from PATH; cwd for the CLI is the "
+            "cqds repo root."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "requests": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "container": {"type": "string"},
+                            "command": {
+                                "oneOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "minItems": 1,
+                                    },
+                                ],
+                            },
+                            "workdir": {"type": "string"},
+                            "user": {"type": "string"},
+                            "env": {
+                                "type": "object",
+                                "description": "Extra -e KEY=value for docker exec.",
+                            },
+                            "stdin": {
+                                "type": "string",
+                                "description": "Optional stdin for this exec (UTF-8).",
+                            },
+                            "interactive": {
+                                "type": "boolean",
+                                "description": "Pass docker -i (also set automatically if stdin is provided).",
+                                "default": False,
+                            },
+                            "timeout_sec": {
+                                "type": "integer",
+                                "description": "Per-step timeout seconds (1–600, default 120).",
+                                "default": 120,
+                            },
+                        },
+                        "required": ["container", "command"],
+                    },
+                    "description": "Ordered docker exec operations.",
+                },
+                "stop_on_error": {
+                    "type": "boolean",
+                    "description": "If true, stop after the first failed step.",
+                    "default": False,
+                },
+            },
+            "required": ["requests"],
+        },
+    ),
+    Tool(
+        name="cq_host_process_spawn",
+        description=(
+            "Spawn a subprocess on the machine where this MCP server runs (local host), not in "
+            "Colloquium/mcp-sandbox. Same interaction model as cq_process_spawn: use cq_host_process_io "
+            "/ wait / status / kill afterward. command: shell string (asyncio.create_subprocess_shell) "
+            "or argv array (create_subprocess_exec). Optional cwd, env, timeout seconds (1–7200, default 3600) "
+            "after which the process is killed if still running."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "command": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                        },
+                    ],
+                    "description": "Shell string or argv list.",
+                },
+                "cwd": {"type": "string"},
+                "env": {"type": "object"},
+                "timeout": {
+                    "type": "integer",
+                    "description": "TTL in seconds; process killed if still alive (default 3600).",
+                    "default": 3600,
+                },
+            },
+            "required": ["command"],
+        },
+    ),
+    Tool(
+        name="cq_host_process_io",
+        description=(
+            "Read accumulated stdout/stderr from a cq_host_process_spawn process and optionally write "
+            "to stdin. Returns text fragments (UTF-8, replacement on errors), not base64."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "process_guid": {"type": "string"},
+                "input": {"type": "string", "description": "Optional plain text written to stdin."},
+                "read_timeout_ms": {"type": "integer", "default": 5000},
+                "max_bytes": {"type": "integer", "default": 65536},
+            },
+            "required": ["process_guid"],
+        },
+    ),
+    Tool(
+        name="cq_host_process_kill",
+        description=(
+            "Send SIGTERM or SIGKILL to a host process spawned via cq_host_process_spawn and remove "
+            "it from the local registry."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "process_guid": {"type": "string"},
+                "signal": {
+                    "type": "string",
+                    "enum": ["SIGTERM", "SIGKILL"],
+                    "default": "SIGTERM",
+                },
+            },
+            "required": ["process_guid"],
+        },
+    ),
+    Tool(
+        name="cq_host_process_status",
+        description="Status for a local host process (alive, returncode, pid, runtime_ms).",
+        inputSchema={
+            "type": "object",
+            "properties": {"process_guid": {"type": "string"}},
+            "required": ["process_guid"],
+        },
+    ),
+    Tool(
+        name="cq_host_process_list",
+        description="List subprocesses spawned via cq_host_process_spawn on this MCP host.",
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    Tool(
+        name="cq_host_process_wait",
+        description=(
+            "Poll a host process for new output or exit (same semantics as cq_process_wait: "
+            "any_output vs finished)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "process_guid": {"type": "string"},
+                "wait_timeout_ms": {"type": "integer", "default": 30000},
+                "wait_condition": {
+                    "type": "string",
+                    "enum": ["any_output", "finished"],
+                    "default": "any_output",
+                },
+            },
+            "required": ["process_guid"],
+        },
+    ),
 ]
 
 
@@ -1330,6 +1719,131 @@ def _index_counts(index_payload: dict[str, Any]) -> tuple[int | None, int | None
     entities_count = len(entities) if isinstance(entities, list) else None
     files_count = len(filelist) if isinstance(filelist, (list, dict)) else None
     return entities_count, files_count
+
+
+def _index_file_rows(index_payload: dict[str, Any]) -> list[str]:
+    files = index_payload.get("files") if isinstance(index_payload, dict) else None
+    if files is None and isinstance(index_payload, dict):
+        files = index_payload.get("filelist")
+    if isinstance(files, list):
+        return [r for r in files if isinstance(r, str)]
+    return []
+
+
+def _file_id_to_name_map(rows: list[str]) -> dict[int, str]:
+    out: dict[int, str] = {}
+    for row in rows:
+        parts = row.split(",")
+        if not parts:
+            continue
+        try:
+            fid = int(parts[0].strip())
+        except ValueError:
+            continue
+        if len(parts) > 1:
+            out[fid] = parts[1]
+    return out
+
+
+def _parse_entity_csv_row(line: str) -> dict[str, Any] | None:
+    """Parse one sandwiches_index entities CSV row: vis,type,parent,name,file_id,start-end,tokens."""
+    if not isinstance(line, str) or not line.strip():
+        return None
+    parts = line.split(",")
+    if len(parts) < 7:
+        return None
+    vis, e_type, parent, name = parts[0], parts[1], parts[2], parts[3]
+    file_id_s, span_s, tokens_s = parts[4], parts[5], parts[6]
+    try:
+        file_id = int(file_id_s.strip())
+    except ValueError:
+        return None
+    m = re.match(r"^(\d+)-(\d+)$", span_s.strip())
+    if not m:
+        return None
+    start_line, end_line = int(m.group(1)), int(m.group(2))
+    try:
+        tokens = int(tokens_s.strip())
+    except ValueError:
+        tokens = 0
+    return {
+        "vis": vis,
+        "type": e_type,
+        "parent": parent,
+        "name": name,
+        "file_id": file_id,
+        "start_line": start_line,
+        "end_line": end_line,
+        "tokens": tokens,
+    }
+
+
+def _build_file_tree_from_index(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Nest flat file_index rows by file_name path segments (posix-style)."""
+    root: dict[str, Any] = {"kind": "dir", "name": "", "path": "", "children": []}
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        raw = entry.get("file_name")
+        if raw is None:
+            continue
+        fn = str(raw).replace("\\", "/").strip("/")
+        if not fn:
+            continue
+        parts = [p for p in fn.split("/") if p]
+        node = root
+        acc: list[str] = []
+        for i, seg in enumerate(parts):
+            acc.append(seg)
+            is_leaf = i == len(parts) - 1
+            children: list[dict[str, Any]] = node.setdefault("children", [])
+            if is_leaf:
+                leaf: dict[str, Any] = {
+                    "kind": "file",
+                    "name": seg,
+                    "file_name": fn,
+                    "id": entry.get("id"),
+                    "ts": entry.get("ts"),
+                }
+                if "project_id" in entry:
+                    leaf["project_id"] = entry["project_id"]
+                if "size_bytes" in entry:
+                    leaf["size_bytes"] = entry["size_bytes"]
+                children.append(leaf)
+            else:
+                dir_node: dict[str, Any] | None = None
+                for c in children:
+                    if c.get("kind") == "dir" and c.get("name") == seg:
+                        dir_node = c
+                        break
+                if dir_node is None:
+                    dir_path = "/".join(acc)
+                    dir_node = {
+                        "kind": "dir",
+                        "name": seg,
+                        "path": dir_path,
+                        "children": [],
+                    }
+                    children.append(dir_node)
+                node = dir_node
+
+    def sort_children(n: dict[str, Any]) -> None:
+        ch = n.get("children")
+        if not isinstance(ch, list):
+            return
+        for c in ch:
+            if isinstance(c, dict) and c.get("kind") == "dir":
+                sort_children(c)
+        ch.sort(
+            key=lambda x: (
+                0 if (isinstance(x, dict) and x.get("kind") == "dir") else 1,
+                str(x.get("name", "")).lower() if isinstance(x, dict) else "",
+            )
+        )
+
+    sort_children(root)
+    return root
 
 
 def _is_progress_stub(message: str) -> bool:
@@ -1372,11 +1886,247 @@ def _extract_latest_message(payload: Any) -> str | None:
     return latest_message
 
 
+_DOCKER_CTL_ALLOWED = frozenset({"status", "restart", "rebuild", "clear-logs"})
+
+
+async def _invoke_cqds_ctl(
+    command: str,
+    services: list[str],
+    timeout: int,
+    wait: bool,
+) -> dict[str, Any]:
+    """Run scripts/cqds_ctl.py once. Returns ok+data or ok False with error/stdout/stderr."""
+    if command not in _DOCKER_CTL_ALLOWED:
+        return {
+            "ok": False,
+            "error": (
+                f"Unknown command '{command}'. Allowed: {', '.join(sorted(_DOCKER_CTL_ALLOWED))}"
+            ),
+            "stdout": "",
+            "stderr": "",
+        }
+
+    ctl_script = Path(__file__).resolve().parent / "scripts" / "cqds_ctl.py"
+    if not ctl_script.is_file():
+        return {
+            "ok": False,
+            "error": f"cqds_ctl.py not found at {ctl_script}",
+            "stdout": "",
+            "stderr": "",
+        }
+
+    proc_env = dict(os.environ)
+    if not proc_env.get("MCP_AUTH_TOKEN"):
+        proc_env["MCP_AUTH_TOKEN"] = _MCP_AUTH_TOKEN
+    if not proc_env.get("DB_ROOT_PASSWD"):
+        db_passwd_file = ctl_script.parent.parent / "secrets" / "cqds_db_password"
+        if db_passwd_file.is_file():
+            proc_env["DB_ROOT_PASSWD"] = db_passwd_file.read_text(encoding="utf-8").strip()
+
+    cmd_args = [sys.executable, str(ctl_script), command]
+    if command in {"status", "restart", "rebuild"}:
+        cmd_args.append(f"--timeout={timeout}")
+    if command == "status" and wait:
+        cmd_args.append("--wait")
+    cmd_args.extend(services)
+
+    LOGGER.info("cqds_ctl: %s", " ".join(cmd_args))
+    proc = await asyncio.create_subprocess_exec(
+        *cmd_args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.DEVNULL,
+        env=proc_env,
+    )
+    proc_timeout = timeout + 60
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=proc_timeout
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        return {
+            "ok": False,
+            "error": f"cqds_ctl timed out after {proc_timeout}s",
+            "stdout": "",
+            "stderr": "",
+        }
+
+    stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+    stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+
+    try:
+        payload = json.loads(stdout_text)
+    except Exception:
+        return {
+            "ok": False,
+            "error": "non-JSON output from cqds_ctl.py",
+            "stdout": stdout_text[:2000],
+            "stderr": stderr_text[:1000],
+        }
+    return {"ok": True, "data": payload}
+
+
+_MAX_HOST_PROC_BUFF = 4 * 1024 * 1024
+_MAX_HOST_PROCS = 48
+
+
+async def _host_pump_stream(
+    reader: asyncio.StreamReader | None,
+    acc: bytearray,
+    cap: int,
+) -> None:
+    if reader is None:
+        return
+    try:
+        while True:
+            chunk = await reader.read(65536)
+            if not chunk:
+                break
+            acc.extend(chunk)
+            if len(acc) > cap:
+                del acc[: len(acc) - cap]
+    except Exception as exc:
+        LOGGER.debug("host process pump ended: %s", exc)
+
+
+class HostProcRecord:
+    __slots__ = (
+        "proc",
+        "argv_desc",
+        "started",
+        "stdout_acc",
+        "stderr_acc",
+        "pump_out",
+        "pump_err",
+        "ttl_task",
+    )
+
+    def __init__(self, proc: asyncio.subprocess.Process, argv_desc: str) -> None:
+        self.proc = proc
+        self.argv_desc = argv_desc
+        self.started = time.monotonic()
+        self.stdout_acc = bytearray()
+        self.stderr_acc = bytearray()
+        self.pump_out: asyncio.Task[None] | None = None
+        self.pump_err: asyncio.Task[None] | None = None
+        self.ttl_task: asyncio.Task[None] | None = None
+
+
+def _host_tail_text(acc: bytearray, max_bytes: int) -> str:
+    if max_bytes <= 0:
+        return ""
+    raw = bytes(acc[-max_bytes:]) if len(acc) > max_bytes else bytes(acc)
+    return raw.decode("utf-8", errors="replace")
+
+
+def _docker_cli_exe() -> str:
+    return shutil.which("docker") or "docker"
+
+
+def _cqds_repo_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _docker_exec_argv(
+    container: str,
+    command: str | list[Any],
+    *,
+    workdir: str | None,
+    user: str | None,
+    env: dict[str, Any] | None,
+    interactive: bool,
+) -> list[str]:
+    exe = _docker_cli_exe()
+    argv: list[str] = [exe, "exec"]
+    if interactive:
+        argv.append("-i")
+    if workdir:
+        argv.extend(["-w", str(workdir)])
+    if user:
+        argv.extend(["-u", str(user)])
+    if env:
+        for k, v in env.items():
+            argv.extend(["-e", f"{str(k)}={str(v)}"])
+    argv.append(container)
+    if isinstance(command, str):
+        argv.extend(["sh", "-c", command])
+    elif isinstance(command, list):
+        if not command:
+            raise ValueError("command list must be non-empty")
+        for part in command:
+            argv.append(str(part))
+    else:
+        raise TypeError("command must be str or list")
+    return argv
+
+
+async def _docker_exec_batch_item(raw: dict[str, Any]) -> dict[str, Any]:
+    try:
+        container = str(raw.get("container", "")).strip()
+        if not container:
+            return {"ok": False, "error": "missing container", "request": raw}
+        command = raw.get("command")
+        if command is None:
+            return {"ok": False, "error": "missing command", "request": raw}
+        workdir = raw.get("workdir")
+        workdir_s = str(workdir) if workdir is not None else None
+        user = raw.get("user")
+        user_s = str(user) if user is not None else None
+        env = raw.get("env")
+        env_d: dict[str, Any] | None = env if isinstance(env, dict) else None
+        stdin_raw = raw.get("stdin")
+        stdin_b = str(stdin_raw).encode("utf-8") if stdin_raw is not None else None
+        interactive_flag = bool(raw.get("interactive", False)) or (stdin_b is not None)
+        argv = _docker_exec_argv(
+            container,
+            command,
+            workdir=workdir_s,
+            user=user_s,
+            env=env_d,
+            interactive=interactive_flag,
+        )
+        timeout_sec = max(1, min(int(raw.get("timeout_sec", 120)), 600))
+        LOGGER.info("cq_docker_exec: %s", argv)
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(_cqds_repo_root()),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.PIPE if stdin_b is not None else asyncio.subprocess.DEVNULL,
+            env=os.environ.copy(),
+        )
+        try:
+            out_b, err_b = await asyncio.wait_for(
+                proc.communicate(stdin_b),
+                timeout=float(timeout_sec) + 15.0,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return {
+                "ok": False,
+                "error": f"docker exec timed out after {timeout_sec}s",
+                "request": raw,
+            }
+        return {
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": out_b.decode("utf-8", errors="replace") if out_b else "",
+            "stderr": err_b.decode("utf-8", errors="replace") if err_b else "",
+            "request": raw,
+        }
+    except Exception as exc:
+        LOGGER.exception("docker exec batch item")
+        return {"ok": False, "error": str(exc), "request": raw}
+
+
 async def run_server(client: ColloquiumClient) -> None:
-    server = Server("colloquium-mcp")
+    server = Server("cqds-mcp")
     index_queue: asyncio.Queue[int] = asyncio.Queue()
     index_jobs: dict[int, dict[str, Any]] = {}
     index_worker_task: asyncio.Task | None = None
+    host_proc_registry: dict[str, HostProcRecord] = {}
 
     async def index_worker() -> None:
         while True:
@@ -1504,6 +2254,18 @@ async def run_server(client: ColloquiumClient) -> None:
                 resp = await client.get_history(chat_id)
                 return _json_text(resp)
 
+            # ---- chat stats ----
+            elif name == "cq_chat_stats":
+                chat_id = int(arguments["chat_id"])
+                since_seconds_raw = arguments.get("since_seconds", 0)
+                since_seconds = int(since_seconds_raw) if since_seconds_raw is not None else 0
+                since_seconds = max(0, min(since_seconds, 30 * 24 * 3600))
+                resp = await client.get_chat_stats(
+                    chat_id=chat_id,
+                    since_seconds=since_seconds if since_seconds > 0 else None,
+                )
+                return _json_text(resp)
+
             # ---- edit file ----
             elif name == "cq_edit_file":
                 chat_id = int(arguments["chat_id"])
@@ -1548,10 +2310,21 @@ async def run_server(client: ColloquiumClient) -> None:
                 modified_since = arguments.get("modified_since")
                 file_ids_raw = arguments.get("file_ids")
                 include_size = bool(arguments.get("include_size", False))
+                as_tree = bool(arguments.get("as_tree", False))
+                include_flat = bool(arguments.get("include_flat", False))
                 modified_since = int(modified_since) if modified_since is not None else None
                 file_ids = [int(x.strip()) for x in file_ids_raw.split(",")] if file_ids_raw else None
                 files = await client.list_files(project_id, modified_since, file_ids, include_size)
-                return _json_text(files)
+                if not as_tree:
+                    return _json_text(files)
+                tree = _build_file_tree_from_index(files)
+                payload: dict[str, Any] = {
+                    "tree": tree,
+                    "file_count": len(files),
+                }
+                if include_flat:
+                    payload["files"] = files
+                return _json_text(payload)
 
             # ---- get index (chat-based cache) ----
             elif name == "cq_get_index":
@@ -1625,6 +2398,128 @@ async def run_server(client: ColloquiumClient) -> None:
                     "source": "sync",
                 }
                 return _json_text(index)
+
+            # ---- grep entities in code index (definitions only) ----
+            elif name == "cq_grep_entity":
+                project_id = int(arguments["project_id"])
+                patterns_raw = arguments.get("patterns")
+                if patterns_raw is None or patterns_raw == []:
+                    single = arguments.get("pattern")
+                    patterns_raw = [single] if single else []
+                if isinstance(patterns_raw, str):
+                    patterns_list = [patterns_raw] if patterns_raw.strip() else []
+                elif isinstance(patterns_raw, list):
+                    patterns_list = [str(p) for p in patterns_raw if str(p).strip()]
+                else:
+                    raise ValueError("cq_grep_entity: patterns must be an array of strings or use pattern (string)")
+                if not patterns_list:
+                    raise ValueError("cq_grep_entity: provide patterns (non-empty array) or pattern (string)")
+
+                match_field = str(arguments.get("match_field", "name")).lower()
+                if match_field not in {"name", "parent", "qualified"}:
+                    raise ValueError("match_field must be one of: name, parent, qualified")
+
+                type_filter = arguments.get("entity_types")
+                type_allow: set[str] | None = None
+                if type_filter is not None:
+                    if not isinstance(type_filter, list):
+                        raise ValueError("entity_types must be an array of strings or omitted")
+                    type_allow = {str(t) for t in type_filter if str(t).strip()}
+                    if not type_allow:
+                        type_allow = None
+
+                is_regex = bool(arguments.get("is_regex", True))
+                case_sensitive = bool(arguments.get("case_sensitive", False))
+                max_results = int(arguments.get("max_results", 100))
+                max_results = max(1, min(max_results, 500))
+
+                ensure_index = bool(arguments.get("ensure_index", False))
+                ensure_timeout = int(arguments.get("ensure_index_timeout", 120))
+                ensure_timeout = max(30, min(ensure_timeout, 300))
+
+                index_payload = await client.get_index(project_id=project_id)
+                entities = index_payload.get("entities") if isinstance(index_payload, dict) else None
+
+                if (not isinstance(entities, list) or len(entities) == 0) and ensure_index:
+                    index_payload = await client.get_code_index(project_id, timeout=ensure_timeout)
+                    entities = index_payload.get("entities") if isinstance(index_payload, dict) else None
+
+                if not isinstance(entities, list) or len(entities) == 0:
+                    return _json_text(
+                        {
+                            "matches": [],
+                            "count": 0,
+                            "truncated": False,
+                            "hint": (
+                                "No entities in index. Run cq_rebuild_index, or call again with ensure_index=true."
+                            ),
+                            "project_id": project_id,
+                        }
+                    )
+
+                flags = 0 if case_sensitive else re.IGNORECASE
+                compiled: list[re.Pattern[str]] = []
+                for pat in patterns_list:
+                    try:
+                        if is_regex:
+                            compiled.append(re.compile(pat, flags))
+                        else:
+                            compiled.append(re.compile(re.escape(pat), flags))
+                    except re.error as exc:
+                        raise ValueError(f"Invalid pattern {pat!r}: {exc}") from exc
+
+                def qualified_name(row: dict[str, Any]) -> str:
+                    par, nm = row.get("parent") or "", row.get("name") or ""
+                    if par:
+                        return f"{par}::{nm}"
+                    return nm
+
+                def text_for_match(row: dict[str, Any]) -> str:
+                    if match_field == "parent":
+                        return row.get("parent") or ""
+                    if match_field == "qualified":
+                        return qualified_name(row)
+                    return row.get("name") or ""
+
+                file_rows = _index_file_rows(index_payload)
+                fid_to_name = _file_id_to_name_map(file_rows)
+
+                matches: list[dict[str, Any]] = []
+                truncated = False
+                for line in entities:
+                    if not isinstance(line, str):
+                        continue
+                    row = _parse_entity_csv_row(line)
+                    if row is None:
+                        continue
+                    if type_allow is not None and row["type"] not in type_allow:
+                        continue
+                    haystack = text_for_match(row)
+                    if not any(c.search(haystack) for c in compiled):
+                        continue
+                    row_out = {
+                        **row,
+                        "file_name": fid_to_name.get(row["file_id"]),
+                    }
+                    matches.append(row_out)
+                    if len(matches) >= max_results:
+                        truncated = True
+                        break
+
+                matches.sort(key=lambda r: (r.get("file_id", 0), r.get("start_line", 0), r.get("name", "")))
+
+                return _json_text(
+                    {
+                        "matches": matches,
+                        "count": len(matches),
+                        "truncated": truncated,
+                        "max_results": max_results,
+                        "project_id": project_id,
+                        "note": (
+                            "Matches are definition rows from the sandwiches index only (not call-site grep)."
+                        ),
+                    }
+                )
 
             # ---- read file ----
             elif name == "cq_read_file":
@@ -1710,15 +2605,20 @@ async def run_server(client: ColloquiumClient) -> None:
             elif name == "cq_query_db":
                 project_id = int(arguments["project_id"])
                 query = str(arguments["query"] or "").strip()
+                allow_write = bool(arguments.get("allow_write", False))
                 timeout = int(arguments.get("timeout", 30))
                 if not query:
                     raise ValueError("query must be non-empty")
 
                 ql = query.lower().lstrip()
-                if not (ql.startswith("select") or ql.startswith("with") or ql.startswith("explain")):
-                    raise ValueError("Only read-only SQL is allowed (SELECT/WITH/EXPLAIN)")
-                if re.search(r"\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|comment)\b", ql):
-                    raise ValueError("Mutating SQL keywords are not allowed in cq_query_db")
+                if not allow_write:
+                    if not (ql.startswith("select") or ql.startswith("with") or ql.startswith("explain")):
+                        raise ValueError("Only read-only SQL is allowed (SELECT/WITH/EXPLAIN). Set allow_write=true for local/private endpoints.")
+                    if re.search(r"\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|comment)\b", ql):
+                        raise ValueError("Mutating SQL keywords are not allowed in cq_query_db without allow_write=true")
+                else:
+                    if not client.is_local_or_private_endpoint():
+                        raise ValueError("allow_write=true is permitted only for local/private Colloquium endpoints")
 
                 encoded = base64.b64encode(query.encode("utf-8")).decode("ascii")
                 command = (
@@ -1775,12 +2675,24 @@ async def run_server(client: ColloquiumClient) -> None:
                 log_masks_raw = arguments.get("log_masks")
                 if not query:
                     raise ValueError("query must be non-empty")
-                if not isinstance(log_masks_raw, list) or not log_masks_raw:
-                    raise ValueError("log_masks must be a non-empty array of glob masks")
+                if log_masks_raw is None:
+                    log_masks_raw = []
+                if not isinstance(log_masks_raw, list):
+                    raise ValueError("log_masks must be an array when provided")
 
-                log_masks = [str(mask).strip() for mask in log_masks_raw if str(mask).strip()]
-                if not log_masks:
-                    raise ValueError("log_masks must contain at least one non-empty mask")
+                raw_sources = [str(mask).strip() for mask in log_masks_raw if str(mask).strip()]
+                docker_services: list[str] = []
+                file_masks: list[str] = []
+                for source in raw_sources:
+                    if source.lower().startswith("docker:"):
+                        service = source.split(":", 1)[1].strip()
+                        if service:
+                            docker_services.append(service)
+                    else:
+                        file_masks.append(source)
+
+                if not docker_services and not file_masks:
+                    raise ValueError("Provide at least one source in log_masks: file glob or docker:<service>")
 
                 tail_lines = int(arguments.get("tail_lines", 100))
                 tail_lines = max(1, min(tail_lines, 5000))
@@ -1788,96 +2700,142 @@ async def run_server(client: ColloquiumClient) -> None:
                 since_seconds = max(0, min(since_seconds, 7 * 24 * 3600))
                 case_sensitive = bool(arguments.get("case_sensitive", False))
 
+                result_payload: dict[str, Any] = {}
+                flags = re.MULTILINE if case_sensitive else (re.MULTILINE | re.IGNORECASE)
+                pattern = re.compile(query, flags)
+
+                if docker_services:
+                    compose_dir = str(Path(__file__).resolve().parent)
+                    docker_errors: dict[str, str] = {}
+                    for service in docker_services:
+                        cmd = [
+                            "docker",
+                            "compose",
+                            "logs",
+                            service,
+                            "--no-color",
+                            "--tail",
+                            str(tail_lines),
+                        ]
+                        if since_seconds > 0:
+                            cmd.extend(["--since", f"{since_seconds}s"])
+
+                        proc = await asyncio.create_subprocess_exec(
+                            *cmd,
+                            cwd=compose_dir,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            stdin=asyncio.subprocess.DEVNULL,
+                        )
+                        stdout_bytes, stderr_bytes = await proc.communicate()
+                        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+                        stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+
+                        key = f"docker:{service}"
+                        if proc.returncode != 0:
+                            result_payload[key] = []
+                            docker_errors[key] = stderr_text or f"docker compose logs failed with exit code {proc.returncode}"
+                            continue
+
+                        matched = [line for line in stdout_text.splitlines() if pattern.search(line)]
+                        result_payload[key] = matched[-tail_lines:] if tail_lines > 0 else matched
+
+                    if docker_errors:
+                        result_payload["_docker_errors"] = docker_errors
+
                 encoded_query = base64.b64encode(query.encode("utf-8")).decode("ascii")
                 encoded_masks = base64.b64encode(
-                    json.dumps(log_masks, ensure_ascii=False).encode("utf-8")
+                    json.dumps(file_masks, ensure_ascii=False).encode("utf-8")
                 ).decode("ascii")
 
-                command = (
-                    "python3 - <<'PY'\n"
-                    "import base64, glob, json, os, re, time\n"
-                    "from datetime import datetime\n"
-                    f"query = base64.b64decode('{encoded_query}').decode('utf-8')\n"
-                    f"masks = json.loads(base64.b64decode('{encoded_masks}').decode('utf-8'))\n"
-                    f"tail_lines = {tail_lines}\n"
-                    f"since_seconds = {since_seconds}\n"
-                    f"case_sensitive = {str(case_sensitive)}\n"
-                    "cutoff_ts = (time.time() - since_seconds) if since_seconds > 0 else None\n"
-                    "flags = re.MULTILINE if case_sensitive else (re.MULTILINE | re.IGNORECASE)\n"
-                    "pattern = re.compile(query, flags)\n"
-                    "ts_patterns = [\n"
-                    "    re.compile(r'^\\[(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})(?:[\\.,]\\d+)?\\]'),\n"
-                    "    re.compile(r'^(\\d{4}-\\d{2}-\\d{2}[ T]\\d{2}:\\d{2}:\\d{2})(?:[\\.,]\\d+)?'),\n"
-                    "]\n"
-                    "ts_formats = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S']\n"
-                    "def parse_line_ts(line):\n"
-                    "    for rx in ts_patterns:\n"
-                    "        m = rx.search(line)\n"
-                    "        if not m:\n"
-                    "            continue\n"
-                    "        raw = m.group(1).replace('T', ' ')\n"
-                    "        for fmt in ts_formats:\n"
-                    "            try:\n"
-                    "                dt = datetime.strptime(raw, fmt.replace('T', ' '))\n"
-                    "                return dt.timestamp()\n"
-                    "            except ValueError:\n"
-                    "                pass\n"
-                    "    return None\n"
-                    "paths = []\n"
-                    "seen = set()\n"
-                    "for mask in masks:\n"
-                    "    for path in glob.glob(mask, recursive=True):\n"
-                    "        norm = os.path.normpath(path)\n"
-                    "        if not os.path.isfile(norm):\n"
-                    "            continue\n"
-                    "        if norm in seen:\n"
-                    "            continue\n"
-                    "        seen.add(norm)\n"
-                    "        paths.append(norm)\n"
-                    "paths.sort()\n"
-                    "result = {}\n"
-                    "for path in paths:\n"
-                    "    try:\n"
-                    "        with open(path, 'r', encoding='utf-8', errors='replace') as fh:\n"
-                    "            lines = fh.read().splitlines()\n"
-                    "    except OSError:\n"
-                    "        result[path] = []\n"
-                    "        continue\n"
-                    "    matched = []\n"
-                    "    current_ts = None\n"
-                    "    for line in lines:\n"
-                    "        parsed_ts = parse_line_ts(line)\n"
-                    "        if parsed_ts is not None:\n"
-                    "            current_ts = parsed_ts\n"
-                    "        effective_ts = parsed_ts if parsed_ts is not None else current_ts\n"
-                    "        if cutoff_ts is not None and (effective_ts is None or effective_ts < cutoff_ts):\n"
-                    "            continue\n"
-                    "        if pattern.search(line):\n"
-                    "            matched.append(line)\n"
-                    "    if tail_lines > 0:\n"
-                    "        matched = matched[-tail_lines:]\n"
-                    "    result[path] = matched\n"
-                    "print(json.dumps(result, ensure_ascii=False))\n"
-                    "PY"
-                )
-
-                result = await client.exec_command(project_id, command, 120)
-                output = result.get("output", "") if isinstance(result, dict) else ""
-                parsed_output = output.strip()
-                if parsed_output.startswith("<stdout>") and "</stdout>" in parsed_output:
-                    parsed_output = parsed_output[len("<stdout>"):parsed_output.rfind("</stdout>")].strip()
-                try:
-                    parsed = json.loads(parsed_output)
-                except Exception as exc:
-                    return _json_text(
-                        {
-                            "status": "error",
-                            "error": f"Failed to parse cq_grep_logs output as JSON: {exc}",
-                            "raw_output": output,
-                            "exec": result,
-                        }
+                if file_masks:
+                    command = (
+                        "python3 - <<'PY'\n"
+                        "import base64, glob, json, os, re, time\n"
+                        "from datetime import datetime\n"
+                        f"query = base64.b64decode('{encoded_query}').decode('utf-8')\n"
+                        f"masks = json.loads(base64.b64decode('{encoded_masks}').decode('utf-8'))\n"
+                        f"tail_lines = {tail_lines}\n"
+                        f"since_seconds = {since_seconds}\n"
+                        f"case_sensitive = {str(case_sensitive)}\n"
+                        "cutoff_ts = (time.time() - since_seconds) if since_seconds > 0 else None\n"
+                        "flags = re.MULTILINE if case_sensitive else (re.MULTILINE | re.IGNORECASE)\n"
+                        "pattern = re.compile(query, flags)\n"
+                        "ts_patterns = [\n"
+                        "    re.compile(r'^\\[(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})(?:[\\.,]\\d+)?\\]'),\n"
+                        "    re.compile(r'^(\\d{4}-\\d{2}-\\d{2}[ T]\\d{2}:\\d{2}:\\d{2})(?:[\\.,]\\d+)?'),\n"
+                        "]\n"
+                        "ts_formats = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S']\n"
+                        "def parse_line_ts(line):\n"
+                        "    for rx in ts_patterns:\n"
+                        "        m = rx.search(line)\n"
+                        "        if not m:\n"
+                        "            continue\n"
+                        "        raw = m.group(1).replace('T', ' ')\n"
+                        "        for fmt in ts_formats:\n"
+                        "            try:\n"
+                        "                dt = datetime.strptime(raw, fmt.replace('T', ' '))\n"
+                        "                return dt.timestamp()\n"
+                        "            except ValueError:\n"
+                        "                pass\n"
+                        "    return None\n"
+                        "paths = []\n"
+                        "seen = set()\n"
+                        "for mask in masks:\n"
+                        "    for path in glob.glob(mask, recursive=True):\n"
+                        "        norm = os.path.normpath(path)\n"
+                        "        if not os.path.isfile(norm):\n"
+                        "            continue\n"
+                        "        if norm in seen:\n"
+                        "            continue\n"
+                        "        seen.add(norm)\n"
+                        "        paths.append(norm)\n"
+                        "paths.sort()\n"
+                        "result = {}\n"
+                        "for path in paths:\n"
+                        "    try:\n"
+                        "        with open(path, 'r', encoding='utf-8', errors='replace') as fh:\n"
+                        "            lines = fh.read().splitlines()\n"
+                        "    except OSError:\n"
+                        "        result[path] = []\n"
+                        "        continue\n"
+                        "    matched = []\n"
+                        "    current_ts = None\n"
+                        "    for line in lines:\n"
+                        "        parsed_ts = parse_line_ts(line)\n"
+                        "        if parsed_ts is not None:\n"
+                        "            current_ts = parsed_ts\n"
+                        "        effective_ts = parsed_ts if parsed_ts is not None else current_ts\n"
+                        "        if cutoff_ts is not None and (effective_ts is None or effective_ts < cutoff_ts):\n"
+                        "            continue\n"
+                        "        if pattern.search(line):\n"
+                        "            matched.append(line)\n"
+                        "    if tail_lines > 0:\n"
+                        "        matched = matched[-tail_lines:]\n"
+                        "    result[path] = matched\n"
+                        "print(json.dumps(result, ensure_ascii=False))\n"
+                        "PY"
                     )
-                return _json_text(parsed)
+
+                    result = await client.exec_command(project_id, command, 120)
+                    output = result.get("output", "") if isinstance(result, dict) else ""
+                    parsed_output = output.strip()
+                    if parsed_output.startswith("<stdout>") and "</stdout>" in parsed_output:
+                        parsed_output = parsed_output[len("<stdout>"):parsed_output.rfind("</stdout>")].strip()
+                    try:
+                        parsed = json.loads(parsed_output)
+                    except Exception as exc:
+                        return _json_text(
+                            {
+                                "status": "error",
+                                "error": f"Failed to parse cq_grep_logs output as JSON: {exc}",
+                                "raw_output": output,
+                                "exec": result,
+                            }
+                        )
+                    result_payload.update(parsed)
+
+                return _json_text(result_payload)
 
             # ---- replace in file ----
             elif name == "cq_replace":
@@ -2038,59 +2996,316 @@ async def run_server(client: ColloquiumClient) -> None:
                 timeout = max(10, min(int(arguments.get("timeout", 90)), 600))
                 wait = bool(arguments.get("wait", False))
 
-                allowed = {"status", "restart", "rebuild", "clear-logs"}
-                if command not in allowed:
-                    raise ValueError(f"Unknown command '{command}'. Allowed: {', '.join(sorted(allowed))}")
-
-                ctl_script = Path(__file__).resolve().parent / "scripts" / "cqds_ctl.py"
-                if not ctl_script.is_file():
-                    raise RuntimeError(f"cqds_ctl.py not found at {ctl_script}")
-
-                # Inherit current env and fill required docker-compose vars if absent,
-                # so that `docker compose` can parse the compose file without hanging on stdin.
-                proc_env = dict(os.environ)
-                if not proc_env.get("MCP_AUTH_TOKEN"):
-                    proc_env["MCP_AUTH_TOKEN"] = _MCP_AUTH_TOKEN
-                if not proc_env.get("DB_ROOT_PASSWD"):
-                    db_passwd_file = ctl_script.parent.parent / "secrets" / "cqds_db_password"
-                    if db_passwd_file.is_file():
-                        proc_env["DB_ROOT_PASSWD"] = db_passwd_file.read_text(encoding="utf-8").strip()
-
-                cmd_args = [sys.executable, str(ctl_script), command]
-                if command in {"status", "restart", "rebuild"}:
-                    cmd_args.append(f"--timeout={timeout}")
-                if command == "status" and wait:
-                    cmd_args.append("--wait")
-                cmd_args.extend(services)
-
-                LOGGER.info("cq_docker_control: %s", " ".join(cmd_args))
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd_args,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    stdin=asyncio.subprocess.DEVNULL,
-                    env=proc_env,
-                )
-                proc_timeout = timeout + 60
-                try:
-                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                        proc.communicate(), timeout=proc_timeout
-                    )
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    return _text(f"cq_docker_control: timed out after {proc_timeout}s")
-
-                stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
-                stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
-
-                try:
-                    payload = json.loads(stdout_text)
-                except Exception:
+                out = await _invoke_cqds_ctl(command, services, timeout, wait)
+                if out["ok"]:
+                    return _json_text(out["data"])
+                err = str(out.get("error", "error"))
+                if out.get("stdout") or out.get("stderr"):
                     return _text(
-                        f"cq_docker_control: non-JSON output from cqds_ctl.py\n"
-                        f"stdout: {stdout_text[:600]}\nstderr: {stderr_text[:300]}"
+                        f"cq_docker_control: {err}\n"
+                        f"stdout: {str(out.get('stdout', ''))[:600]}\n"
+                        f"stderr: {str(out.get('stderr', ''))[:300]}"
                     )
-                return _json_text(payload)
+                return _text(f"cq_docker_control: {err}")
+
+            # ---- docker control batch (cqds_ctl) ----
+            elif name == "cq_docker_control_batch":
+                raw_reqs = arguments.get("requests")
+                if not isinstance(raw_reqs, list) or len(raw_reqs) == 0:
+                    raise ValueError("cq_docker_control_batch requires a non-empty requests array")
+                stop_on_error = bool(arguments.get("stop_on_error", False))
+                results: list[dict[str, Any]] = []
+
+                for i, raw in enumerate(raw_reqs):
+                    if not isinstance(raw, dict):
+                        row: dict[str, Any] = {
+                            "index": i,
+                            "ok": False,
+                            "error": "request must be an object",
+                            "request": raw,
+                        }
+                        results.append(row)
+                        if stop_on_error:
+                            break
+                        continue
+
+                    command = str(raw.get("command", "status"))
+                    services = [str(s) for s in (raw.get("services") or [])]
+                    timeout = max(10, min(int(raw.get("timeout", 90)), 600))
+                    wait = bool(raw.get("wait", False))
+
+                    if command not in _DOCKER_CTL_ALLOWED:
+                        row = {
+                            "index": i,
+                            "ok": False,
+                            "error": (
+                                f"Unknown command '{command}'. "
+                                f"Allowed: {', '.join(sorted(_DOCKER_CTL_ALLOWED))}"
+                            ),
+                            "request": raw,
+                        }
+                        results.append(row)
+                        if stop_on_error:
+                            break
+                        continue
+
+                    out = await _invoke_cqds_ctl(command, services, timeout, wait)
+                    if out["ok"]:
+                        results.append(
+                            {
+                                "index": i,
+                                "ok": True,
+                                "request": raw,
+                                "response": out["data"],
+                            }
+                        )
+                    else:
+                        row = {
+                            "index": i,
+                            "ok": False,
+                            "request": raw,
+                            "error": out.get("error"),
+                            "stdout": out.get("stdout"),
+                            "stderr": out.get("stderr"),
+                        }
+                        results.append(row)
+                        if stop_on_error:
+                            break
+
+                all_ok = all(r.get("ok") for r in results)
+                return _json_text(
+                    {
+                        "results": results,
+                        "all_ok": all_ok,
+                        "count": len(results),
+                    }
+                )
+
+            # ---- docker exec (CLI on MCP host) ----
+            elif name == "cq_docker_exec":
+                raw_reqs = arguments.get("requests")
+                if not isinstance(raw_reqs, list) or len(raw_reqs) == 0:
+                    raise ValueError("cq_docker_exec requires a non-empty requests array")
+                stop_on_error = bool(arguments.get("stop_on_error", False))
+                results: list[dict[str, Any]] = []
+                for i, raw in enumerate(raw_reqs):
+                    if not isinstance(raw, dict):
+                        results.append(
+                            {
+                                "index": i,
+                                "ok": False,
+                                "error": "request must be an object",
+                                "request": raw,
+                            }
+                        )
+                        if stop_on_error:
+                            break
+                        continue
+                    row = await _docker_exec_batch_item(raw)
+                    row["index"] = i
+                    results.append(row)
+                    if stop_on_error and not row.get("ok"):
+                        break
+                all_ok = all(r.get("ok") for r in results)
+                return _json_text(
+                    {"results": results, "all_ok": all_ok, "count": len(results)}
+                )
+
+            # ---- host-local subprocesses (MCP machine, not sandbox) ----
+            elif name == "cq_host_process_spawn":
+                if len(host_proc_registry) >= _MAX_HOST_PROCS:
+                    return _text(f"Too many host processes (max {_MAX_HOST_PROCS})")
+                cmd = arguments.get("command")
+                if cmd is None:
+                    return _text("Missing required argument: command")
+                cwd = arguments.get("cwd")
+                cwd_s = str(cwd) if cwd else None
+                env_arg = arguments.get("env")
+                env_merged = os.environ.copy()
+                if isinstance(env_arg, dict):
+                    for k, v in env_arg.items():
+                        env_merged[str(k)] = str(v)
+                timeout_sec = max(1, min(int(arguments.get("timeout", 3600)), 7200))
+
+                try:
+                    if isinstance(cmd, str):
+                        proc = await asyncio.create_subprocess_shell(
+                            cmd,
+                            cwd=cwd_s,
+                            env=env_merged,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            stdin=asyncio.subprocess.PIPE,
+                        )
+                        desc = cmd[:500]
+                    elif isinstance(cmd, list):
+                        if not cmd:
+                            return _text("command array must be non-empty")
+                        argv = [str(x) for x in cmd]
+                        proc = await asyncio.create_subprocess_exec(
+                            *argv,
+                            cwd=cwd_s,
+                            env=env_merged,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            stdin=asyncio.subprocess.PIPE,
+                        )
+                        desc = " ".join(argv)[:500]
+                    else:
+                        return _text("command must be string or array")
+                except Exception as exc:
+                    return _text(f"spawn failed: {exc}")
+
+                guid = str(uuid.uuid4())
+                rec = HostProcRecord(proc, desc)
+                rec.pump_out = asyncio.create_task(
+                    _host_pump_stream(proc.stdout, rec.stdout_acc, _MAX_HOST_PROC_BUFF)
+                )
+                rec.pump_err = asyncio.create_task(
+                    _host_pump_stream(proc.stderr, rec.stderr_acc, _MAX_HOST_PROC_BUFF)
+                )
+
+                async def _host_ttl_kill() -> None:
+                    await asyncio.sleep(float(timeout_sec))
+                    if proc.returncode is None:
+                        proc.kill()
+
+                rec.ttl_task = asyncio.create_task(_host_ttl_kill())
+                host_proc_registry[guid] = rec
+                return _json_text(
+                    {"process_guid": guid, "pid": proc.pid, "command": desc, "timeout": timeout_sec}
+                )
+
+            elif name == "cq_host_process_io":
+                process_guid = str(arguments.get("process_guid") or "")
+                if not process_guid:
+                    return _text("Missing required argument: process_guid")
+                rec = host_proc_registry.get(process_guid)
+                if not rec:
+                    return _text("Unknown process_guid")
+                inp = arguments.get("input")
+                if inp is not None and rec.proc.stdin:
+                    try:
+                        if rec.proc.stdin.is_closing():
+                            pass
+                        else:
+                            rec.proc.stdin.write(str(inp).encode("utf-8", errors="replace"))
+                            await rec.proc.stdin.drain()
+                    except Exception as exc:
+                        return _json_text(
+                            {
+                                "error": f"stdin write failed: {exc}",
+                                "stdout_fragment": _host_tail_text(
+                                    rec.stdout_acc, int(arguments.get("max_bytes", 65536))
+                                ),
+                                "stderr_fragment": _host_tail_text(
+                                    rec.stderr_acc, int(arguments.get("max_bytes", 65536))
+                                ),
+                                "alive": rec.proc.returncode is None,
+                                "returncode": rec.proc.returncode,
+                            }
+                        )
+                max_bytes = int(arguments.get("max_bytes", 65536))
+                read_timeout_ms = max(0, int(arguments.get("read_timeout_ms", 5000)))
+                await asyncio.sleep(min(read_timeout_ms / 1000.0, 2.0))
+                return _json_text(
+                    {
+                        "stdout_fragment": _host_tail_text(rec.stdout_acc, max_bytes),
+                        "stderr_fragment": _host_tail_text(rec.stderr_acc, max_bytes),
+                        "alive": rec.proc.returncode is None,
+                        "returncode": rec.proc.returncode,
+                    }
+                )
+
+            elif name == "cq_host_process_kill":
+                process_guid = str(arguments.get("process_guid") or "")
+                if not process_guid:
+                    return _text("Missing required argument: process_guid")
+                rec = host_proc_registry.get(process_guid)
+                if not rec:
+                    return _text("Unknown process_guid")
+                signal_name = str(arguments.get("signal", "SIGTERM"))
+                if rec.ttl_task and not rec.ttl_task.done():
+                    rec.ttl_task.cancel()
+                for t in (rec.pump_out, rec.pump_err):
+                    if t and not t.done():
+                        t.cancel()
+                try:
+                    if rec.proc.returncode is None:
+                        if signal_name == "SIGKILL":
+                            rec.proc.kill()
+                        else:
+                            rec.proc.terminate()
+                        try:
+                            await asyncio.wait_for(rec.proc.wait(), timeout=8.0)
+                        except asyncio.TimeoutError:
+                            rec.proc.kill()
+                            await rec.proc.wait()
+                finally:
+                    for t in (rec.pump_out, rec.pump_err):
+                        if t and not t.done():
+                            try:
+                                await t
+                            except asyncio.CancelledError:
+                                pass
+                    host_proc_registry.pop(process_guid, None)
+                return _json_text({"stopped": True, "returncode": rec.proc.returncode})
+
+            elif name == "cq_host_process_status":
+                process_guid = str(arguments.get("process_guid") or "")
+                if not process_guid:
+                    return _text("Missing required argument: process_guid")
+                rec = host_proc_registry.get(process_guid)
+                if not rec:
+                    return _text("Unknown process_guid")
+                alive = rec.proc.returncode is None
+                runtime_ms = int((time.monotonic() - rec.started) * 1000)
+                return _json_text(
+                    {
+                        "alive": alive,
+                        "returncode": rec.proc.returncode,
+                        "pid": rec.proc.pid,
+                        "runtime_ms": runtime_ms,
+                        "command": rec.argv_desc,
+                    }
+                )
+
+            elif name == "cq_host_process_list":
+                items: list[dict[str, Any]] = []
+                for g, r in host_proc_registry.items():
+                    items.append(
+                        {
+                            "process_guid": g,
+                            "pid": r.proc.pid,
+                            "alive": r.proc.returncode is None,
+                            "returncode": r.proc.returncode,
+                            "command": r.argv_desc,
+                        }
+                    )
+                return _json_text({"processes": items, "count": len(items)})
+
+            elif name == "cq_host_process_wait":
+                process_guid = str(arguments.get("process_guid") or "")
+                if not process_guid:
+                    return _text("Missing required argument: process_guid")
+                rec = host_proc_registry.get(process_guid)
+                if not rec:
+                    return _text("Unknown process_guid")
+                wait_ms = max(0, int(arguments.get("wait_timeout_ms", 30000)))
+                condition = str(arguments.get("wait_condition", "any_output"))
+                baseline = len(rec.stdout_acc) + len(rec.stderr_acc)
+                deadline = time.monotonic() + wait_ms / 1000.0
+                while time.monotonic() < deadline:
+                    if rec.proc.returncode is not None:
+                        return _json_text(
+                            {"finished": True, "returncode": rec.proc.returncode}
+                        )
+                    if condition == "any_output" and (
+                        len(rec.stdout_acc) + len(rec.stderr_acc) > baseline
+                    ):
+                        return _json_text({"finished": False, "saw_output": True})
+                    await asyncio.sleep(0.05)
+                return _json_text({"finished": False, "timed_out": True})
 
             else:
 

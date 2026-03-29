@@ -88,6 +88,8 @@ class LLMInteractor(ContextAssembler):
                 "output_tokens INTEGER",
                 "sources_used INTEGER",
                 "token_limit INTEGER DEFAULT 131072",
+                "input_token_cost FLOAT",
+                "output_token_cost FLOAT",
                 "token_cost FLOAT",
                 "chat_id INTEGER"
             ]
@@ -324,7 +326,7 @@ class LLMInteractor(ContextAssembler):
         """
         actor = ci.actor
         self.pre_prompt, self.pre_prompt_path = _load_pre_prompt(actor.user_name)
-        tokens_limit, tokens_cost = g.user_manager.get_user_token_limits(actor.user_id)
+        tokens_limit, input_tokens_cost, output_tokens_cost = g.user_manager.get_user_token_limits(actor.user_id)
         # build_context is CPU/IO heavy and can block event loop; move it to a worker thread.
         context = await asyncio.to_thread(self.build_context, ci, rql)
         if not context:
@@ -367,7 +369,9 @@ class LLMInteractor(ContextAssembler):
                 used_tokens = usage.get('prompt_tokens', 0)
                 output_tokens = usage.get('completion_tokens', 0)
                 sources_used = usage.get('num_sources_used', 0)
-                total_cost = (used_tokens + output_tokens) * tokens_cost / 1_000_000
+                input_cost = used_tokens * input_tokens_cost / 1_000_000
+                output_cost = output_tokens * output_tokens_cost / 1_000_000
+                total_cost = input_cost + output_cost
                 self.llm_usage_table.insert_into({
                     "ts": int(datetime.datetime.now().timestamp()),
                     "model": conn.model,
@@ -376,11 +380,13 @@ class LLMInteractor(ContextAssembler):
                     "output_tokens": output_tokens,
                     "sources_used": sources_used,
                     "token_limit": tokens_limit,
+                    "input_token_cost": input_cost,
+                    "output_token_cost": output_cost,
                     "token_cost": total_cost,
                     "chat_id": ci.chat_id
                 })
-                log.debug("Сохранена статистика LLM для chat_id=%d, user_id=%d: model=%s, sent_tokens=%d, used_tokens=%d, output_tokens=%d, sources_used=%d, token_cost=%f",
-                          ci.chat_id, actor.user_id, conn.model, sent_tokens, used_tokens, output_tokens, sources_used, total_cost)
+                log.debug("Сохранена статистика LLM для chat_id=%d, user_id=%d: model=%s, sent_tokens=%d, used_tokens=%d, output_tokens=%d, sources_used=%d, input_cost=%f, output_cost=%f, token_cost=%f",
+                          ci.chat_id, actor.user_id, conn.model, sent_tokens, used_tokens, output_tokens, sources_used, input_cost, output_cost, total_cost)
                 text = response.get('text', 'void-response')
                 response_file = Path(f"/app/logs/response-{actor.user_name}-{ci.chat_id}.llm")
                 await asyncio.to_thread(self._atomic_write_text, response_file, text)

@@ -89,7 +89,8 @@ class Database:
                     llm_class TEXT,
                     llm_token TEXT,
                     tokens_limit BIGINT DEFAULT 131072,
-                    tokens_cost DOUBLE PRECISION,
+                    tokens_input_cost DOUBLE PRECISION,
+                    tokens_output_cost DOUBLE PRECISION,
                     llm_reasoning_eff TEXT DEFAULT 'medium',
                     password_hash TEXT,
                     salt TEXT
@@ -115,7 +116,8 @@ class Database:
                 llm_class TEXT,
                 llm_token TEXT,
                 tokens_limit INTEGER DEFAULT 131072,
-                tokens_cost FLOAT,
+                tokens_input_cost FLOAT,
+                tokens_output_cost FLOAT,
                 llm_reasoning_eff TEXT DEFAULT 'medium',
                 password_hash TEXT,
                 salt TEXT
@@ -163,7 +165,11 @@ class Database:
             with self.engine.connect() as conn:
                 params = params if params is not None else {}
                 result = conn.execute(text(query), params)
-                rows = result.fetchall()
+                try:
+                    rows = result.fetchall()
+                except Exception:
+                    rows = []  # DDL/DML statements that don't return rows
+                conn.commit()
                 return rows
         except SQLAlchemyError as e:
             log.excpt("Ошибка fetch_all: %s, params=~%s, error=%s",
