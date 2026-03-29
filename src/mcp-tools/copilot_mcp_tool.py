@@ -1,5 +1,5 @@
 # copilot_mcp_tool.py — MCP server bridging GitHub Copilot to Colloquium-DevSpace
-# Place: P:\GitHub\Colloquium-DevSpace\src\copilot_mcp_tool.py
+# Place: P:\GitHub\Colloquium-DevSpace\src\mcp-tools\copilot_mcp_tool.py
 #
 # Usage:
 #   python copilot_mcp_tool.py [--url URL] [--username USER]

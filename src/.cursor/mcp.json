@@ -21,7 +21,7 @@
     "cqds": {
       "command": "C:\\Apps\\Python3\\python.exe",
       "args": [
-        "P:\\opt\\docker\\cqds\\copilot_mcp_tool.py",
+        "P:\\opt\\docker\\cqds\\mcp-tools\\copilot_mcp_tool.py",
         "--url",
         "http://localhost:8008",
         "--username",
@@ -35,7 +35,7 @@
     "gitbash": {
       "command": "C:\\Apps\\Python3\\python.exe",
       "args": [
-        "P:\\opt\\docker\\cqds\\mcp_gitbash_stdio.py"
+        "P:\\opt\\docker\\cqds\\mcp-tools\\mcp_gitbash_stdio.py"
       ],
       "type": "stdio"
     }

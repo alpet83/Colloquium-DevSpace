@@ -12,7 +12,7 @@
 #   "gitbash": {
 #     "type": "stdio",
 #     "command": "C:\\\\Apps\\\\Python3\\\\python.exe",
-#     "args": ["P:\\\\opt\\\\docker\\\\cqds\\\\mcp_gitbash_stdio.py"]
+#     "args": ["P:\\\\opt\\\\docker\\\\cqds\\\\mcp-tools\\\\mcp_gitbash_stdio.py"]
 #   }
 
 from __future__ import annotations

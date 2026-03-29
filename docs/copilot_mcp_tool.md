@@ -1,4 +1,4 @@
-CP# copilot_mcp_tool — Интеграция GitHub Copilot с Colloquium-DevSpace
+# copilot_mcp_tool — Интеграция GitHub Copilot с Colloquium-DevSpace
 
 MCP-сервер (`copilot_mcp_tool.py`) транслирует инструменты GitHub Copilot Agent в HTTP-запросы к Colloquium-DevSpace, позволяя Copilot читать чаты, отправлять сообщения и управлять файлами проекта через Colloquium.
 
@@ -187,7 +187,7 @@ docker exec colloquium-core python3 /app/agent/create_user.py --list
 
 ### Рекомендуемый вариант: sidecar secret
 
-Создай файл `X:\docker\cqds\copilot_mcp_tool.secret`, в котором находится только пароль, без JSON и без лишних строк:
+Создай файл `X:\docker\cqds\mcp-tools\copilot_mcp_tool.secret`, в котором находится только пароль, без JSON и без лишних строк:
 
 ```text
 мой_пароль
@@ -580,7 +580,7 @@ COLLOQUIUM_MCP_LOG_LEVEL уровень логирования (например
 Запусти сервер вручную — если стартует без ошибок, конфигурация верна:
 
 ```powershell
-python.exe X:\docker\cqds\copilot_mcp_tool.py `
+python.exe X:\docker\cqds\mcp-tools\copilot_mcp_tool.py `
   --url http://localhost:8008 --username copilot
 # Должен зависнуть (ожидает stdin от MCP-клиента) — Ctrl+C для выхода
 ```
