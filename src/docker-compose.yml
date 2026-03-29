@@ -81,8 +81,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: mcp-sandbox
-    ports:
-      - "8084:8084"
+    # Port 8084 is no longer exposed directly; access goes via nginx-router /mcp/mcp-sandbox/
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -93,6 +92,7 @@ services:
       - RUST_LOG=debug
     networks:
       - devspace-net
+      - mcp_debug_net
 
   frontend:
     build:
@@ -118,6 +118,7 @@ services:
       - "8008:8008"
     networks:
       - devspace-net
+      - mcp_debug_net
     depends_on:
       - colloquium-core
       - frontend
@@ -125,6 +126,9 @@ services:
 networks:
   devspace-net:
     driver: bridge
+  mcp_debug_net:
+    external: true
+    name: mcp_debug_net
 
 volumes:
   data_volume:

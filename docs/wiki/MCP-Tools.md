@@ -37,3 +37,10 @@ This page tracks MCP scripts and config locations after path migration.
 - Keep script path references consistent with `mcp-tools` in all `mcp.json` files.
 - Avoid shell redirection for document restore flows when Cyrillic text is involved.
 - Prefer byte-safe restore strategy (`git show` via programmatic bytes decode/encode) for docs recovery.
+
+## Project-Scoped MCP Route
+
+- `projects.mcp_server_url` is now the runtime route source for MCP process APIs.
+- Core processors (`shell_code`, `cmd`) resolve MCP endpoint from selected project and fallback to `MCP_SERVER_URL`.
+- MCP tool resolves route from `cq_list_projects` payload and caches it per project.
+- `cq_process_spawn` stores `process_guid -> mcp_server_url` mapping for follow-up `cq_process_io/status/wait/kill`.

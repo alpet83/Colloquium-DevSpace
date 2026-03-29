@@ -1,4 +1,6 @@
 __pycache__/
 *.py[cod]
 *.pyo
+.tmp/
+*.code-workspace
 *.pyd

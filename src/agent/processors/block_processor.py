@@ -1,4 +1,5 @@
 # /app/agent/processors/block_processor.py, updated 2025-07-23 18:32 EEST
+import os
 import re
 import traceback
 import requests
@@ -8,8 +9,33 @@ import time
 import globals as g
 from pathlib import Path
 
-MCP_URL = "http://mcp-sandbox:8084"
+MCP_URL = os.getenv('MCP_SERVER_URL', 'http://mcp-sandbox:8084').rstrip('/')
 log = globals.get_logger("llm_proc")
+
+
+def _normalize_mcp_url(url: str | None) -> str | None:
+    if url is None:
+        return None
+    val = str(url).strip()
+    if not val:
+        return None
+    if not (val.startswith('http://') or val.startswith('https://')):
+        val = 'http://' + val
+    return val.rstrip('/')
+
+
+def resolve_mcp_url(project_manager=None, project_id: int | None = None) -> str:
+    url = None
+    try:
+        pm = project_manager
+        if pm is None and project_id is not None:
+            from managers.project import ProjectManager
+            pm = ProjectManager.get(project_id)
+        if pm is not None:
+            url = getattr(pm, 'mcp_server_url', None)
+    except Exception as e:
+        log.warn("Не удалось определить project-scoped mcp_server_url: %s", str(e))
+    return _normalize_mcp_url(url) or MCP_URL
 
 class ProcessorError(Exception):
     def __init__(self, message, user_name='Unknown'):
@@ -189,6 +215,7 @@ class CommandProcessor(BlockProcessor):
         command = command.strip()
         _proj_man = g.current_project_manager.get() or g.project_manager  # TODO(pre-release): remove g.project_manager fallback after ContextVar adoption is verified
         proj_name = getattr(_proj_man, "project_name", "default")
+        mcp_url = resolve_mcp_url(_proj_man)
         user_name = attrs.get('user_name', 'Unknown')
         tail = ' '.join(tokens[1:])
         log.debug("Обработка команды: %s с параметрами %s", command or "None", tail[:50])
@@ -200,12 +227,12 @@ class CommandProcessor(BlockProcessor):
             return res_success(user_name, f"@{user_name} pong")
         elif command == 'run_test':
             params = {'project_name': proj_name, 'test_name': 'test'}
-            resp = requests.get(f"{MCP_URL}/run_test", params=params, headers=auth_header)
+            resp = requests.get(f"{mcp_url}/run_test", params=params, headers=auth_header)
             response = resp.text if resp.status_code == 200 else f"Ошибка: {resp.status_code}"
             return res_success(user_name, f"@{user_name} {response}") if resp.status_code == 200 else res_error(user_name, f"@{user_name} {response}")
         elif command == 'commit':
             params = {'project_name': proj_name, 'msg': 'commit msg'}
-            resp = requests.post(f"{MCP_URL}/commit", json=params, headers=auth_header)
+            resp = requests.post(f"{mcp_url}/commit", json=params, headers=auth_header)
             response = resp.text if resp.status_code == 200 else f"Ошибка: {resp.status_code}"
             return res_success(user_name, f"@{user_name} {response}") if resp.status_code == 200 else res_error(user_name, f"@{user_name} {response}")
         elif command == 'show':

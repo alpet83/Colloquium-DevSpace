@@ -2,7 +2,7 @@ import re
 import aiohttp
 import globals
 from lib.execute_commands import execute
-from processors.block_processor import BlockProcessor, res_error, res_success, MCP_URL
+from processors.block_processor import BlockProcessor, res_error, res_success, resolve_mcp_url
 
 log = globals.get_logger("llm_proc")
 
@@ -29,6 +29,7 @@ class ShellCodeProcessor(BlockProcessor):
             log.error("Отсутствует project_name для MCP команды")
             return res_error(user_name, "<stdout>Error: No project selected for MCP command</stdout>")
         project_name = project_name or 'default'
+        mcp_url = resolve_mcp_url(project_manager)
 
         user_inputs = []
         input_matches = list(re.finditer(r'<user_input\s+rqs="([^"]*)"\s+ack="([^"]*)"\s*/>', block_code,
@@ -43,7 +44,7 @@ class ShellCodeProcessor(BlockProcessor):
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
-                        f"{MCP_URL}/exec_commands",
+                        f"{mcp_url}/exec_commands",
                         json={'command': shell_command, 'user_inputs': user_inputs, 'project_name': project_name,
                               'timeout': timeout},
                         headers={'Authorization': "Bearer " + globals.MCP_AUTH_TOKEN},

@@ -21,6 +21,7 @@ class ProjectManager:
         self.local_git = None
         self.public_git = None
         self.dependencies = None
+        self.mcp_server_url = None
         self.projects_table = DataTable(
             table_name="projects",
             template=[
@@ -29,7 +30,8 @@ class ProjectManager:
                 "description TEXT",
                 "local_git TEXT",
                 "public_git TEXT",
-                "dependencies TEXT"
+                "dependencies TEXT",
+                "mcp_server_url TEXT"
             ]
         )
         if project_id is not None:
@@ -41,7 +43,7 @@ class ProjectManager:
             return
         row = self.projects_table.select_from(
             conditions={'id': self.project_id},
-            columns=['id', 'project_name', 'description', 'local_git', 'public_git', 'dependencies'],
+            columns=['id', 'project_name', 'description', 'local_git', 'public_git', 'dependencies', 'mcp_server_url'],
             limit=1
         )
         if not row:
@@ -54,6 +56,7 @@ class ProjectManager:
         self.local_git = row[0][3]
         self.public_git = row[0][4]
         self.dependencies = row[0][5]
+        self.mcp_server_url = row[0][6]
         # Keep load() lightweight: file-system scan is an explicit operation.
         log.debug("Загружен проект id=%d, project_name=%s", self.project_id, self.project_name)
 
@@ -100,7 +103,19 @@ class ProjectManager:
             log.excpt("Ошибка получения пути файла %s: %s", file_name, str(e))
             return default / file_name
 
-    def update(self, project_name, description=None, local_git=None, public_git=None, dependencies=None):
+    @staticmethod
+    def normalize_mcp_server_url(url):
+        if url is None:
+            return None
+        val = str(url).strip()
+        if not val:
+            return None
+        if not (val.startswith('http://') or val.startswith('https://')):
+            val = 'http://' + val
+        return val.rstrip('/')
+
+    def update(self, project_name, description=None, local_git=None, public_git=None, dependencies=None, mcp_server_url=None):
+        mcp_server_url = self.normalize_mcp_server_url(mcp_server_url)
         try:
             self.projects_table.update(
                 conditions={'id': self.project_id},
@@ -109,7 +124,8 @@ class ProjectManager:
                     'description': description,
                     'local_git': local_git,
                     'public_git': public_git,
-                    'dependencies': dependencies
+                    'dependencies': dependencies,
+                    'mcp_server_url': mcp_server_url
                 }
             )
             self.project_name = project_name
@@ -117,6 +133,7 @@ class ProjectManager:
             self.local_git = local_git
             self.public_git = public_git
             self.dependencies = dependencies
+            self.mcp_server_url = mcp_server_url
             log.debug("Обновлён проект id=%d, project_name=%s", self.project_id, project_name)
         except Exception as e:
             log.excpt("Ошибка обновления проекта project_id=%d: %s", self.project_id, str(e))
@@ -150,7 +167,8 @@ class ProjectManager:
                 "description TEXT",
                 "local_git TEXT",
                 "public_git TEXT",
-                "dependencies TEXT"
+                "dependencies TEXT",
+                "mcp_server_url TEXT"
             ]
         ).select_from(
             conditions={'id': project_id},
@@ -199,7 +217,8 @@ class ProjectManager:
             'duration_sec': float(duration_sec),
         }
 
-    def create_project(self, project_name, description='', local_git=None, public_git=None, dependencies=None):
+    def create_project(self, project_name, description='', local_git=None, public_git=None, dependencies=None, mcp_server_url=None):
+        mcp_server_url = self.normalize_mcp_server_url(mcp_server_url)
         try:
             project_dir = self.projects_dir / project_name
             project_dir.mkdir(exist_ok=True)
@@ -209,7 +228,8 @@ class ProjectManager:
                     'description': description,
                     'local_git': local_git,
                     'public_git': public_git,
-                    'dependencies': dependencies
+                    'dependencies': dependencies,
+                    'mcp_server_url': mcp_server_url
                 }
             )
             ProjectManager.mark_scan_stale(project_id, reason='project_created')
@@ -221,7 +241,7 @@ class ProjectManager:
 
     def list_projects(self):
         rows = self.projects_table.select_from(
-            columns=['id', 'project_name', 'description', 'local_git', 'public_git', 'dependencies'],
+            columns=['id', 'project_name', 'description', 'local_git', 'public_git', 'dependencies', 'mcp_server_url'],
             conditions="id > 0"
         )
         projects = [
@@ -231,7 +251,8 @@ class ProjectManager:
                 'description': row[2],
                 'local_git': row[3],
                 'public_git': row[4],
-                'dependencies': row[5]
+                'dependencies': row[5],
+                'mcp_server_url': row[6]
             }
             for row in rows
         ]

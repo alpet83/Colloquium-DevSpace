@@ -125,7 +125,19 @@ def _resolve_mcp_auth_token() -> str:
 
 # Resolved once at startup; used by all process-management and docker-control handlers.
 _MCP_AUTH_TOKEN: str = _resolve_mcp_auth_token()
-_MCP_SERVER_URL: str = os.environ.get("MCP_SERVER_URL", "http://localhost:8084")
+_DEFAULT_MCP_SERVER_URL: str = os.environ.get("MCP_SERVER_URL", "http://localhost:8084").rstrip("/")
+_PROJECT_MCP_URL_CACHE: dict[int, str] = {}
+_PROCESS_GUID_TO_MCP_URL: dict[str, str] = {}
+# Active project set by cq_select_project — used as implicit routing default.
+_ACTIVE_PROJECT_ID: int | None = None
+# Optional host-rewrite for Docker-internal URLs when copilot_mcp_tool runs on the host.
+# Set MCP_HOST_REMAP="nginx-router=localhost" in the MCP server env (e.g. mcp.json 'env').
+_MCP_HOST_REMAP: dict[str, str] = {}
+for _mcp_remap_pair in os.environ.get("MCP_HOST_REMAP", "").split(","):
+    if "=" in _mcp_remap_pair:
+        _k, _v = _mcp_remap_pair.split("=", 1)
+        _MCP_HOST_REMAP[_k.strip()] = _v.strip()
+del _mcp_remap_pair, _k, _v  # type: ignore[name-defined]  # only defined if loop ran
 
 
 def _preview_text(text: str, limit: int = 200) -> str:
@@ -155,6 +167,62 @@ def _summarize_arguments(arguments: dict[str, Any]) -> str:
             continue
         parts.append(f"{key}={value!r}")
     return ", ".join(parts)
+
+
+def _normalize_mcp_server_url(url: Any) -> str | None:
+    if url is None:
+        return None
+    val = str(url).strip()
+    if not val:
+        return None
+    if not (val.startswith("http://") or val.startswith("https://")):
+        val = "http://" + val
+    return val.rstrip("/")
+
+
+def _apply_mcp_host_remap(url: str | None) -> str | None:
+    """Rewrite Docker-internal hostnames to host-accessible ones via MCP_HOST_REMAP.
+
+    Example: MCP_HOST_REMAP="nginx-router=localhost" rewrites
+    ``http://nginx-router:8008/mcp/...`` → ``http://localhost:8008/mcp/...``
+    so copilot_mcp_tool running on the host reaches the container via mapped port.
+    """
+    if not url or not _MCP_HOST_REMAP:
+        return url
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host not in _MCP_HOST_REMAP:
+        return url
+    new_host = _MCP_HOST_REMAP[host]
+    port_part = f":{parsed.port}" if parsed.port else ""
+    return parsed._replace(netloc=f"{new_host}{port_part}").geturl()
+
+
+def _cache_project_mcp_urls(projects: list[dict[str, Any]]) -> None:
+    for project in projects:
+        try:
+            pid = int(project.get("id"))
+        except Exception:
+            continue
+        norm = _normalize_mcp_server_url(project.get("mcp_server_url"))
+        _PROJECT_MCP_URL_CACHE[pid] = norm or _DEFAULT_MCP_SERVER_URL
+
+
+async def _resolve_project_mcp_server_url(client: "ColloquiumClient", project_id: int | None) -> str:
+    """Return the MCP server URL for *project_id*, falling back to the active project
+    or the process-level default.  Applies MCP_HOST_REMAP so the URL is always
+    reachable from wherever this script is running.
+    """
+    effective_id = project_id if project_id is not None else _ACTIVE_PROJECT_ID
+    if effective_id is None:
+        return _apply_mcp_host_remap(_DEFAULT_MCP_SERVER_URL) or _DEFAULT_MCP_SERVER_URL
+    cached = _PROJECT_MCP_URL_CACHE.get(effective_id)
+    if cached:
+        return _apply_mcp_host_remap(cached) or cached
+    projects = await client.list_projects()
+    _cache_project_mcp_urls(projects)
+    url = _PROJECT_MCP_URL_CACHE.get(effective_id, _DEFAULT_MCP_SERVER_URL)
+    return _apply_mcp_host_remap(url) or url
 
 # ---------------------------------------------------------------------------
 # Colloquium HTTP client
@@ -1314,6 +1382,10 @@ TOOLS: list[Tool] = [
         inputSchema={
             "type": "object",
             "properties": {
+                "project_id": {
+                    "type": "integer",
+                    "description": "Optional project ID; when set, route I/O to this project's mcp_server_url.",
+                },
                 "process_guid": {
                     "type": "string",
                     "description": "Process GUID (returned by cq_process_spawn).",
@@ -1344,6 +1416,10 @@ TOOLS: list[Tool] = [
         inputSchema={
             "type": "object",
             "properties": {
+                "project_id": {
+                    "type": "integer",
+                    "description": "Optional project ID; when set, route signal to this project's mcp_server_url.",
+                },
                 "process_guid": {
                     "type": "string",
                     "description": "Process GUID to terminate.",
@@ -1366,6 +1442,10 @@ TOOLS: list[Tool] = [
         inputSchema={
             "type": "object",
             "properties": {
+                "project_id": {
+                    "type": "integer",
+                    "description": "Optional project ID; when set, query this project's mcp_server_url.",
+                },
                 "process_guid": {
                     "type": "string",
                     "description": "Process GUID to query.",
@@ -1418,6 +1498,10 @@ TOOLS: list[Tool] = [
         inputSchema={
             "type": "object",
             "properties": {
+                "project_id": {
+                    "type": "integer",
+                    "description": "Optional project ID; when set, wait via this project's mcp_server_url.",
+                },
                 "process_guid": {
                     "type": "string",
                     "description": "Process GUID to wait for.",
@@ -2296,13 +2380,23 @@ async def run_server(client: ColloquiumClient) -> None:
             # ---- list projects ----
             elif name == "cq_list_projects":
                 projects = await client.list_projects()
+                _cache_project_mcp_urls(projects)
                 return _json_text(projects)
 
             # ---- select project ----
             elif name == "cq_select_project":
+                global _ACTIVE_PROJECT_ID
                 project_id = int(arguments["project_id"])
                 result = await client.select_project(project_id)
-                return _text(f"Project {project_id} selected: {result}")
+                _ACTIVE_PROJECT_ID = project_id
+                # Warm URL cache so subsequent cq_process_spawn/cq_exec route correctly.
+                if project_id not in _PROJECT_MCP_URL_CACHE:
+                    projects_list = await client.list_projects()
+                    _cache_project_mcp_urls(projects_list)
+                mcp_url = _apply_mcp_host_remap(
+                    _PROJECT_MCP_URL_CACHE.get(project_id, _DEFAULT_MCP_SERVER_URL)
+                )
+                return _text(f"Project {project_id} selected: {result}\nmcp_server_url: {mcp_url}")
 
             # ---- list files ----
             elif name == "cq_list_files":
@@ -2865,9 +2959,10 @@ async def run_server(client: ColloquiumClient) -> None:
                 cwd = arguments.get("cwd")
                 env = arguments.get("env")
                 timeout = int(arguments.get("timeout", 3600))
+                mcp_server_url = await _resolve_project_mcp_server_url(client, project_id)
                 
                 resp = await httpx.AsyncClient().post(
-                    f"{_MCP_SERVER_URL}/process/spawn",
+                    f"{mcp_server_url}/process/spawn",
                     json={
                         "project_id": project_id,
                         "command": command,
@@ -2880,7 +2975,11 @@ async def run_server(client: ColloquiumClient) -> None:
                     timeout=30.0,
                 )
                 resp.raise_for_status()
-                return _json_text(resp.json())
+                result = resp.json()
+                process_guid = str(result.get("process_guid") or "")
+                if process_guid:
+                    _PROCESS_GUID_TO_MCP_URL[process_guid] = mcp_server_url
+                return _json_text(result)
 
             elif name == "cq_process_io":
                 process_guid = str(arguments.get("process_guid") or "")
@@ -2889,9 +2988,14 @@ async def run_server(client: ColloquiumClient) -> None:
                 input_data = arguments.get("input")
                 read_timeout_ms = int(arguments.get("read_timeout_ms", 5000))
                 max_bytes = int(arguments.get("max_bytes", 65536))
+                project_id = arguments.get("project_id")
+                if project_id is not None:
+                    mcp_server_url = await _resolve_project_mcp_server_url(client, int(project_id))
+                else:
+                    mcp_server_url = _PROCESS_GUID_TO_MCP_URL.get(process_guid, _DEFAULT_MCP_SERVER_URL)
                 
                 resp = await httpx.AsyncClient().post(
-                    f"{_MCP_SERVER_URL}/process/io",
+                    f"{mcp_server_url}/process/io",
                     json={
                         "process_guid": process_guid,
                         "input": input_data,
@@ -2921,9 +3025,14 @@ async def run_server(client: ColloquiumClient) -> None:
                 if not process_guid:
                     return _text("Missing required argument: process_guid")
                 signal_name = str(arguments.get("signal", "SIGTERM"))
+                project_id = arguments.get("project_id")
+                if project_id is not None:
+                    mcp_server_url = await _resolve_project_mcp_server_url(client, int(project_id))
+                else:
+                    mcp_server_url = _PROCESS_GUID_TO_MCP_URL.get(process_guid, _DEFAULT_MCP_SERVER_URL)
                 
                 resp = await httpx.AsyncClient().post(
-                    f"{_MCP_SERVER_URL}/process/kill",
+                    f"{mcp_server_url}/process/kill",
                     json={
                         "process_guid": process_guid,
                         "signal": signal_name,
@@ -2932,6 +3041,7 @@ async def run_server(client: ColloquiumClient) -> None:
                     timeout=30.0,
                 )
                 resp.raise_for_status()
+                _PROCESS_GUID_TO_MCP_URL.pop(process_guid, None)
                 return _json_text(resp.json())
 
             elif name == "cq_project_status":
@@ -2943,9 +3053,14 @@ async def run_server(client: ColloquiumClient) -> None:
                 process_guid = str(arguments.get("process_guid") or "")
                 if not process_guid:
                     return _text("Missing required argument: process_guid")
+                project_id = arguments.get("project_id")
+                if project_id is not None:
+                    mcp_server_url = await _resolve_project_mcp_server_url(client, int(project_id))
+                else:
+                    mcp_server_url = _PROCESS_GUID_TO_MCP_URL.get(process_guid, _DEFAULT_MCP_SERVER_URL)
                 
                 resp = await httpx.AsyncClient().get(
-                    f"{_MCP_SERVER_URL}/process/status",
+                    f"{mcp_server_url}/process/status",
                     params={"process_guid": process_guid},
                     headers={"Authorization": f"Bearer {_MCP_AUTH_TOKEN}"},
                     timeout=30.0,
@@ -2959,9 +3074,12 @@ async def run_server(client: ColloquiumClient) -> None:
                 params = {}
                 if project_id:
                     params["project_id"] = int(project_id)
+                    mcp_server_url = await _resolve_project_mcp_server_url(client, int(project_id))
+                else:
+                    mcp_server_url = _DEFAULT_MCP_SERVER_URL
                 
                 resp = await httpx.AsyncClient().get(
-                    f"{_MCP_SERVER_URL}/process/list",
+                    f"{mcp_server_url}/process/list",
                     params=params,
                     headers={"Authorization": f"Bearer {_MCP_AUTH_TOKEN}"},
                     timeout=30.0,
@@ -2975,9 +3093,14 @@ async def run_server(client: ColloquiumClient) -> None:
                     return _text("Missing required argument: process_guid")
                 wait_timeout_ms = int(arguments.get("wait_timeout_ms", 30000))
                 wait_condition = str(arguments.get("wait_condition", "any_output"))
+                project_id = arguments.get("project_id")
+                if project_id is not None:
+                    mcp_server_url = await _resolve_project_mcp_server_url(client, int(project_id))
+                else:
+                    mcp_server_url = _PROCESS_GUID_TO_MCP_URL.get(process_guid, _DEFAULT_MCP_SERVER_URL)
                 
                 resp = await httpx.AsyncClient().post(
-                    f"{_MCP_SERVER_URL}/process/wait",
+                    f"{mcp_server_url}/process/wait",
                     json={
                         "process_guid": process_guid,
                         "wait_timeout_ms": wait_timeout_ms,

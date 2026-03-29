@@ -439,10 +439,11 @@ async def create_project(request: Request):
         local_git = data.get('local_git')
         public_git = data.get('public_git')
         dependencies = data.get('dependencies')
+        mcp_server_url = data.get('mcp_server_url')
         if not project_name:
             log.info(g.with_session_tag(request, "Неверный параметр project_name=%s для IP=%s"), str(project_name), request.client.host)
             raise HTTPException(status_code=400, detail="Missing project_name")
-        project_id = g.project_manager.create_project(project_name, description, local_git, public_git, dependencies)
+        project_id = g.project_manager.create_project(project_name, description, local_git, public_git, dependencies, mcp_server_url)
         log.debug(g.with_session_tag(request, "Создан проект project_id=%d, project_name=%s для user_id=%d"), project_id, project_name, user_id)
         return {"project_id": project_id}
     except HTTPException as e:
@@ -474,6 +475,7 @@ async def update_project(request: Request):
         local_git = data.get('local_git')
         public_git = data.get('public_git')
         dependencies = data.get('dependencies')
+        mcp_server_url = data.get('mcp_server_url')
         if not project_id or not project_name:
             log.info(g.with_session_tag(request, "Неверные параметры project_id=%s, project_name=%s для IP=%s"),
                      str(project_id), str(project_name), request.client.host)
@@ -481,7 +483,7 @@ async def update_project(request: Request):
         project_manager = ProjectManager.get(project_id)
         if project_manager is None:
             raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
-        project_manager.update(project_name, description, local_git, public_git, dependencies)
+        project_manager.update(project_name, description, local_git, public_git, dependencies, mcp_server_url)
         log.debug(g.with_session_tag(request, "Обновлён проект project_id=%d, project_name=%s для user_id=%d"), project_id, project_name, user_id)
         return {"status": "Project updated"}
     except HTTPException as e:
