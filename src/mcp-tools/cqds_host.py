@@ -61,6 +61,19 @@ def _host_tail_text(acc: bytearray, max_bytes: int) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def _lookup_host_proc(
+    arguments: dict[str, Any], registry: dict[str, HostProcRecord]
+) -> tuple[str, HostProcRecord]:
+    """Extract process_guid and look up its record. Raises ValueError on missing/unknown guid."""
+    guid = str(arguments.get("process_guid") or "")
+    if not guid:
+        raise ValueError("Missing required argument: process_guid")
+    rec = registry.get(guid)
+    if not rec:
+        raise ValueError(f"Unknown process_guid: {guid}")
+    return guid, rec
+
+
 TOOLS: list[Tool] = [
     Tool(
         name="cq_host_process_spawn",
@@ -205,12 +218,7 @@ async def handle(name: str, arguments: dict[str, Any], ctx: RunContext) -> CallT
         return _json_text({"process_guid": guid, "pid": proc.pid, "command": desc, "timeout": timeout_sec})
 
     if name == "cq_host_process_io":
-        process_guid = str(arguments.get("process_guid") or "")
-        if not process_guid:
-            return _text("Missing required argument: process_guid")
-        rec = host_proc_registry.get(process_guid)
-        if not rec:
-            return _text("Unknown process_guid")
+        _, rec = _lookup_host_proc(arguments, host_proc_registry)
         inp = arguments.get("input")
         if inp is not None and rec.proc.stdin:
             try:
@@ -241,12 +249,7 @@ async def handle(name: str, arguments: dict[str, Any], ctx: RunContext) -> CallT
         )
 
     if name == "cq_host_process_kill":
-        process_guid = str(arguments.get("process_guid") or "")
-        if not process_guid:
-            return _text("Missing required argument: process_guid")
-        rec = host_proc_registry.get(process_guid)
-        if not rec:
-            return _text("Unknown process_guid")
+        process_guid, rec = _lookup_host_proc(arguments, host_proc_registry)
         signal_name = str(arguments.get("signal", "SIGTERM"))
         if rec.ttl_task and not rec.ttl_task.done():
             rec.ttl_task.cancel()
@@ -275,12 +278,7 @@ async def handle(name: str, arguments: dict[str, Any], ctx: RunContext) -> CallT
         return _json_text({"stopped": True, "returncode": rec.proc.returncode})
 
     if name == "cq_host_process_status":
-        process_guid = str(arguments.get("process_guid") or "")
-        if not process_guid:
-            return _text("Missing required argument: process_guid")
-        rec = host_proc_registry.get(process_guid)
-        if not rec:
-            return _text("Unknown process_guid")
+        _, rec = _lookup_host_proc(arguments, host_proc_registry)
         alive = rec.proc.returncode is None
         runtime_ms = int((time.monotonic() - rec.started) * 1000)
         return _json_text(
@@ -308,12 +306,7 @@ async def handle(name: str, arguments: dict[str, Any], ctx: RunContext) -> CallT
         return _json_text({"processes": items, "count": len(items)})
 
     if name == "cq_host_process_wait":
-        process_guid = str(arguments.get("process_guid") or "")
-        if not process_guid:
-            return _text("Missing required argument: process_guid")
-        rec = host_proc_registry.get(process_guid)
-        if not rec:
-            return _text("Unknown process_guid")
+        _, rec = _lookup_host_proc(arguments, host_proc_registry)
         wait_ms = max(0, int(arguments.get("wait_timeout_ms", 30000)))
         condition = str(arguments.get("wait_condition", "any_output"))
         baseline = len(rec.stdout_acc) + len(rec.stderr_acc)
