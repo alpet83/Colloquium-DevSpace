@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -113,6 +114,33 @@ def _resolve_bash() -> str:
     return "/bin/bash"
 
 
+async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
+    if proc.returncode is not None:
+        return
+
+    if sys.platform == "win32":
+        try:
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill",
+                "/PID",
+                str(proc.pid),
+                "/T",
+                "/F",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await killer.wait()
+        except Exception:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+    else:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(proc.wait(), timeout=5)
+
+
 TOOLS: list[Tool] = [
     Tool(
         name="gitbash_exec",
@@ -198,19 +226,24 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
         env=os.environ.copy(),
     )
 
+    timeout_event = asyncio.Event()
+
+    async def timeout_watchdog() -> None:
+        await asyncio.sleep(timeout_sec)
+        if proc.returncode is None:
+            timeout_event.set()
+            await _kill_process_tree(proc)
+
+    watchdog_task = asyncio.create_task(timeout_watchdog(), name="gitbash-timeout-watchdog")
+
     timed_out = False
     try:
-        stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(input=stdin_bytes),
-            timeout=timeout_sec,
-        )
-    except asyncio.TimeoutError:
-        timed_out = True
-        proc.kill()
-        try:
-            stdout_b, stderr_b = await proc.communicate()
-        except Exception:
-            stdout_b, stderr_b = b"", b""
+        stdout_b, stderr_b = await proc.communicate(input=stdin_bytes)
+        timed_out = timeout_event.is_set()
+    finally:
+        watchdog_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watchdog_task
 
     exit_code = proc.returncode
     if exit_code is None:

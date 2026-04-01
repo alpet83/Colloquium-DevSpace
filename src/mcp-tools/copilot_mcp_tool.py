@@ -15,6 +15,7 @@ from mcp.server.stdio import stdio_server  # type: ignore[import]
 from mcp.types import CallToolResult, Tool  # type: ignore[import]
 
 import cqds_chat
+import cqds_credentials as cq_cred
 import cqds_docker
 import cqds_exec
 import cqds_files
@@ -156,38 +157,6 @@ async def run_server(client: ColloquiumClient) -> None:
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
-def _read_password_file(password_file: str) -> str:
-    try:
-        with open(password_file, "r", encoding="utf-8") as handle:
-            password = handle.read().strip()
-    except OSError as exc:
-        raise RuntimeError(f"Failed to read password file '{password_file}': {exc}") from exc
-    if not password:
-        raise RuntimeError(f"Password file '{password_file}' is empty")
-    return password
-
-
-def _resolve_password(cli_password: str | None, cli_password_file: str | None) -> tuple[str, str]:
-    if cli_password:
-        return cli_password, "--password"
-    if cli_password_file:
-        return _read_password_file(cli_password_file), "--password-file"
-
-    env_password = os.environ.get("COLLOQUIUM_PASSWORD")
-    if env_password:
-        return env_password, "COLLOQUIUM_PASSWORD"
-
-    env_password_file = os.environ.get("COLLOQUIUM_PASSWORD_FILE")
-    if env_password_file:
-        return _read_password_file(env_password_file), "COLLOQUIUM_PASSWORD_FILE"
-
-    sidecar_secret = os.path.join(os.path.dirname(os.path.abspath(__file__)), "copilot_mcp_tool.secret")
-    if os.path.isfile(sidecar_secret):
-        return _read_password_file(sidecar_secret), "copilot_mcp_tool.secret"
-
-    return "devspace", "default"
-
-
 def _password_preview(password: str) -> str:
     if not password:
         return "<empty>"
@@ -241,7 +210,7 @@ def main() -> None:
     log_file = _setup_logging()
     LOGGER.info("MCP tool start url=%s username=%s pid=%s", args.url, args.username, os.getpid())
 
-    password, password_source = _resolve_password(args.password, args.password_file)
+    password, password_source = cq_cred.resolve_password(args.password, args.password_file)
     if not password:
         print(
             "ERROR: Colloquium password is required. "

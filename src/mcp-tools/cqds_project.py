@@ -14,15 +14,65 @@ from cqds_client import (
     set_active_project_id,
 )
 from cqds_helpers import _json_text, _text
+from cqds_host_grep_jobs import host_grep_poll_hint_sec, take_host_grep_snapshot
+from cqds_result_pages import (
+    DEFAULT_PAGE_SIZE,
+    extra_result_page,
+    finalize_smart_grep_response,
+    get_page_store,
+)
 from cqds_run_ctx import RunContext
 
 
 TOOLS: list[Tool] = [
     Tool(
+        name="cq_fetch_result",
+        description=(
+            "Три режима (ровно один на вызов): "
+            "(1) Пейджинг MCP — paging.handle из cq_start_grep; page_index 0 — первая страница из кэша. "
+            "(2) Следующий stateless-чанк — chunk_continuation из cq_start_grep/cq_fetch_result (пока scan_complete=false). "
+            "(3) host_fs async — host_grep_job_id из cq_start_grep с host_async=true; периодически опрашивать (hint host_grep_poll_hint_sec). "
+            "TTL page-store: после scan_complete — ~30 мин; истёкший job → unknown_or_expired_host_grep_job."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "handle": {
+                    "type": "string",
+                    "description": "Opaque handle из cq_start_grep → paging.handle (режим пейджинга по hits).",
+                },
+                "chunk_continuation": {
+                    "type": "object",
+                    "description": "Объект из поля chunk_continuation предыдущего ответа (следующий POST smart_grep/chunk).",
+                },
+                "page_index": {
+                    "type": "integer",
+                    "description": "0-based page index для handle (0 = первая страница как в inline hits).",
+                    "default": 1,
+                },
+                "page_size": {
+                    "type": "integer",
+                    "description": "Hits per page для handle (1..500).",
+                    "default": DEFAULT_PAGE_SIZE,
+                },
+                "max_returned_items": {
+                    "type": "integer",
+                    "description": "Для chunk_continuation и host_grep_job_id: сколько hits в ответе (1..500), остальное в paging.",
+                    "default": DEFAULT_PAGE_SIZE,
+                },
+                "host_grep_job_id": {
+                    "type": "string",
+                    "description": "ID фонового host_fs-поиска (cq_start_grep с host_async=true).",
+                },
+            },
+            "required": [],
+        },
+    ),
+    Tool(
         name="cq_list_projects",
         description=(
             "List all projects registered in Colloquium-DevSpace with id and metadata. "
-            "Typical first step before cq_select_project, cq_exec, cq_smart_grep, or cq_list_files."
+            "Typical first step before cq_select_project, cq_exec, cq_start_grep, or cq_list_files."
         ),
         inputSchema={"type": "object", "properties": {}, "required": []},
     ),
@@ -122,6 +172,88 @@ TOOLS: list[Tool] = [
 
 async def handle(name: str, arguments: dict[str, Any], ctx: RunContext) -> CallToolResult | None:
     client = ctx.client
+
+    if name == "cq_fetch_result":
+        chunk_cont = arguments.get("chunk_continuation")
+        if chunk_cont is not None:
+            if not isinstance(chunk_cont, dict):
+                raise ValueError("chunk_continuation must be an object")
+            max_returned = max(1, min(int(arguments.get("max_returned_items", DEFAULT_PAGE_SIZE)), 500))
+            p_req = dict(chunk_cont)
+            chunk = await client.smart_grep_chunk_stable(p_req)
+            search_mode_label = str(chunk_cont.get("search_mode", "project_registered"))
+            next_cont: dict[str, Any] | None = None
+            if not bool(chunk.get("scan_complete")):
+                next_cont = {
+                    **dict(chunk_cont),
+                    "index_epoch": int(chunk.get("index_epoch", p_req.get("index_epoch", 0))),
+                    "offset": int(chunk.get("next_offset", 0)),
+                    "search_mode": "project_registered",
+                }
+            for_finalize = {**chunk, "search_mode": search_mode_label}
+            out = await finalize_smart_grep_response(
+                for_finalize,
+                page_size=max_returned,
+                store=get_page_store(),
+                source_tool="cq_start_grep",
+                scan_complete=bool(chunk.get("scan_complete")),
+            )
+            if next_cont is not None:
+                out["chunk_continuation"] = next_cont
+            return _json_text(out)
+
+        host_jid = str(arguments.get("host_grep_job_id") or "").strip()
+        if host_jid:
+            max_returned = max(1, min(int(arguments.get("max_returned_items", DEFAULT_PAGE_SIZE)), 500))
+            snap = await take_host_grep_snapshot(host_jid)
+            if snap is None:
+                return _json_text(
+                    {
+                        "status": "error",
+                        "error": "unknown_or_expired_host_grep_job",
+                        "host_grep_job_id": host_jid,
+                    }
+                )
+            scan_done = bool(snap["scan_complete"])
+            for_finalize: dict[str, Any] = {
+                "status": "ok",
+                "search_mode": "host_fs",
+                "engine": snap["engine"],
+                "host_path": snap["host_path"],
+                "mode": snap["mode"],
+                "profile": snap["profile"],
+                "query": snap["query"],
+                "is_regex": snap["is_regex"],
+                "case_sensitive": snap["case_sensitive"],
+                "hits": snap["hits"],
+                "total": len(snap["hits"]),
+                "truncated": snap["truncated"],
+                "scan_complete": scan_done,
+                "host_grep_job_id": snap["job_id"],
+                "host_grep_snapshot_seq": snap["snapshot_seq"],
+                "host_grep_poll_hint_sec": host_grep_poll_hint_sec(),
+            }
+            if snap.get("error"):
+                for_finalize["status"] = "error"
+                for_finalize["host_grep_error"] = snap["error"]
+            out = await finalize_smart_grep_response(
+                for_finalize,
+                page_size=max_returned,
+                store=get_page_store(),
+                source_tool="cq_start_grep",
+                scan_complete=scan_done,
+            )
+            return _json_text(out)
+
+        handle_id = str(arguments.get("handle") or "").strip()
+        if not handle_id:
+            raise ValueError(
+                "cq_fetch_result: укажите ровно один из: handle | chunk_continuation | host_grep_job_id"
+            )
+        page_index = int(arguments.get("page_index", 1))
+        page_size = int(arguments.get("page_size", DEFAULT_PAGE_SIZE))
+        data = await extra_result_page(handle_id, page_index, page_size, get_page_store())
+        return _json_text(data)
 
     if name == "cq_list_projects":
         projects = await client.list_projects()

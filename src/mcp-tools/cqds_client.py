@@ -366,6 +366,7 @@ class ColloquiumClient:
         max_results: int = 100,
         context_lines: int = 0,
         include_glob: list[str] | None = None,
+        search_mode: str = "project_registered",
     ) -> dict:
         """Search occurrences in project file sets via /api/project/smart_grep."""
         await self._ensure_login()
@@ -378,6 +379,7 @@ class ColloquiumClient:
             "case_sensitive": case_sensitive,
             "max_results": max_results,
             "context_lines": context_lines,
+            "search_mode": search_mode,
         }
         if time_strict:
             payload["time_strict"] = time_strict
@@ -386,6 +388,51 @@ class ColloquiumClient:
         resp = await self._client.post("/api/project/smart_grep", json=payload)
         resp.raise_for_status()
         return resp.json()
+
+    async def get_project_index_meta(self, project_id: int) -> dict:
+        """GET /api/project/{id}/index_meta → index_epoch для stateless-чанков."""
+        await self._ensure_login()
+        resp = await self._client.get(f"/api/project/{project_id}/index_meta")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def smart_grep_chunk(self, payload: dict[str, Any]) -> tuple[int, Any]:
+        """POST /api/project/smart_grep/chunk; возвращает (status_code, body dict или текст ошибки)."""
+        await self._ensure_login()
+        resp = await self._client.post(
+            "/api/project/smart_grep/chunk",
+            json=payload,
+            timeout=httpx.Timeout(120.0),
+        )
+        try:
+            body: Any = resp.json()
+        except Exception:
+            body = {"detail": resp.text[:4000]}
+        return resp.status_code, body
+
+    async def smart_grep_chunk_stable(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Вызов chunk с повтором при 409 stale_index_epoch (offset→0, search_mode→project_registered)."""
+        p: dict[str, Any] = dict(payload)
+        project_id = int(p["project_id"])
+        for _ in range(16):
+            status, body = await self.smart_grep_chunk(p)
+            if status == 200 and isinstance(body, dict) and body.get("status") == "ok":
+                return body
+            if status == 409 and isinstance(body, dict):
+                detail = body.get("detail")
+                cur: Any = None
+                if isinstance(detail, dict):
+                    cur = detail.get("current_epoch")
+                if cur is None:
+                    meta = await self.get_project_index_meta(project_id)
+                    cur = meta.get("index_epoch")
+                p["index_epoch"] = int(cur)
+                p["offset"] = 0
+                p["search_mode"] = "project_registered"
+                continue
+            msg = body if not isinstance(body, dict) else body.get("detail", body)
+            raise RuntimeError(f"smart_grep_chunk failed: HTTP {status}: {msg}")
+        raise RuntimeError("smart_grep_chunk: too many 409 retries")
 
     async def replace_file(
         self,

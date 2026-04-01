@@ -12,6 +12,9 @@ from typing import Any
 import httpx  # type: ignore[import]
 from mcp.types import CallToolResult, Tool  # type: ignore[import]
 
+from cqds_host_grep_jobs import host_grep_poll_hint_sec, start_host_grep_job
+from cqds_smart_grep_host import smart_grep_host_fs
+
 from cqds_helpers import (
     _build_file_tree_from_index,
     _file_id_to_name_map,
@@ -25,6 +28,7 @@ from cqds_helpers import (
     _xml_undo,
 )
 from cqds_run_ctx import RunContext
+from cqds_result_pages import DEFAULT_SCAN_HIT_CAP, finalize_smart_grep_response, get_page_store
 
 
 TOOLS: list[Tool] = [
@@ -184,7 +188,7 @@ TOOLS: list[Tool] = [
                 "patterns": {"type": "array", "items": {"type": "string"}, "description": "Regex patterns (OR). Alternatively pass a single string via 'pattern'."},
                 "pattern": {"type": "string", "description": "Single regex pattern (convenience if only one). Ignored if patterns is non-empty."},
                 "match_field": {"type": "string", "description": "Which field to match: name | parent | qualified (parent::name, or name if no parent).", "default": "name"},
-                "entity_types": {"type": "array", "items": {"type": "string"}, "description": "Optional whitelist of entity type strings (e.g. function, class, method). Omit for all types."},
+                "entity_types": {"type": "array", "items": {"type": "string"}, "description": "Optional whitelist of entity type strings (e.g. function, class, method, interface, trait, enum). Omit for all types."},
                 "is_regex": {"type": "boolean", "description": "If false, patterns are literal substrings (escaped).", "default": True},
                 "case_sensitive": {"type": "boolean", "description": "Regex case sensitivity (default false).", "default": False},
                 "max_results": {"type": "integer", "description": "Cap on returned matches (1..500, default 100).", "default": 100},
@@ -211,27 +215,92 @@ TOOLS: list[Tool] = [
         },
     ),
     Tool(
-        name="cq_smart_grep",
+        name="cq_start_grep",
         description=(
-            "Search text or regex in predefined project file sets (code/logs/docs/all) on the CQDS project tree in one call. "
-            "Prefer this over running grep/find in the IDE terminal on Windows when the task targets Colloquium-attached sources. "
-            "Direct call — no LLM chat loop."
+            "Текстовый / regex-поиск с выбором режима на запрос.\n"
+            "• search_mode=host_fs — каталог на машине MCP (host_path), без HTTP к Colloquium; "
+            "если в PATH есть ripgrep (rg), используется он, иначе многопоточный обход файлов на Python.\n"
+            "  host_async=true (только host_fs): фоновая задача читает stdout rg с тиками (см. CQDS_HOST_GREP_POLL_SEC, по умолчанию 5 с); "
+            "cq_fetch_result с host_grep_job_id возвращает накопленные hits до scan_complete (аналогично polling cq_host_process_io, но с разбором JSON rg).\n"
+            "• search_mode=project_registered / project_refresh — первый шаг через POST /api/project/smart_grep/chunk "
+            "(stateless): в ответе поле chunk_continuation для следующего чанка → инструмент cq_fetch_result.\n"
+            "  project_refresh допускается только с offset=0 (скан в ядре один раз).\n"
+            "Пресеты mode / profile / include_glob как у серверного smart_grep; на host_fs фильтрация на хосте.\n"
+            "Много попаданий в одном чанке: при hits > max_returned_items первая страница в ответе, хвост — "
+            "cq_fetch_result с paging.handle. max_results — верхняя граница max_hits в чанке и лимит host_fs (scan_hit_cap)."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "project_id": {"type": "integer", "description": "Project ID."},
-                "query": {"type": "string", "description": "Text or regex pattern to find."},
-                "mode": {"type": "string", "description": "File set preset: code | logs | docs | all (default: code).", "default": "code"},
-                "profile": {"type": "string", "description": "Focus profile: all | backend | frontend | docs | infra | tests | logs (default: all).", "default": "all"},
-                "time_strict": {"type": "string", "description": "Optional time filter, e.g. 'mtime>2026-03-25', 'mtime>=2026-03-25 21:00', 'ctime>1711390800'."},
-                "is_regex": {"type": "boolean", "description": "Interpret query as regex.", "default": False},
-                "case_sensitive": {"type": "boolean", "description": "Case-sensitive search.", "default": False},
-                "max_results": {"type": "integer", "description": "Maximum returned matches (1..500).", "default": 100},
-                "context_lines": {"type": "integer", "description": "Context lines before/after match (0..3).", "default": 0},
-                "include_glob": {"type": "array", "items": {"type": "string"}, "description": "Optional extra path globs to narrow search, e.g. ['src/**/*.py']."},
+                "search_mode": {
+                    "type": "string",
+                    "enum": ["host_fs", "project_registered", "project_refresh"],
+                    "description": "host_fs | project_registered | project_refresh",
+                    "default": "project_registered",
+                },
+                "host_path": {
+                    "type": "string",
+                    "description": "Абсолютный или пользовательский путь к папке на хосте MCP; обязателен для search_mode=host_fs.",
+                },
+                "host_timeout_sec": {
+                    "type": "integer",
+                    "description": "Таймаут ripgrep для host_fs (5..600, по умолчанию 120).",
+                    "default": 120,
+                },
+                "host_workers": {
+                    "type": "integer",
+                    "description": "Число потоков для Python-fallback на host_fs (1..32, по умолчанию 8).",
+                    "default": 8,
+                },
+                "host_async": {
+                    "type": "boolean",
+                    "description": "Только host_fs: не блокировать MCP — запустить rg в фоне; опрос через cq_fetch_result + host_grep_job_id.",
+                    "default": False,
+                },
+                "project_id": {
+                    "type": "integer",
+                    "description": "ID проекта CQDS; обязателен для project_registered и project_refresh.",
+                },
+                "path_prefix": {
+                    "type": "string",
+                    "description": "Подкаталог проекта (POSIX, без ведущего /), пусто — весь проект; только API-режимы.",
+                    "default": "",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Смещение в списке file_id для чанка (обычно 0; продолжение — через cq_fetch_result).",
+                    "default": 0,
+                },
+                "limit_files": {
+                    "type": "integer",
+                    "description": "Сколько файлов обработать за один чанок (сервер ограничивает верх).",
+                    "default": 50,
+                },
+                "query": {"type": "string", "description": "Строка или regex (если is_regex=true)."},
+                "mode": {"type": "string", "description": "Набор файлов: code | logs | docs | all (default: code).", "default": "code"},
+                "profile": {"type": "string", "description": "Профиль путей: all | backend | frontend | docs | infra | tests | logs (default: all).", "default": "all"},
+                "time_strict": {"type": "string", "description": "Фильтр по времени (только API-режимы), напр. mtime>2026-03-25."},
+                "is_regex": {"type": "boolean", "description": "Интерпретировать query как regex.", "default": False},
+                "case_sensitive": {"type": "boolean", "description": "Учёт регистра.", "default": False},
+                "max_results": {
+                    "type": "integer",
+                    "description": "max_hits в одном чанке / лимит host_fs; не больше scan_hit_cap (1..10000).",
+                    "default": 100,
+                },
+                "scan_hit_cap": {
+                    "type": "integer",
+                    "description": "Жёсткий потолок совпадений для одного запроса (1..10000, по умолчанию 10000).",
+                    "default": 10000,
+                },
+                "max_returned_items": {
+                    "type": "integer",
+                    "description": "Сколько попаданий отдать в ответе MCP; при превышении — кэш и cq_fetch_result (1..500).",
+                    "default": 100,
+                },
+                "context_lines": {"type": "integer", "description": "Строк контекста до/после (0..3).", "default": 0},
+                "include_glob": {"type": "array", "items": {"type": "string"}, "description": "Доп. glob путей, напр. ['src/**/*.py']."},
             },
-            "required": ["project_id", "query"],
+            "required": ["query"],
         },
     ),
     Tool(
@@ -501,30 +570,160 @@ async def handle(name: str, arguments: dict[str, Any], ctx: RunContext) -> CallT
         content = await client.read_file(file_id)
         return _text(content)
 
-    if name == "cq_smart_grep":
-        project_id = int(arguments["project_id"])
-        query = str(arguments["query"])
+    if name == "cq_start_grep":
+        query = str(arguments.get("query") or "").strip()
+        if not query:
+            raise ValueError("cq_start_grep: query must be non-empty")
+        search_mode = str(arguments.get("search_mode", "project_registered") or "project_registered").strip().lower()
         mode = str(arguments.get("mode", "code"))
         profile = str(arguments.get("profile", "all"))
-        time_strict = arguments.get("time_strict")
         is_regex = bool(arguments.get("is_regex", False))
         case_sensitive = bool(arguments.get("case_sensitive", False))
-        max_results = int(arguments.get("max_results", 100))
-        context_lines = int(arguments.get("context_lines", 0))
+        scan_hit_cap = max(1, min(int(arguments.get("scan_hit_cap", DEFAULT_SCAN_HIT_CAP)), DEFAULT_SCAN_HIT_CAP))
+        max_returned = max(1, min(int(arguments.get("max_returned_items", 100)), 500))
+        max_hits = max(1, min(int(arguments.get("max_results", 100)), scan_hit_cap))
+        context_lines = min(max(int(arguments.get("context_lines", 0)), 0), 3)
         include_glob = arguments.get("include_glob")
-        result = await client.smart_grep(
-            project_id=project_id,
-            query=query,
-            mode=mode,
-            profile=profile,
-            time_strict=str(time_strict) if time_strict is not None else None,
-            is_regex=is_regex,
-            case_sensitive=case_sensitive,
-            max_results=max_results,
-            context_lines=context_lines,
-            include_glob=include_glob,
+        if include_glob is not None and not isinstance(include_glob, list):
+            raise ValueError("include_glob must be an array of strings or omitted")
+
+        if search_mode == "host_fs":
+            host_path = str(arguments.get("host_path") or "").strip()
+            if not host_path:
+                raise ValueError("cq_start_grep host_fs requires host_path")
+            timeout_sec = max(5, min(int(arguments.get("host_timeout_sec", 120)), 600))
+            workers = max(1, min(int(arguments.get("host_workers", 8)), 32))
+            if bool(arguments.get("host_async", False)):
+                job_id = await start_host_grep_job(
+                    host_path,
+                    query,
+                    mode=mode,
+                    profile=profile,
+                    include_glob=include_glob,
+                    is_regex=is_regex,
+                    case_sensitive=case_sensitive,
+                    max_results=max_hits,
+                    context_lines=context_lines,
+                    timeout_sec=timeout_sec,
+                    workers=workers,
+                    page_size=max_returned,
+                )
+                return _json_text(
+                    {
+                        "status": "ok",
+                        "search_mode": "host_fs",
+                        "host_async": True,
+                        "host_grep_job_id": job_id,
+                        "host_grep_poll_hint_sec": host_grep_poll_hint_sec(),
+                        "scan_complete": False,
+                        "hits": [],
+                        "total": 0,
+                        "truncated": False,
+                        "query": query,
+                        "mode": mode,
+                        "profile": profile,
+                        "is_regex": is_regex,
+                        "case_sensitive": case_sensitive,
+                        "hint": "cq_fetch_result с полем host_grep_job_id; snapshot_seq в ответе меняется при тике poll и при завершении.",
+                    }
+                )
+            result = await smart_grep_host_fs(
+                host_path,
+                query,
+                mode=mode,
+                profile=profile,
+                include_glob=include_glob,
+                is_regex=is_regex,
+                case_sensitive=case_sensitive,
+                max_results=max_hits,
+                context_lines=context_lines,
+                timeout_sec=timeout_sec,
+                workers=workers,
+            )
+            result = await finalize_smart_grep_response(
+                result,
+                page_size=max_returned,
+                store=get_page_store(),
+                source_tool="cq_start_grep",
+                scan_complete=True,
+            )
+            return _json_text(result)
+
+        if search_mode not in ("project_registered", "project_refresh"):
+            raise ValueError(
+                "search_mode must be host_fs, project_registered, or project_refresh"
+            )
+        project_id = arguments.get("project_id")
+        if project_id is None:
+            raise ValueError("project_id is required for project_registered / project_refresh")
+        project_id = int(project_id)
+        time_strict = arguments.get("time_strict")
+        ts_val = str(time_strict).strip() if time_strict is not None else ""
+        path_prefix = str(arguments.get("path_prefix") or "").strip()
+        offset = max(0, int(arguments.get("offset", 0)))
+        limit_files = max(1, int(arguments.get("limit_files", 50)))
+
+        sm = search_mode
+        if offset != 0 and sm == "project_refresh":
+            sm = "project_registered"
+
+        payload: dict[str, Any] = {
+            "project_id": project_id,
+            "path_prefix": path_prefix,
+            "offset": offset,
+            "limit_files": limit_files,
+            "max_hits": max_hits,
+            "query": query,
+            "mode": mode,
+            "profile": profile,
+            "is_regex": is_regex,
+            "case_sensitive": case_sensitive,
+            "context_lines": context_lines,
+            "search_mode": sm,
+        }
+        if ts_val:
+            payload["time_strict"] = ts_val
+        if include_glob:
+            payload["include_glob"] = list(include_glob)
+
+        meta = await client.get_project_index_meta(project_id)
+        payload["index_epoch"] = int(meta.get("index_epoch", 0))
+        chunk = await client.smart_grep_chunk_stable(payload)
+
+        need_more = not bool(chunk.get("scan_complete"))
+        cont: dict[str, Any] | None = None
+        if need_more:
+            cont = {
+                "project_id": project_id,
+                "index_epoch": int(chunk.get("index_epoch", payload["index_epoch"])),
+                "path_prefix": str(chunk.get("path_prefix", path_prefix)),
+                "offset": int(chunk.get("next_offset", 0)),
+                "limit_files": limit_files,
+                "max_hits": max_hits,
+                "query": query,
+                "mode": mode,
+                "profile": profile,
+                "is_regex": is_regex,
+                "case_sensitive": case_sensitive,
+                "context_lines": context_lines,
+                "search_mode": "project_registered",
+            }
+            if ts_val:
+                cont["time_strict"] = ts_val
+            if include_glob:
+                cont["include_glob"] = list(include_glob)
+
+        for_finalize = {**chunk, "search_mode": search_mode}
+        out = await finalize_smart_grep_response(
+            for_finalize,
+            page_size=max_returned,
+            store=get_page_store(),
+            source_tool="cq_start_grep",
+            scan_complete=bool(chunk.get("scan_complete")),
         )
-        return _json_text(result)
+        if cont is not None:
+            out["chunk_continuation"] = cont
+        return _json_text(out)
 
     if name == "cq_grep_logs":
         project_id = int(arguments["project_id"])
