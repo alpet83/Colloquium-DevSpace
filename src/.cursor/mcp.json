@@ -18,22 +18,21 @@
       ],
       "type": "stdio"
     },
-    "cqds": {
+    "cqds_runtime": {
       "command": "C:\\Apps\\Python3\\python.exe",
       "args": [
-        "P:\\opt\\docker\\cqds\\mcp-tools\\copilot_mcp_tool.py",
+        "P:\\opt\\docker\\cqds\\mcp-tools\\runtime\\copilot_mcp_runtime.py",
         "--url",
         "http://localhost:8008",
         "--username",
         "copilot"
       ],
-      "env": {
-        "MCP_AUTH_TOKEN": "Grok-xAI-Agent-The-Best"
-      },
       "type": "stdio",
       "env": {
+        "MCP_AUTH_TOKEN": "Grok-xAI-Agent-The-Best",
         "MCP_HOST_REMAP": "nginx-router=localhost",
-        "CQDS_BASE_URL": "http://localhost:8008"
+        "CQDS_BASE_URL": "http://localhost:8008",
+        "COLLOQUIUM_PASSWORD_FILE": "P:\\opt\\docker\\cqds\\mcp-tools\\copilot_mcp_tool.secret"
       }
     }, 
     "gitbash": {

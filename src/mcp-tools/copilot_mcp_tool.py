@@ -23,7 +23,18 @@ import cqds_host
 import cqds_process
 import cqds_project
 from cqds_client import ColloquiumClient
-from cqds_helpers import CURRENT_TOOL, LOGGER, _index_counts, _setup_logging, _summarize_arguments, _text
+from cqds_mcp_version import print_ident_stderr
+from cqds_helpers import (
+    CURRENT_TOOL,
+    LOGGER,
+    _index_counts,
+    _setup_logging,
+    _summarize_arguments,
+    _text,
+    cq_filter_tools_for_list,
+    cq_hide_tool_names,
+    cq_tool_is_hidden,
+)
 from cqds_run_ctx import RunContext
 
 
@@ -129,7 +140,7 @@ async def run_server(client: ColloquiumClient) -> None:
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
-        return _registered_tools()
+        return cq_filter_tools_for_list(_registered_tools())
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult:
@@ -137,6 +148,10 @@ async def run_server(client: ColloquiumClient) -> None:
         started_at = time.monotonic()
         LOGGER.info("TOOL call start name=%s args=[%s]", name, _summarize_arguments(arguments))
         try:
+            if cq_tool_is_hidden(name):
+                return _text(
+                    f"Tool '{name}' is excluded for this configuration (CQ_HIDE_TOOLS)."
+                )
             for module in MODULE_HANDLERS:
                 delegated = await module.handle(name, arguments, run_ctx)
                 if delegated is not None:
@@ -176,6 +191,7 @@ def main() -> None:
               COLLOQUIUM_USERNAME  Login username                   (default: copilot)
               COLLOQUIUM_PASSWORD  Login password                   (higher priority than file/env file)
               COLLOQUIUM_PASSWORD_FILE  Path to file containing only the password
+              CQ_HIDE_TOOLS        Comma-separated tool names to hide from list_tools / block calls
         """
         ),
     )
@@ -207,8 +223,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    print_ident_stderr("full")
     log_file = _setup_logging()
     LOGGER.info("MCP tool start url=%s username=%s pid=%s", args.url, args.username, os.getpid())
+    if cq_hide_tool_names():
+        LOGGER.info("CQ_HIDE_TOOLS active: %s", sorted(cq_hide_tool_names()))
 
     password, password_source = cq_cred.resolve_password(args.password, args.password_file)
     if not password:

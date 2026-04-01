@@ -8,11 +8,12 @@ import os
 import re
 import sys
 import time
+from datetime import datetime
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
-from mcp.types import CallToolResult, TextContent  # type: ignore[import]
+from mcp.types import CallToolResult, TextContent, Tool  # type: ignore[import]
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -22,8 +23,23 @@ LOGGER = logging.getLogger("copilot_mcp_tool")
 CURRENT_TOOL: ContextVar[str] = ContextVar("copilot_mcp_current_tool", default="-")
 
 
+def _default_runtime_log_path() -> Path:
+    """Имя журнала с меткой времени до минуты (без секунд), чтобы параллельные MCP не делили один файл.
+
+    Префикс: COLLOQUIUM_MCP_LOG_STEM (по умолчанию copilot_mcp_tool.runtime — как раньше у полного сервера).
+    Compact runtime задаёт stem=cqds_mcp_runtime до _setup_logging().
+    """
+    logs_dir = Path(__file__).resolve().parent / "logs"
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    stem = (os.environ.get("COLLOQUIUM_MCP_LOG_STEM") or "copilot_mcp_tool.runtime").strip() or "copilot_mcp_tool.runtime"
+    candidate = logs_dir / f"{stem}.{stamp}.log"
+    if candidate.exists():
+        candidate = logs_dir / f"{stem}.{stamp}.{os.getpid()}.log"
+    return candidate
+
+
 def _setup_logging() -> Path:
-    default_log = Path(__file__).resolve().parent / "logs" / "copilot_mcp_tool.runtime.log"
+    default_log = _default_runtime_log_path()
     log_file = Path(os.environ.get("COLLOQUIUM_MCP_LOG_FILE", str(default_log))).resolve()
     log_level_name = os.environ.get("COLLOQUIUM_MCP_LOG_LEVEL", "INFO").upper()
     log_level = getattr(logging, log_level_name, logging.INFO)
@@ -50,6 +66,31 @@ def _setup_logging() -> Path:
     LOGGER.addHandler(stderr_handler)
 
     return log_file
+
+
+# ---------------------------------------------------------------------------
+# MCP tool visibility (CQ_HIDE_TOOLS)
+# ---------------------------------------------------------------------------
+# Перечень имён инструментов через запятую — не попадают в list_tools и не вызываются
+# (текущая конфигурация процесса MCP).
+
+
+def cq_hide_tool_names() -> frozenset[str]:
+    raw = (os.environ.get("CQ_HIDE_TOOLS") or "").strip()
+    if not raw:
+        return frozenset()
+    return frozenset(p.strip() for p in raw.split(",") if p.strip())
+
+
+def cq_tool_is_hidden(tool_name: str) -> bool:
+    return tool_name in cq_hide_tool_names()
+
+
+def cq_filter_tools_for_list(tools: list[Tool]) -> list[Tool]:
+    hide = cq_hide_tool_names()
+    if not hide:
+        return list(tools)
+    return [t for t in tools if t.name not in hide]
 
 
 # ---------------------------------------------------------------------------

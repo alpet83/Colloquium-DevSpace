@@ -22,8 +22,9 @@ def _docker_cli_exe() -> str:
     return shutil.which("docker") or "docker"
 
 
-def _cqds_repo_root() -> Path:
-    return Path(__file__).resolve().parent
+def docker_project_root() -> Path:
+    """Корень репозитория cqds (родитель каталога mcp-tools); здесь docker-compose.yml."""
+    return Path(__file__).resolve().parent.parent
 
 
 def _docker_exec_argv(
@@ -67,7 +68,7 @@ async def _invoke_cqds_ctl(command: str, services: list[str], timeout: int, wait
             "stderr": "",
         }
 
-    ctl_script = Path(__file__).resolve().parent / "scripts" / "cqds_ctl.py"
+    ctl_script = docker_project_root() / "scripts" / "cqds_ctl.py"
     if not ctl_script.is_file():
         return {
             "ok": False,
@@ -80,7 +81,7 @@ async def _invoke_cqds_ctl(command: str, services: list[str], timeout: int, wait
     if not proc_env.get("MCP_AUTH_TOKEN"):
         proc_env["MCP_AUTH_TOKEN"] = _MCP_AUTH_TOKEN
     if not proc_env.get("DB_ROOT_PASSWD"):
-        db_passwd_file = ctl_script.parent.parent / "secrets" / "cqds_db_password"
+        db_passwd_file = docker_project_root() / "secrets" / "cqds_db_password"
         if db_passwd_file.is_file():
             proc_env["DB_ROOT_PASSWD"] = db_passwd_file.read_text(encoding="utf-8").strip()
 
@@ -154,7 +155,7 @@ async def _docker_exec_batch_item(raw: dict[str, Any]) -> dict[str, Any]:
         LOGGER.info("cq_docker_exec: %s", argv)
         proc = await asyncio.create_subprocess_exec(
             *argv,
-            cwd=str(_cqds_repo_root()),
+            cwd=str(docker_project_root()),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.PIPE if stdin_b is not None else asyncio.subprocess.DEVNULL,
@@ -176,6 +177,170 @@ async def _docker_exec_batch_item(raw: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         LOGGER.exception("docker exec batch item")
         return {"ok": False, "error": str(exc), "request": raw}
+
+
+_COMPOSE_SUB_ALLOWED = frozenset({"up", "down", "stop", "start", "restart", "pull", "ps", "build"})
+
+
+async def docker_compose_run(raw: dict[str, Any]) -> dict[str, Any]:
+    """docker compose <sub> в каталоге репозитория cqds."""
+    try:
+        sub = str(raw.get("compose_command") or raw.get("subcommand") or "").strip().lower()
+        if not sub:
+            return {"ok": False, "error": "compose_command or subcommand required", "request": raw}
+        if sub not in _COMPOSE_SUB_ALLOWED:
+            return {
+                "ok": False,
+                "error": f"Unknown compose subcommand '{sub}'. Allowed: {', '.join(sorted(_COMPOSE_SUB_ALLOWED))}",
+                "request": raw,
+            }
+        services = [str(s) for s in (raw.get("services") or [])]
+        root = docker_project_root()
+        compose_yml = root / "docker-compose.yml"
+        exe = _docker_cli_exe()
+        argv: list[str] = [exe, "compose"]
+        if compose_yml.is_file():
+            argv.extend(["-f", str(compose_yml)])
+        extra_files = raw.get("compose_files")
+        if isinstance(extra_files, list):
+            for cf in extra_files:
+                pth = Path(str(cf))
+                if not pth.is_absolute():
+                    pth = root / pth
+                if pth.is_file():
+                    argv.extend(["-f", str(pth)])
+        for prof in raw.get("profiles") or []:
+            argv.extend(["--profile", str(prof)])
+        argv.append(sub)
+        if sub == "up":
+            if bool(raw.get("detach", True)):
+                argv.append("-d")
+            if bool(raw.get("build", False)):
+                argv.append("--build")
+            argv.extend(services)
+        elif sub in {"stop", "start", "restart", "build", "pull"}:
+            argv.extend(services)
+        elif sub == "down":
+            if bool(raw.get("remove_orphans", False)):
+                argv.append("--remove-orphans")
+            if bool(raw.get("volumes", False)):
+                argv.append("-v")
+            argv.extend(services)
+        elif sub == "ps":
+            if bool(raw.get("all", False)):
+                argv.append("-a")
+            argv.extend(services)
+        timeout_sec = max(10, min(int(raw.get("timeout_sec", 600)), 7200))
+        LOGGER.info("docker compose: cwd=%s argv=%s", root, argv)
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(root),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+            env=os.environ.copy(),
+        )
+        try:
+            out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=float(timeout_sec))
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return {"ok": False, "error": f"docker compose {sub} timed out after {timeout_sec}s", "request": raw}
+        return {
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": out_b.decode("utf-8", errors="replace") if out_b else "",
+            "stderr": err_b.decode("utf-8", errors="replace") if err_b else "",
+            "request": raw,
+        }
+    except Exception as exc:
+        LOGGER.exception("docker_compose_run")
+        return {"ok": False, "error": str(exc), "request": raw}
+
+
+async def docker_inspect_run(raw: dict[str, Any]) -> dict[str, Any]:
+    try:
+        target = str(raw.get("target") or "").strip()
+        if not target:
+            return {"ok": False, "error": "missing target (container or image id/name)", "request": raw}
+        exe = _docker_cli_exe()
+        argv: list[str] = [exe, "inspect", target]
+        fmt = raw.get("format")
+        if fmt is not None and str(fmt).strip():
+            argv.extend(["--format", str(fmt)])
+        timeout_sec = max(5, min(int(raw.get("timeout_sec", 120)), 600))
+        LOGGER.info("docker inspect: %s", argv)
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(docker_project_root()),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+            env=os.environ.copy(),
+        )
+        try:
+            out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=float(timeout_sec))
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return {"ok": False, "error": f"docker inspect timed out after {timeout_sec}s", "request": raw}
+        return {
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": out_b.decode("utf-8", errors="replace") if out_b else "",
+            "stderr": err_b.decode("utf-8", errors="replace") if err_b else "",
+            "request": raw,
+        }
+    except Exception as exc:
+        LOGGER.exception("docker_inspect_run")
+        return {"ok": False, "error": str(exc), "request": raw}
+
+
+async def docker_logs_run(raw: dict[str, Any]) -> dict[str, Any]:
+    try:
+        container = str(raw.get("container") or "").strip()
+        if not container:
+            return {"ok": False, "error": "missing container", "request": raw}
+        exe = _docker_cli_exe()
+        argv: list[str] = [exe, "logs", container]
+        tail = max(1, min(int(raw.get("tail", 200)), 10000))
+        argv.extend(["--tail", str(tail)])
+        since = raw.get("since")
+        if since is not None and str(since).strip():
+            argv.extend(["--since", str(since)])
+        if bool(raw.get("timestamps", False)):
+            argv.append("--timestamps")
+        timeout_sec = max(5, min(int(raw.get("timeout_sec", 120)), 600))
+        LOGGER.info("docker logs: %s", argv)
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(docker_project_root()),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+            env=os.environ.copy(),
+        )
+        try:
+            out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=float(timeout_sec))
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return {"ok": False, "error": f"docker logs timed out after {timeout_sec}s", "request": raw}
+        return {
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": out_b.decode("utf-8", errors="replace") if out_b else "",
+            "stderr": err_b.decode("utf-8", errors="replace") if err_b else "",
+            "request": raw,
+        }
+    except Exception as exc:
+        LOGGER.exception("docker_logs_run")
+        return {"ok": False, "error": str(exc), "request": raw}
+
+
+# Публичные алиасы для runtime cq_docker_ctl
+invoke_cqds_ctl = _invoke_cqds_ctl
+docker_exec_one = _docker_exec_batch_item
 
 
 TOOLS: list[Tool] = [
