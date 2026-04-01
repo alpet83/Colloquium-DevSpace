@@ -90,7 +90,6 @@ class LLMInteractor(ContextAssembler):
                 "token_limit INTEGER DEFAULT 131072",
                 "input_token_cost FLOAT",
                 "output_token_cost FLOAT",
-                "token_cost FLOAT",
                 "chat_id INTEGER"
             ]
         )
@@ -382,10 +381,9 @@ class LLMInteractor(ContextAssembler):
                     "token_limit": tokens_limit,
                     "input_token_cost": input_cost,
                     "output_token_cost": output_cost,
-                    "token_cost": total_cost,
                     "chat_id": ci.chat_id
                 })
-                log.debug("Сохранена статистика LLM для chat_id=%d, user_id=%d: model=%s, sent_tokens=%d, used_tokens=%d, output_tokens=%d, sources_used=%d, input_cost=%f, output_cost=%f, token_cost=%f",
+                log.debug("Сохранена статистика LLM для chat_id=%d, user_id=%d: model=%s, sent_tokens=%d, used_tokens=%d, output_tokens=%d, sources_used=%d, input_cost=%f, output_cost=%f, total=%f",
                           ci.chat_id, actor.user_id, conn.model, sent_tokens, used_tokens, output_tokens, sources_used, input_cost, output_cost, total_cost)
                 text = response.get('text', 'void-response')
                 response_file = Path(f"/app/logs/response-{actor.user_name}-{ci.chat_id}.llm")

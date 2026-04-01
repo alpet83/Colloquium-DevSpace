@@ -17,7 +17,7 @@ alwaysApply: true
 
 | Задача | Предпочтительно | Избегать |
 |--------|-----------------|----------|
-| Поиск по коду/логам/докам проекта | **`cq_smart_grep`** (режимы `code` / `logs` / `docs` / `all`, профили) | `grep`, `find`, поиск по workspace в PowerShell/CMD на Windows |
+| Поиск по коду/логам/докам проекта | **`cq_start_grep`** (чанки API + `chunk_continuation` → **`cq_fetch_result`**; `host_fs` — отдельный режим) | `grep`, `find`, поиск по workspace в PowerShell/CMD на Windows |
 | Поиск по строкам в логах / docker-логи | **`cq_grep_logs`** | `docker logs` с хоста, если цель — контекст проекта в CQDS |
 | Чтение файла проекта | **`cq_list_files`** → **`cq_read_file`** по `file_id` | Читать «угадывая» путь только с локального диска, если задача про состояние в Colloquium |
 | Навигация по символам | **`cq_rebuild_index`** / **`cq_get_index`** | Долгие ручные обходы дерева без индекса |

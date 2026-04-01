@@ -1,5 +1,6 @@
 # /agent/routes/project_routes.py, updated 2026-03-26 — simplified sync indexing + cache
 import json
+import os
 import re
 import time
 import asyncio
@@ -14,6 +15,7 @@ from lib.sandwich_pack import SandwichPack
 from fnmatch import fnmatch
 import globals as g
 from lib.basic_logger import BasicLogger
+from lib.smart_grep_scope_cache import filters_fingerprint, get_scope_cache, normalize_path_prefix
 
 router = APIRouter()
 log = g.get_logger("projectman")
@@ -234,6 +236,119 @@ def _cmp(left: int, op: str, right: int) -> bool:
     return left == right
 
 
+def _chunk_limit_files_cap() -> int:
+    try:
+        v = int(os.environ.get("CQDS_SMART_GREP_CHUNK_LIMIT_FILES", "100"))
+        return max(1, min(v, 200))
+    except ValueError:
+        return 100
+
+
+def _chunk_max_hits_cap() -> int:
+    try:
+        v = int(os.environ.get("CQDS_SMART_GREP_CHUNK_MAX_HITS", "2000"))
+        return max(1, min(v, 50_000))
+    except ValueError:
+        return 2000
+
+
+_NEXT_FILE_IDS_CAP = 500
+
+
+def _path_prefix_matches(file_name: str, path_prefix_norm: str) -> bool:
+    fn = str(file_name or "").replace("\\", "/").lstrip("/")
+    if not path_prefix_norm:
+        return True
+    if fn == path_prefix_norm:
+        return True
+    return fn.startswith(path_prefix_norm + "/")
+
+
+def _filter_entries_for_smart_grep(
+    entries: list,
+    pm: ProjectManager,
+    project_id: int,
+    mode: str,
+    profile: str,
+    include_glob: list,
+    time_filter,
+    path_prefix_norm: str,
+) -> list:
+    out = []
+    for entry in entries:
+        file_name = entry.get("file_name") or ""
+        if not _path_prefix_matches(file_name, path_prefix_norm):
+            continue
+        if not _is_mode_match(file_name, mode):
+            continue
+        if not _is_profile_match(file_name, profile):
+            continue
+        if include_glob and not any(fnmatch(file_name, gpat) for gpat in include_glob):
+            continue
+        if time_filter:
+            field, op, rhs = time_filter
+            lhs = None
+            if field in ("mtime", "ts"):
+                lhs = int(entry.get("ts") or 0)
+            elif field == "ctime":
+                try:
+                    qfn = pm.locate_file(file_name, project_id)
+                    if qfn and qfn.exists():
+                        lhs = int(qfn.stat().st_ctime)
+                except Exception:
+                    lhs = None
+            if lhs is None or not _cmp(lhs, op, rhs):
+                continue
+        out.append(entry)
+    out.sort(key=lambda e: int(e.get("id") or 0))
+    return out
+
+
+def _grep_hits_one_file(
+    entry: dict,
+    pm: ProjectManager,
+    project_id: int,
+    query: str,
+    pattern: re.Pattern | None,
+    is_regex: bool,
+    case_sensitive: bool,
+    context_lines: int,
+) -> list[dict]:
+    file_id = entry["id"]
+    file_name = entry["file_name"]
+    file_data = g.file_manager.get_file(file_id)
+    if not file_data or file_data.get("content") is None:
+        return []
+    lines = str(file_data.get("content") or "").splitlines()
+    hits = []
+    for i, line in enumerate(lines, start=1):
+        if pattern is not None:
+            m = pattern.search(line)
+            matched = m is not None
+            matched_text = m.group(0)[:200] if m else ""
+        else:
+            haystack = line if case_sensitive else line.lower()
+            needle = query if case_sensitive else query.lower()
+            matched = needle in haystack
+            matched_text = query[:200] if matched else ""
+        if not matched:
+            continue
+        before = lines[max(0, i - 1 - context_lines) : i - 1] if context_lines else []
+        after = lines[i : i + context_lines] if context_lines else []
+        hits.append(
+            {
+                "file_id": file_id,
+                "file_name": file_name,
+                "line": i,
+                "line_text": line[:400],
+                "match": matched_text,
+                "context_before": before,
+                "context_after": after,
+            }
+        )
+    return hits
+
+
 def _scan_state_store() -> dict:
     state = getattr(g, 'project_scan_state', None)
     if not isinstance(state, dict):
@@ -255,6 +370,7 @@ def _scan_state(project_id: int, project_name: str | None = None) -> dict:
         'finished_at': state.get('finished_at'),
         'duration_sec': state.get('duration_sec'),
         'files_count': state.get('files_count'),
+        'scan_time_limited': bool(state.get('scan_time_limited', False)),
         'error': state.get('error'),
     }
 
@@ -301,6 +417,20 @@ def _collect_project_problems(project_id: int, project_name: str) -> tuple[list[
                     'reason': scan.get('reason'),
                     'updated_at': scan.get('updated_at'),
                     'project_id': project_id,
+                },
+            }
+        )
+
+    if scan.get('scan_time_limited') and not scan.get('stale'):
+        problems.append(
+            {
+                'code': 'scan_time_budget',
+                'severity': 'info',
+                'message': 'Сканирование каталога оборвано по бюджету времени (CQDS_SCAN_MAX_SECONDS); при необходимости повторите обновление индекса.',
+                'details': {
+                    'project_id': project_id,
+                    'duration_sec': scan.get('duration_sec'),
+                    'files_count': scan.get('files_count'),
                 },
             }
         )
@@ -812,6 +942,200 @@ async def exec_project_command(request: Request):
         raise
 
 
+@router.get("/project/{project_id}/index_meta")
+async def project_index_meta(request: Request, project_id: int):
+    """Текущий index_epoch проекта (инвалидация stateless-чанков после рескана)."""
+    try:
+        g.check_session(request)
+        _resolve_project(project_id)
+        return {
+            "status": "ok",
+            "project_id": project_id,
+            "index_epoch": g.get_project_index_epoch(project_id),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        g.handle_exception("Ошибка в GET /project/index_meta", e)
+        raise
+
+
+@router.post("/project/smart_grep/chunk")
+async def smart_grep_chunk(request: Request):
+    """Stateless-чанк grep: offset/limit по закэшированному списку file_id (см. docs/search_grep_async_upgrade.md)."""
+    try:
+        user_id = g.check_session(request)
+        data = await request.json()
+        project_id = int(data.get("project_id") or 0)
+        client_epoch = int(data.get("index_epoch", -1))
+        path_prefix_raw = data.get("path_prefix")
+        offset = int(data.get("offset", 0))
+        limit_files = int(data.get("limit_files", 50))
+        max_hits = int(data.get("max_hits", 500))
+        query = str(data.get("query", "")).strip()
+        mode = str(data.get("mode", "code")).strip().lower()
+        profile = str(data.get("profile", "all")).strip().lower()
+        is_regex = bool(data.get("is_regex", False))
+        case_sensitive = bool(data.get("case_sensitive", False))
+        context_lines = min(max(int(data.get("context_lines", 0)), 0), 3)
+        time_strict = str(data.get("time_strict", "") or "").strip()
+        include_glob = data.get("include_glob") or []
+        if isinstance(include_glob, str):
+            include_glob = [x.strip() for x in include_glob.split(",") if x.strip()]
+        search_mode = str(data.get("search_mode", "project_registered") or "project_registered").strip().lower()
+
+        if project_id <= 0:
+            raise HTTPException(status_code=400, detail="Missing or invalid project_id")
+        if not query:
+            raise HTTPException(status_code=400, detail="Missing query")
+        if profile not in SMART_GREP_PROFILES:
+            raise HTTPException(status_code=400, detail=f"Unknown profile '{profile}'")
+        if search_mode not in ("project_registered", "project_refresh"):
+            raise HTTPException(
+                status_code=400,
+                detail="search_mode must be 'project_registered' or 'project_refresh'",
+            )
+        if offset < 0:
+            raise HTTPException(status_code=400, detail="offset must be >= 0")
+
+        try:
+            path_prefix_norm = normalize_path_prefix(path_prefix_raw)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+        cap_lf = _chunk_limit_files_cap()
+        limit_files = max(1, min(limit_files, cap_lf))
+        cap_mh = _chunk_max_hits_cap()
+        max_hits = max(1, min(max_hits, cap_mh))
+
+        current_epoch = g.get_project_index_epoch(project_id)
+        if client_epoch != current_epoch:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "stale_index_epoch",
+                    "current_epoch": current_epoch,
+                    "project_id": project_id,
+                },
+            )
+
+        pm = ProjectManager.get(project_id)
+        if pm is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+        if search_mode == "project_refresh":
+            if offset != 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="project_refresh in chunk is only allowed with offset=0",
+                )
+            scan_started = time.monotonic()
+            pm.scan_project_files()
+            current_epoch = g.get_project_index_epoch(project_id)
+            log.debug(
+                "smart_grep_chunk project_refresh scan done project_id=%d sec=%.3f epoch=%d",
+                project_id,
+                time.monotonic() - scan_started,
+                current_epoch,
+            )
+
+        time_filter = None
+        if time_strict:
+            try:
+                time_filter = _parse_time_strict(time_strict)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+
+        fp = filters_fingerprint(mode, profile, include_glob, time_strict or None)
+
+        def _build_id_list() -> list[int]:
+            entries = g.file_manager.file_index(project_id)
+            filt = _filter_entries_for_smart_grep(
+                entries, pm, project_id, mode, profile, include_glob, time_filter, path_prefix_norm
+            )
+            return [int(e["id"]) for e in filt]
+
+        cache = get_scope_cache()
+        ids_sorted = cache.get_or_build(project_id, path_prefix_norm, fp, current_epoch, _build_id_list)
+        total_ids = len(ids_sorted)
+
+        if offset > total_ids:
+            raise HTTPException(status_code=400, detail="offset beyond total_ids_in_scope")
+
+        batch_ids = ids_sorted[offset : offset + limit_files]
+        flags = 0 if case_sensitive else re.IGNORECASE
+        pattern = re.compile(query, flags) if is_regex else None
+
+        hits: list[dict] = []
+        files_scanned = 0
+        truncated_by_max_hits = False
+        for fid in batch_ids:
+            rows = g.file_manager.file_index(project_id, file_ids=[fid])
+            if not rows:
+                files_scanned += 1
+                continue
+            entry = rows[0]
+            fh = _grep_hits_one_file(
+                entry, pm, project_id, query, pattern, is_regex, case_sensitive, context_lines
+            )
+            if len(hits) + len(fh) > max_hits:
+                remain = max_hits - len(hits)
+                if remain > 0:
+                    hits.extend(fh[:remain])
+                truncated_by_max_hits = True
+                files_scanned += 1
+                break
+            hits.extend(fh)
+            files_scanned += 1
+
+        next_offset = offset + files_scanned
+        scan_complete = next_offset >= total_ids and not truncated_by_max_hits
+
+        tail = ids_sorted[next_offset : next_offset + _NEXT_FILE_IDS_CAP]
+        more_pending = next_offset < total_ids
+
+        log.debug(
+            g.with_session_tag(
+                request,
+                "POST /project/smart_grep/chunk user_id=%d project_id=%d epoch=%d offset=%d files=%d hits=%d complete=%s",
+            ),
+            user_id,
+            project_id,
+            current_epoch,
+            offset,
+            files_scanned,
+            len(hits),
+            str(scan_complete),
+        )
+
+        return {
+            "status": "ok",
+            "project_id": project_id,
+            "index_epoch": current_epoch,
+            "path_prefix": path_prefix_norm,
+            "offset": offset,
+            "limit_files": limit_files,
+            "files_scanned": files_scanned,
+            "total_ids_in_scope": total_ids,
+            "next_offset": next_offset,
+            "scan_complete": scan_complete,
+            "truncated_by_max_hits": truncated_by_max_hits,
+            "hits": hits,
+            "next_file_ids": tail,
+            "more_file_ids_pending": bool(more_pending),
+            "mode": mode,
+            "profile": profile,
+            "query": query,
+        }
+    except re.error as e:
+        raise HTTPException(status_code=400, detail=f"Invalid regex: {str(e)}") from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        g.handle_exception("Ошибка в POST /project/smart_grep/chunk", e)
+        raise
+
+
 @router.post("/project/smart_grep")
 async def smart_grep(request: Request):
     """Search query across predefined file sets in a project (code/logs/docs/all)."""
@@ -824,12 +1148,19 @@ async def smart_grep(request: Request):
         profile = str(data.get('profile', 'all')).strip().lower()
         is_regex = bool(data.get('is_regex', False))
         case_sensitive = bool(data.get('case_sensitive', False))
-        max_results = min(max(int(data.get('max_results', 100)), 1), 500)
+        # Верхняя граница для раннего выхода из полного скана; MCP может запрашивать до 10k.
+        max_results = min(max(int(data.get('max_results', 100)), 1), 10000)
         context_lines = min(max(int(data.get('context_lines', 0)), 0), 3)
         time_strict = str(data.get('time_strict', '') or '').strip()
         include_glob = data.get('include_glob') or []
         if isinstance(include_glob, str):
             include_glob = [x.strip() for x in include_glob.split(',') if x.strip()]
+        search_mode = str(data.get('search_mode', 'project_registered') or 'project_registered').strip().lower()
+        if search_mode not in ('project_registered', 'project_refresh'):
+            raise HTTPException(
+                status_code=400,
+                detail="search_mode must be 'project_registered' or 'project_refresh'",
+            )
 
         if project_id <= 0:
             raise HTTPException(status_code=400, detail="Missing or invalid project_id")
@@ -848,6 +1179,15 @@ async def smart_grep(request: Request):
         pm = ProjectManager.get(project_id)
         if pm is None:
             raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+        if search_mode == 'project_refresh':
+            scan_started = time.monotonic()
+            pm.scan_project_files()
+            log.debug(
+                "smart_grep project_refresh scan done project_id=%d sec=%.3f",
+                project_id,
+                time.monotonic() - scan_started,
+            )
 
         entries = g.file_manager.file_index(project_id)
         hits = []
@@ -924,6 +1264,7 @@ async def smart_grep(request: Request):
         return {
             'status': 'ok',
             'project_id': project_id,
+            'search_mode': search_mode,
             'mode': mode,
             'profile': profile,
             'query': query,

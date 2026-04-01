@@ -1,18 +1,90 @@
+# Локальная разработка: доп. сервисы (cron-дампы, апгрейд PG) и привязки проектов.
+# Для «только базовый compose» (без этого файла):  docker compose -f docker-compose.yml …
+# Том PG: cqds_postgres_data в docker-compose.yml; дампы — ./data/backups/pg на хосте.
+
 services:
-  postgres:
-    volumes:
-      - /opt/data/pgdata:/var/lib/postgresql/data    
+  # Ежедневный pg_dump в ./data/backups/pg (UTC, см. PG_BACKUP_SCHEDULE). Не путать с projects/*/backups.
+  pg-backup-scheduler:
+    build:
+      context: .
+      dockerfile: postgres/Dockerfile.backup-cron
+    container_name: cqds-pg-backup-scheduler
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
-      - POSTGRES_PASSWORD=dummy1248
-      - POSTGRES_ROOT_PASSWORD=dummy1248
+      - PGHOST=postgres
+      - PGPORT=5432
+      - PGUSER=cqds
+      - PGDATABASE=cqds
+      - PGPASSWORD_FILE=/run/secrets/cqds_db_password
+      - BACKUP_DIR=/backups/pg
+      - RETENTION_DAYS=14
+      - PG_BACKUP_SCHEDULE=15 3 * * *
+      - TZ=UTC
+    volumes:
+      - ./data/backups/pg:/backups/pg
+      - ./secrets:/run/secrets:ro
+      - ./postgres/backup_postgres.sh:/opt/backup/backup_postgres.sh:ro
+    networks:
+      - devspace-net
+
+  # Шаг 1 — апгрейд каталога PG 16→17 in-place (только бинарный апгрейд ./data/pgdata).
+  # Шаг 2 — перенос в том cqds_postgres_data через дамп + COUNT (надёжнее cp): pg-pipeline-pgdata-to-volume.
+  # Перед любым шагом: docker compose stop postgres …; бэкап данных.
+  #
+  # docker compose --profile upgrade run --rm pg-upgrade-live16
+  pg-upgrade-live16:
+    profiles: ["upgrade"]
+    image: pgautoupgrade/pgautoupgrade:17-alpine
+    container_name: cqds-pg-upgrade-live16
+    user: "0:0"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/cqds_db_password
+      PGAUTO_ONESHOT: "yes"
+      PGAUTO_REINDEX: ${PGAUTO_REINDEX:-no}
+    volumes:
+      - ./data/pgdata:/backups/live16
+      - ./data/pgdata:/var/lib/postgresql/data
+      - ./secrets:/run/secrets:ro
+
+  # Заливка ./data/pgdata (уже PG 17) в именованный том: дамп, контроль COUNT(*) до/после, pg_restore.
+  # docker compose --profile upgrade run --rm pg-pipeline-pgdata-to-volume
+  pg-pipeline-pgdata-to-volume:
+    profiles: ["upgrade"]
+    image: postgres:17-alpine
+    container_name: cqds-pg-pipeline-pgdata
+    user: root
+    # У образа postgres CMD по умолчанию «postgres» — иначе лишний аргумент к sh.
+    command: []
+    # Снятие CR без литерала \r в файле (sprintf 13). Во временный файл — затем sh файл (не sh -s).
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'awk ''{gsub(sprintf("%c",13),"");print}'' /opt/cqds-pipeline/pipeline_pgdata_to_volume.sh > /tmp/_cqds_pl.sh && test -s /tmp/_cqds_pl.sh && exec sh /tmp/_cqds_pl.sh'
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/cqds_db_password
+      PGDATABASE: cqds
+    volumes:
+      - ./data/pgdata:/var/lib/postgresql/data:rw
+      - cqds_postgres_data:/target_pgdata
+      - ./data/backups/pg:/backups/pg
+      - ./secrets:/run/secrets:ro
+      - ./postgres/pipeline_pgdata_to_volume.sh:/opt/cqds-pipeline/pipeline_pgdata_to_volume.sh:ro
+      - ./postgres/restore_postgres.sh:/opt/cqds-pipeline/restore_postgres.sh:ro
+      - ./postgres/init:/opt/cqds-pipeline/init:ro
   colloquium-core:
     environment:
       - PYTHONUNBUFFERED=1
-      - DEBUG_MODE=False  
+      - DEBUG_MODE=False
     volumes:
       # Local deployment-only bind mounts for real project trees.
       - P:/vps.alpet.me/sigsys-ts:/app/projects/sigsys-ts
-      - P:/opt/docker:/app/projects/Colloquium-DevSpace     
+      - P:/opt/docker:/app/projects/Colloquium-DevSpace
       - P:/opt/docker/trading-platform-php:/app/projects/trading-platform-php
       - P:/GitHub/alpet-libs-php:/app/projects/alpet-libs-php
   mcp-sandbox:

@@ -8,6 +8,7 @@ import logging
 import socket
 import os
 import signal
+import subprocess
 import sys
 import toml
 import datetime
@@ -127,27 +128,20 @@ def server_init():
         except Exception as _e:
             log.warn("Не удалось авто-загрузить проект: %s", str(_e))
         globals.file_manager = FileManager()
-        # Scan all projects at startup to populate attached_files.
-        # Removed from ProjectManager.load() for speed; this is the single reliable trigger.
-        try:
-            all_projects = globals.project_manager.projects_table.select_from(
-                columns=['id'], conditions='id > 0'
-            )
-            for proj_row in (all_projects or []):
-                pid = proj_row[0]
-                pm = ProjectManager.get(pid)
-                if pm is not None:
-                    log.info("Сканирование файлов проекта id=%d при запуске", pid)
-                    pm.scan_project_files()
-        except Exception as _e:
-            log.warn("Ошибка сканирования проектов при запуске: %s", str(_e))
+        # Сканирование всех проектов — только в фоне после поднятия uvicorn (см. _schedule_startup_project_scans).
+        # Синхронный полный scan здесь блокировал bind :8080 и давал nginx 502 на /api/* при долгом скане.
         dbg = os.getenv("DEBUG_MODE", "0").strip().lower()
         debug_enabled = dbg in ("1", "true", "yes", "on")
         log.debug("ENV DEBUG_MODE=%s parsed=%s", dbg, str(debug_enabled))
         globals.replication_manager = ReplicationManager(debug_mode=debug_enabled)
         log.info("Менеджеры инициализированы")
-        log.info("Установка прав для пользователя agent на /app/projects")
-        os.system("chown agent -R /app/projects")
+        log.info("chown agent на /app/projects — в фоне (синхронный chown блокировал bind :8080 → nginx 502)")
+        subprocess.Popen(
+            ["chown", "agent", "-R", "/app/projects"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
 
         log.debug("Подключение auth_router")
         app.include_router(auth_router)
@@ -158,11 +152,39 @@ def server_init():
         log.debug("Подключение project_router")
         app.include_router(project_router)
 
+        _schedule_startup_project_scans()
+
     except Exception as e:
         log_msg("Ошибка инициализации сервера: %s" % str(e), "#ERROR")
         raise
 
 shutdown_event = asyncio.Event()
+
+
+def _schedule_startup_project_scans() -> None:
+    """Заполняет attached_files без блокировки старта HTTP (избегает 502 от nginx)."""
+
+    @app.on_event("startup")
+    async def _startup_scan_background() -> None:
+        async def _run() -> None:
+            await asyncio.sleep(0.2)
+            try:
+                pm0 = globals.project_manager
+                if pm0 is None:
+                    return
+                all_projects = pm0.projects_table.select_from(columns=["id"], conditions="id > 0")
+                for proj_row in all_projects or []:
+                    pid = proj_row[0]
+                    pm = ProjectManager.get(pid)
+                    if pm is None:
+                        continue
+                    log.info("Фоновое сканирование файлов проекта id=%d после старта HTTP", pid)
+                    await asyncio.to_thread(pm.scan_project_files)
+            except Exception as _e:
+                log.warn("Ошибка фонового сканирования проектов: %s", str(_e))
+
+        asyncio.create_task(_run())
+
 
 async def lifespan(app: FastAPI):
     log_init()

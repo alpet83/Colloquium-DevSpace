@@ -37,7 +37,6 @@ def _collect_chat_usage_stats(chat_id: int, since_seconds: Optional[int] = None)
             'sources_used',
             'input_token_cost',
             'output_token_cost',
-            'token_cost',
             'ts'
         ],
         conditions=conditions,
@@ -56,7 +55,7 @@ def _collect_chat_usage_stats(chat_id: int, since_seconds: Optional[int] = None)
 
     for row in rows:
         if cutoff_ts is not None:
-            raw_ts = _row_get(row, 7, 'ts', 0)
+            raw_ts = _row_get(row, 6, 'ts', 0)
             ts_value = 0
             try:
                 if hasattr(raw_ts, 'timestamp'):
@@ -74,7 +73,7 @@ def _collect_chat_usage_stats(chat_id: int, since_seconds: Optional[int] = None)
         sources_used = int(row[3] or 0)
         input_cost = float(row[4] or 0.0)
         output_cost = float(row[5] or 0.0)
-        row_total_cost = float(row[6] or 0.0)
+        row_total_cost = input_cost + output_cost
 
         total_input_tokens += used_tokens
         total_output_tokens += output_tokens

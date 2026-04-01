@@ -120,7 +120,7 @@ async def execute(shell_command: str, user_inputs: list, user_name: str, cwd: st
             err = _err.read(fds, 'stderr')
             active |= bool(line) or bool(err)
             if 0 == _loops % 10:
-                print(f"[{tss()}] #EXEC: process is running: {active}\r")
+                print(f"[{tss()}] #EXEC: process is running: {active}\n")
             await asyncio.sleep(0.1)
 
         # Записываем полный вывод в логи

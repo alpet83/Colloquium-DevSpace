@@ -280,13 +280,13 @@ class CodePatchProcessor(BlockProcessor):
             self.current_lines = [None] + source.splitlines(keepends=True)  # 1-based indexing
             self.patch_lines = block_code.splitlines(keepends=True)
             old_lines_count = len(self.current_lines) - 1
-            line_endings = [line[-2:] if line and line.endswith('\r\n') else
+            line_endings = [line[-2:] if line and line.endswith('\n') else
                             line[-1:] if line and line.endswith('\n') else
                             '' for line in self.current_lines[1:]]
             self.line_ending = '\n'
             if line_endings:
                 most_common = Counter(line_endings).most_common(1)
-                self.line_ending = most_common[0][0] if most_common[0][0] in ['\n', '\r\n'] else '\n'
+                self.line_ending = most_common[0][0] if most_common[0][0] in ['\n', '\n'] else '\n'
             log.debug("Initialized patch context: lines=%d, line_ending=%s",
                       old_lines_count, repr(self.line_ending))
 

@@ -138,7 +138,7 @@ class SpanProcessor(BlockProcessor):
         start_idx = file_line
         if replace_lines >= 0:
             end_idx = file_line + replace_lines if replace_lines > 0 else len(new_lines)
-            if not (block_code.endswith("\n") or block_code.endswith("\r")):
+            if not (block_code.endswith("\n") or block_code.endswith("\n")):
                 block_code += "\n"  # обрезка при извлечении из тегов, нужна компенсация
             new_lines[start_idx:end_idx] = [block_code]
         else:

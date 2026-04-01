@@ -1,15 +1,15 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:17-alpine
     container_name: cqds-postgres
     entrypoint: ["/bin/sh", "/opt/cqds-postgres/start-with-startup-backup.sh"]
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_DB=postgres
-      - POSTGRES_PASSWORD=${DB_ROOT_PASSWD:?DB_ROOT_PASSWD is required}
-      - POSTGRES_ROOT_PASSWORD=${DB_ROOT_PASSWD:?DB_ROOT_PASSWD is required}
+      # Пароль из секрета; проверка непустоты — только при первом init (пустой PGDATA).
+      - POSTGRES_PASSWORD_FILE=/run/secrets/cqds_db_password
       - POSTGRES_ROOT_PASSWORD_FILE=/run/secrets/cqds_db_password
-      - PGHOST=127.0.0.1
+      # Без PGHOST=127.0.0.1: скрипты init используют сокет; TCP на localhost при init ещё не поднят.
       - PGPORT=5432
       - PGUSER=cqds
       - PGDATABASE=cqds
@@ -17,11 +17,13 @@ services:
       - BACKUP_DIR=/backups/pg
       - RETENTION_DAYS=14
     volumes:
-      - ./data/pgdata:/var/lib/postgresql/data
+      # Дампы БД только ./data/backups/pg -> /backups/pg. Папка ./backups/ у корня не используется (см. backups/README.txt).
+      # Мажорное обновление PG (16→17): том cqds_postgres_data с данными 16 нельзя просто подключить к 17 — см. postgres/BACKUPS.txt.
+      - cqds_postgres_data:/var/lib/postgresql/data
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
       - ./postgres:/opt/cqds-postgres:ro
       - ./secrets:/run/secrets:ro
-      - p:/opt/data/backups/pg:/backups/pg
+      - ./data/backups/pg:/backups/pg
     networks:
       - devspace-net
     healthcheck:                                                    
@@ -56,6 +58,7 @@ services:
       - PYTHONUNBUFFERED=1
       - DEBUG_MODE=True
       - SQLITE_PATH=/app/data/multichat.db
+      - RETENTION_DAYS=14
       - PGHOST=postgres
       - PGPORT=5432
       - PGUSER=cqds
@@ -63,8 +66,7 @@ services:
       - PGDATABASE=cqds
       - MCP_SERVER_URL=http://mcp-sandbox:8084
       - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:?MCP_AUTH_TOKEN is required}
-    command: >
-      sh -c "python /app/postgres/migrate_sqlite_to_postgres.py && python3 /app/agent/server.py"
+    command: ["python3", "/app/agent/server.py"]
     restart: on-failure
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/docs"]
@@ -81,7 +83,8 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: mcp-sandbox
-    # Port 8084 is no longer exposed directly; access goes via nginx-router /mcp/mcp-sandbox/
+    ports:
+      - "8084:8084"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -92,7 +95,6 @@ services:
       - RUST_LOG=debug
     networks:
       - devspace-net
-      - mcp_debug_net
 
   frontend:
     build:
@@ -118,7 +120,6 @@ services:
       - "8008:8008"
     networks:
       - devspace-net
-      - mcp_debug_net
     depends_on:
       - colloquium-core
       - frontend
@@ -126,10 +127,9 @@ services:
 networks:
   devspace-net:
     driver: bridge
-  mcp_debug_net:
-    external: true
-    name: mcp_debug_net
 
 volumes:
   data_volume:
   logs_volume:
+  cqds_postgres_data:
+    name: cqds_postgres_data

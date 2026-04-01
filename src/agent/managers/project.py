@@ -10,6 +10,20 @@ import globals
 
 log = globals.get_logger("projectman")
 
+# Верхняя граница длительности одного прохода rglob+add_file (сек), с запасом до типичного HTTP-таймаута клиента.
+_SCAN_BUDGET_DEFAULT_SEC = 25.0
+_SCAN_BUDGET_MARGIN_SEC = 0.75
+
+
+def _scan_budget_seconds() -> float:
+    raw = os.environ.get("CQDS_SCAN_MAX_SECONDS", "").strip()
+    if raw:
+        try:
+            return max(5.0, min(float(raw), 600.0))
+        except ValueError:
+            pass
+    return _SCAN_BUDGET_DEFAULT_SEC
+
 
 class ProjectManager:
     def __init__(self, project_id=None):
@@ -201,7 +215,7 @@ class ProjectManager:
         state[project_id] = current
 
     @staticmethod
-    def mark_scan_fresh(project_id: int, files_count: int, duration_sec: float):
+    def mark_scan_fresh(project_id: int, files_count: int, duration_sec: float, time_limited: bool = False):
         if project_id is None or project_id <= 0:
             return
         state = getattr(globals, 'project_scan_state', None)
@@ -215,7 +229,9 @@ class ProjectManager:
             'updated_at': int(time.time()),
             'files_count': int(files_count),
             'duration_sec': float(duration_sec),
+            'scan_time_limited': bool(time_limited),
         }
+        globals.bump_project_index_epoch(project_id)
 
     def create_project(self, project_name, description='', local_git=None, public_git=None, dependencies=None, mcp_server_url=None):
         mcp_server_url = self.normalize_mcp_server_url(mcp_server_url)
@@ -283,42 +299,82 @@ class ProjectManager:
                     ignore_patterns = [line.strip() for line in f if line.strip() and not line.startswith('#')]
                 log.debug("Загружены %d паттернов из .scan_ignore.txt для %s", len(ignore_patterns), project_name)
 
+            budget = _scan_budget_seconds()
+            deadline = started + max(0.0, budget - _SCAN_BUDGET_MARGIN_SEC)
+            time_limited = False
+
             for file_path in project_dir.rglob('*'):
-                if file_path.is_file():
+                if time.monotonic() >= deadline:
+                    time_limited = True
+                    log.warn(
+                        "scan_project_files: достигнут лимит времени %.1fs (CQDS_SCAN_MAX_SECONDS), проект=%s, "
+                        "поддерживаемых файлов=%d — остановка до обрыва запроса клиентом",
+                        budget,
+                        project_name,
+                        len(files),
+                    )
+                    break
+
+                try:
+                    is_reg = file_path.is_file()
+                except OSError as e:
+                    log.warn("scan_project_files: пропуск (is_file) %s: %s", file_path, e)
+                    continue
+                if not is_reg:
+                    continue
+
+                try:
                     relative_path = str(file_path.relative_to(project_dir)).replace('\\', '/')
-                    ignore = False
-                    for pattern in ignore_patterns:
-                        try:
-                            if re.search(pattern, relative_path):
-                                ignore = True
-                                break
-                        except re.error as e:
-                            log.error("Некорректный regex паттерн '%s' в .scan_ignore.txt: %s", pattern, str(e))
-                            continue
-                    if ignore:
-                        ignored_count += 1
+                except (OSError, ValueError) as e:
+                    log.warn("scan_project_files: пропуск (relative_to) %s: %s", file_path, e)
+                    continue
+
+                ignore = False
+                for pattern in ignore_patterns:
+                    try:
+                        if re.search(pattern, relative_path):
+                            ignore = True
+                            break
+                    except re.error as e:
+                        log.error("Некорректный regex паттерн '%s' в .scan_ignore.txt: %s", pattern, str(e))
                         continue
-                    name = file_path.name  # for specific supported files like .env, .profile, .bashrc
+                if ignore:
+                    ignored_count += 1
+                    continue
+
+                try:
+                    name = file_path.name
                     extension = '.' + file_path.suffix.lower().lstrip('.') if file_path.suffix else ''
                     if not SandwichPack.supported_type(extension) and not SandwichPack.supported_type(name):
                         continue
+                    st_mtime = int(file_path.stat().st_mtime)
                     files.append({
                         'file_name': relative_path,
                         'full_path': str(file_path),
-                        'ts': int(file_path.stat().st_mtime)
+                        'ts': st_mtime,
                     })
                     file_mod = os.path.getmtime(file_path)
                     reg_path = Path(project_name) / relative_path
                     if self.project_name == project_name:
                         globals.file_manager.add_file(reg_path, None, file_mod, self.project_id)
+                except (OSError, ValueError) as e:
+                    log.warn("scan_project_files: пропуск %s: %s", relative_path, e)
+                except Exception as e:
+                    log.warn("scan_project_files: пропуск %s: %s", relative_path, e)
+
             duration = time.monotonic() - started
             if duration >= 10:
                 log.warn("PERF_WARN scan_project_files project_id=%s project_name=%s took=%.2fs files=%d ignored=%d",
                          str(self.project_id), project_name, duration, len(files), ignored_count)
-            ProjectManager.mark_scan_fresh(self.project_id, len(files), duration)
+            if time_limited:
+                log.info(
+                    "scan_project_files: проект=%s частичный проход (time_limited), повторите scan при необходимости",
+                    project_name,
+                )
+            ProjectManager.mark_scan_fresh(self.project_id, len(files), duration, time_limited=time_limited)
             log.debug("Найдено %d поддерживаемых файлов в проекте %s, пропущено из-за фильтрации %d, duration=%.2fs",
                       len(files), project_name, ignored_count, duration)
             return files
         except Exception as e:
-            log.excpt("Ошибка сканирования файлов проекта %s: %s", project_name, str(e))
+            log.excpt("Ошибка сканирования файлов проекта %s: ", project_name, e=e)
             raise

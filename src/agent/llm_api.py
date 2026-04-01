@@ -4,8 +4,13 @@
 import aiohttp
 
 import json
+import os
 import re
 import codecs
+import threading
+import time
+import urllib.error
+import urllib.request
 # from typing import dict, Optional  PROHIBITED OBSOLETE CODE, NEVER USE!
 from managers.db import Database
 from openai import AsyncOpenAI, RateLimitError, APIStatusError, APIConnectionError
@@ -14,6 +19,114 @@ import datetime
 
 Optional = Dict = None
 log = globals.get_logger("llm_api")
+
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+_openrouter_pricing_lock = threading.Lock()
+_openrouter_pricing_cache: dict | None = None  # {"t": float, "by_id": dict[str, tuple[float, float]]}
+
+
+def _openrouter_pricing_cache_ttl_sec() -> int:
+    try:
+        return max(60, int(os.getenv("OPENROUTER_PRICING_CACHE_TTL", "3600")))
+    except ValueError:
+        return 3600
+
+
+def _openrouter_fetch_models_pricing() -> dict[str, tuple[float, float]]:
+    req = urllib.request.Request(
+        OPENROUTER_MODELS_URL,
+        headers={"User-Agent": "cqds-colloquium/openrouter-pricing"},
+    )
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    out: dict[str, tuple[float, float]] = {}
+    for m in data.get("data") or []:
+        mid = m.get("id")
+        if not mid:
+            continue
+        pr = m.get("pricing") or {}
+        try:
+            p = float(pr.get("prompt") or 0)
+            c = float(pr.get("completion") or 0)
+        except (TypeError, ValueError):
+            p, c = 0.0, 0.0
+        out[str(mid)] = (p, c)
+    return out
+
+
+def _openrouter_pricing_map_cached() -> dict[str, tuple[float, float]]:
+    """Кэш каталога OpenRouter (USD за 1 токен → позже ×1e6 для users)."""
+    global _openrouter_pricing_cache
+    now = time.time()
+    ttl = _openrouter_pricing_cache_ttl_sec()
+    with _openrouter_pricing_lock:
+        c = _openrouter_pricing_cache
+        if c is not None and (now - c["t"]) <= ttl:
+            return c["by_id"]
+    try:
+        by_id = _openrouter_fetch_models_pricing()
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, OSError) as e:
+        log.warn("OpenRouter: не удалось загрузить %s: %s", OPENROUTER_MODELS_URL, e)
+        with _openrouter_pricing_lock:
+            if _openrouter_pricing_cache is not None:
+                return _openrouter_pricing_cache["by_id"]
+        return {}
+    with _openrouter_pricing_lock:
+        _openrouter_pricing_cache = {"t": time.time(), "by_id": by_id}
+        return by_id
+
+
+def _openrouter_pricing_valid(prompt_per_token: float, completion_per_token: float, model_id: str) -> bool:
+    """Нулевые/отрицательные цены — ошибка, кроме моделей с подстрокой «free» в id (регистр не важен)."""
+    if prompt_per_token < 0 or completion_per_token < 0:
+        return False
+    if "free" in model_id.lower():
+        return True
+    return prompt_per_token > 0 and completion_per_token > 0
+
+
+def _maybe_sync_openrouter_user_pricing(db, user_id: int | None, openrouter_model_id: str) -> None:
+    """Обновляет users.tokens_input_cost / tokens_output_cost (USD за 1M токенов) из каталога OpenRouter."""
+    if user_id is None or not db.is_postgres():
+        return
+    by_id = _openrouter_pricing_map_cached()
+    if not by_id:
+        return
+    pair = by_id.get(openrouter_model_id)
+    if pair is None:
+        log.warn(
+            "OpenRouter: модель «%s» не найдена в API, tokens_*_cost не обновлены (user_id=%s)",
+            openrouter_model_id,
+            user_id,
+        )
+        return
+    p_tok, c_tok = pair
+    if not _openrouter_pricing_valid(p_tok, c_tok, openrouter_model_id):
+        log.error(
+            "OpenRouter: отклонены цены для «%s»: prompt=%s completion=%s "
+            "(ожидаются положительные оба, если в id нет «free»)",
+            openrouter_model_id,
+            p_tok,
+            c_tok,
+        )
+        return
+    in_m = p_tok * 1_000_000.0
+    out_m = c_tok * 1_000_000.0
+    try:
+        db.execute(
+            "UPDATE users SET tokens_input_cost = :a, tokens_output_cost = :b WHERE user_id = :uid",
+            {"a": in_m, "b": out_m, "uid": int(user_id)},
+        )
+        log.info(
+            "OpenRouter: user_id=%s model=%s — tokens_input_cost=%.8g tokens_output_cost=%.8g (USD за 1M токенов)",
+            user_id,
+            openrouter_model_id,
+            in_m,
+            out_m,
+        )
+    except Exception as e:
+        # db.execute уже логирует через log.excpt; здесь только краткое пояснение без второго traceback
+        log.warn("OpenRouter: не обновлены цены в users для user_id=%s: %s", user_id, e)
 
 
 class LLMConnection:
@@ -259,6 +372,8 @@ class OpenAIConnection(LLMConnection):
 
 class OpenRouterConnection(LLMConnection):
     def __init__(self, config: dict):
+        raw_llm_class = (config.get("model") or "").strip()
+        sync_pricing = "openrouter:" in raw_llm_class.lower()
         super().__init__(config)
         model_value = (self.model or "").strip()
         self.model = model_value[len("openrouter:"):] if model_value.lower().startswith("openrouter:") else model_value
@@ -268,4 +383,6 @@ class OpenRouterConnection(LLMConnection):
         # Keep conservative: add reasoning only for OpenAI models on OpenRouter.
         if eff and eff != "none" and self.model.startswith("openai/"):
             self.model_params["reasoning"] = {"effort": eff}
+        if sync_pricing:
+            _maybe_sync_openrouter_user_pricing(self.db, config.get("user_id"), self.model)
 

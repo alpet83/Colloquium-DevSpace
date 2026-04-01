@@ -24,6 +24,22 @@ project_registry = {}
 """ project_registry (dict[int, ProjectManager]) - cache of managers by project_id """
 project_scan_state = {}
 """ project_scan_state (dict[int, dict]) - scan freshness metadata by project_id """
+project_index_epoch = {}
+""" project_index_epoch (dict[int, int]) — монотонно растёт после каждого mark_scan_fresh (рескан файлов) """
+
+
+def get_project_index_epoch(project_id: int) -> int:
+    try:
+        return int(project_index_epoch.get(int(project_id), 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def bump_project_index_epoch(project_id: int) -> int:
+    pid = int(project_id)
+    n = int(project_index_epoch.get(pid, 0)) + 1
+    project_index_epoch[pid] = n
+    return n
 replication_manager = None
 """ replication_manager (ReplicationManager) - control replication: interaction with LLMs"""
 post_processor = None

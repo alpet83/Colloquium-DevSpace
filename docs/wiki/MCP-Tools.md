@@ -11,8 +11,8 @@ This page tracks MCP scripts and config locations after path migration.
 
 ### Runtime paths
 
-- `P:/opt/docker/cqds/mcp-tools/copilot_mcp_tool.py`
-- `P:/opt/docker/cqds/mcp-tools/mcp_gitbash_stdio.py`
+- `/opt/docker/cqds/mcp-tools/copilot_mcp_tool.py`
+- `/opt/docker/cqds/mcp-tools/mcp_gitbash_stdio.py`
 
 ## MCP Config Files
 
@@ -22,8 +22,8 @@ This page tracks MCP scripts and config locations after path migration.
 
 ### Runtime
 
-- `P:/opt/docker/cqds/.cursor/mcp.json`
-- `P:/opt/docker/cqds/.vscode/mcp.json`
+- `/opt/docker/cqds/.cursor/mcp.json`
+- `/opt/docker/cqds/.vscode/mcp.json`
 
 ## Related Documentation
 

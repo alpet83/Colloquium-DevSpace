@@ -280,7 +280,8 @@ Preview намеренно показывает только первые 2 си
 | `cq_exec` | Выполнить shell-команду в проекте |
 | `cq_query_db` | Выполнить read-only SQL через backend DB layer (debug) |
 | `cq_set_sync_mode` | Включить/выключить синхронный режим для `cq_send_message` |
-| `cq_smart_grep` | Поиск по наборам файлов (code/logs/docs/all) |
+| `cq_start_grep` | Старт поиска: `host_fs` на хосте MCP (опционально **`host_async=true`** — фоновый `rg`, опрос через `cq_fetch_result` + `host_grep_job_id`) или первый **stateless-чанк** по проекту; в ответе `chunk_continuation` / `paging` / `host_grep_job_id` |
+| `cq_fetch_result` | Следующий чанк (`chunk_continuation`), страница из кэша (`handle`), или снимок **host async** (`host_grep_job_id`; подсказка `host_grep_poll_hint_sec`, обычно ~5 с) |
 | `cq_grep_entity` | Поиск строк индекса сущностей (только **объявления**: function/class/method/…), один или несколько regex, поля name/parent/qualified; опционально `ensure_index` |
 | `cq_grep_logs` | Сканирование одного/нескольких log-файлов по маскам с regex-фильтрацией |
 | `cq_docker_control` | Управление Docker Compose сервисами CQDS на хосте (status/restart/rebuild/clear-logs) |
