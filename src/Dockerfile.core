@@ -1,18 +1,21 @@
 FROM python:3.11-slim
 
-# Создание виртуальной среды и установка зависимостей
+# Создание виртуальной среды и установка зависимостей (всегда в venv — см. CMD / compose command).
 RUN python3 -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
 ENV PYTHONPATH=/app/agent
 
-RUN pip install --no-cache-dir fastapi uvicorn openai requests asyncio gitpython
+COPY agent/requirements-core.txt /tmp/requirements-core.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-core.txt \
+    && /app/venv/bin/python3 -c "import apscheduler; import fastapi; import uvicorn"
+
+COPY docker/core-entrypoint.sh /usr/local/bin/cqds-core-entrypoint.sh
+RUN chmod +x /usr/local/bin/cqds-core-entrypoint.sh
+
 RUN apt-get update && apt-get install -y git
 RUN apt install -y inetutils-ping net-tools traceroute dnsutils nano 
 RUN apt install -y sqlite3 sudo
 RUN apt install -y postgresql-client
-RUN pip install watchgod toml python-multipart
-RUN pip install sqlalchemy aiohttp colorama
-RUN pip install psycopg2-binary
 # Рабочая директория
 WORKDIR /app/agent
 VOLUME /app/agent
@@ -33,5 +36,5 @@ RUN echo "agent ALL=(ALL) NOPASSWD: /usr/bin/apt, /usr/bin/apt-get" > /etc/sudoe
 RUN apt install -y curl wget
 
 EXPOSE 8080
-# Запуск
-CMD ["python3", "/app/agent/server.py"]
+ENTRYPOINT ["/usr/local/bin/cqds-core-entrypoint.sh"]
+CMD ["/app/agent/server.py"]

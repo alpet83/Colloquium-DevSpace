@@ -1,9 +1,13 @@
 # Локальная разработка: доп. сервисы (cron-дампы, апгрейд PG) и привязки проектов.
 # Для «только базовый compose» (без этого файла):  docker compose -f docker-compose.yml …
 # Том PG: cqds_postgres_data в docker-compose.yml; дампы — ./data/backups/pg на хосте.
+#
+# Планируемые дампы из ядра (APScheduler, таблицы scheduled_*): закомментируйте pg-backup-scheduler,
+# чтобы не дублировать pg_dump с colloquium-core (том ./data/backups/pg смонтирован и там).
 
 services:
-  # Ежедневный pg_dump в ./data/backups/pg (UTC, см. PG_BACKUP_SCHEDULE). Не путать с projects/*/backups.
+  # Устаревший cron-контейнер: тот же pg_dump, что может делать colloquium-core (таблица scheduled_jobs).
+  # Расписание legacy-сервиса — только env ниже; ядро смотрит на БД, не на эти переменные.
   pg-backup-scheduler:
     build:
       context: .

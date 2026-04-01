@@ -40,6 +40,7 @@ services:
     container_name: colloquium-core
     volumes:
       - ./data:/app/data
+      - ./data/backups/pg:/backups/pg
       - ./logs:/app/logs
       - ./projects:/app/projects
       - ./agent:/app/agent
@@ -66,7 +67,8 @@ services:
       - PGDATABASE=cqds
       - MCP_SERVER_URL=http://mcp-sandbox:8084
       - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:?MCP_AUTH_TOKEN is required}
-    command: ["python3", "/app/agent/server.py"]
+    # ENTRYPOINT доустанавливает apscheduler в venv при необходимости; аргумент — скрипт ядра.
+    command: ["/app/agent/server.py"]
     restart: on-failure
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/docs"]
