@@ -3,21 +3,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import threading
 from collections import OrderedDict
 from typing import Any, Callable
 
+from managers.runtime_config import get_int
+
 _DEFAULT_MAX_KEYS = 128
 _DEFAULT_MAX_IDS_TOTAL = 2_000_000
-
-
-def _env_int(name: str, default: int, lo: int, hi: int) -> int:
-    try:
-        v = int(os.environ.get(name, "").strip() or default)
-        return max(lo, min(v, hi))
-    except ValueError:
-        return default
 
 
 def filters_fingerprint(
@@ -56,10 +49,10 @@ class SmartGrepScopeCache:
         max_keys: int | None = None,
         max_ids_total: int | None = None,
     ) -> None:
-        self._max_keys = max_keys if max_keys is not None else _env_int(
+        self._max_keys = max_keys if max_keys is not None else get_int(
             "CQDS_SMART_GREP_SCOPE_CACHE_KEYS", _DEFAULT_MAX_KEYS, 8, 4096
         )
-        self._max_ids_total = max_ids_total if max_ids_total is not None else _env_int(
+        self._max_ids_total = max_ids_total if max_ids_total is not None else get_int(
             "CQDS_SMART_GREP_SCOPE_MAX_IDS", _DEFAULT_MAX_IDS_TOTAL, 10_000, 20_000_000
         )
         self._data: OrderedDict[tuple[int, str, str], tuple[int, list[int]]] = OrderedDict()

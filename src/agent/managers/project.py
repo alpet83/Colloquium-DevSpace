@@ -4,6 +4,7 @@ import re
 import time
 from pathlib import Path
 from .db import Database, DataTable
+from .runtime_config import get_float
 from lib.sandwich_pack import SandwichPack
 from lib.basic_logger import BasicLogger
 import globals
@@ -16,13 +17,12 @@ _SCAN_BUDGET_MARGIN_SEC = 0.75
 
 
 def _scan_budget_seconds() -> float:
-    raw = os.environ.get("CQDS_SCAN_MAX_SECONDS", "").strip()
-    if raw:
-        try:
-            return max(5.0, min(float(raw), 600.0))
-        except ValueError:
-            pass
-    return _SCAN_BUDGET_DEFAULT_SEC
+    return get_float(
+        "CQDS_SCAN_MAX_SECONDS",
+        _SCAN_BUDGET_DEFAULT_SEC,
+        5.0,
+        600.0,
+    )
 
 
 class ProjectManager:
@@ -303,7 +303,16 @@ class ProjectManager:
             deadline = started + max(0.0, budget - _SCAN_BUDGET_MARGIN_SEC)
             time_limited = False
 
-            for file_path in project_dir.rglob('*'):
+            _walk = iter(project_dir.rglob('*'))
+            while True:
+                try:
+                    file_path = next(_walk)
+                except StopIteration:
+                    break
+                except OSError as e:
+                    log.warn("scan_project_files: пропуск при обходе дерева: %s", e)
+                    continue
+
                 if time.monotonic() >= deadline:
                     time_limited = True
                     log.warn(

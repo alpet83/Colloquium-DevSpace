@@ -4,7 +4,6 @@
 import aiohttp
 
 import json
-import os
 import re
 import codecs
 import threading
@@ -13,6 +12,7 @@ import urllib.error
 import urllib.request
 # from typing import dict, Optional  PROHIBITED OBSOLETE CODE, NEVER USE!
 from managers.db import Database
+from managers.runtime_config import get_int
 from openai import AsyncOpenAI, RateLimitError, APIStatusError, APIConnectionError
 import globals
 import datetime
@@ -26,10 +26,7 @@ _openrouter_pricing_cache: dict | None = None  # {"t": float, "by_id": dict[str,
 
 
 def _openrouter_pricing_cache_ttl_sec() -> int:
-    try:
-        return max(60, int(os.getenv("OPENROUTER_PRICING_CACHE_TTL", "3600")))
-    except ValueError:
-        return 3600
+    return get_int("OPENROUTER_PRICING_CACHE_TTL", 3600, 60, 999_999_999)
 
 
 def _openrouter_fetch_models_pricing() -> dict[str, tuple[float, float]]:

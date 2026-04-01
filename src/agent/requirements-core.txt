@@ -1,0 +1,14 @@
+# Зависимости образа colloquium-core (Dockerfile.core). Установка: pip install -r requirements-core.txt
+apscheduler>=3.10.4,<4
+fastapi
+uvicorn
+openai
+requests
+gitpython
+watchgod
+toml
+python-multipart
+sqlalchemy
+aiohttp
+colorama
+psycopg2-binary

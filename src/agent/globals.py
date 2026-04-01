@@ -154,6 +154,13 @@ def check_session(request: Request) -> int:
 
 def handle_exception(message: str, e: Exception, _raise: bool = True):  # TODO: надо будет куда-то переместить
     """Общая функция для обработки исключений сервера."""
+    from starlette.requests import ClientDisconnect
+
+    if isinstance(e, ClientDisconnect):
+        if _raise:
+            raise e
+        return
+
     log = get_logger("exception")
     if isinstance(e, HTTPException):
         log.error(f"HTTP ошибка: {message}: {str(e)}")

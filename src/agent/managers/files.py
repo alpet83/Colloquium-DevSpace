@@ -7,19 +7,10 @@ from pathlib import Path
 from contextlib import contextmanager
 from .db import Database, DataTable
 from .project import ProjectManager
+from .runtime_config import get_int
 from lib.basic_logger import BasicLogger
 
 log = globals.get_logger("fileman")
-
-
-def _safe_int_env(name: str, default: int, min_value: int = 0) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return max(int(raw), min_value)
-    except Exception:
-        return default
 
 
 def _mark_project_scan_stale(project_id: int, reason: str):
@@ -47,9 +38,8 @@ def _mod_time(file_name: str, project_id: int):
 
 class FileManager:
     def __init__(self):
-        self._missing_ttl_max = _safe_int_env("FILE_LINK_TTL_MAX", 3, 1)
-        self._missing_probe_cooldown_sec = _safe_int_env("FILE_LINK_TTL_CHECK_COOLDOWN_SEC", 120, 0)
         self.db = Database.get_database()
+        _ttl0 = get_int("FILE_LINK_TTL_MAX", 3, 1, 10_000)
         self.files_table = DataTable(
             table_name="attached_files",
             template=[
@@ -57,7 +47,7 @@ class FileManager:
                 "content BLOB",
                 "ts INTEGER",
                 "file_name TEXT",
-                f"missing_ttl INTEGER DEFAULT {self._missing_ttl_max}",
+                f"missing_ttl INTEGER DEFAULT {_ttl0}",
                 "missing_checked_ts INTEGER DEFAULT 0",
                 "project_id INTEGER",
                 "FOREIGN KEY (project_id) REFERENCES projects(id)"
@@ -74,6 +64,14 @@ class FileManager:
             ]
         )
         self.check()
+
+    @property
+    def missing_ttl_max(self) -> int:
+        return get_int("FILE_LINK_TTL_MAX", 3, 1, 10_000)
+
+    @property
+    def missing_probe_cooldown_sec(self) -> int:
+        return get_int("FILE_LINK_TTL_CHECK_COOLDOWN_SEC", 120, 0, 86_400)
 
     @staticmethod
     def _file_lock_key(file_name: str, project_id=None) -> str:
@@ -116,7 +114,7 @@ class FileManager:
                 "UPDATE attached_files "
                 "SET missing_ttl = :ttl "
                 "WHERE missing_ttl IS NULL OR missing_ttl < 0",
-                {'ttl': self._missing_ttl_max},
+                {'ttl': self.missing_ttl_max},
             )
             self.db.execute(
                 "UPDATE attached_files "
@@ -131,30 +129,30 @@ class FileManager:
         checked_value = int(time.time()) if checked_ts is None else int(checked_ts)
         self.db.execute(
             "UPDATE attached_files SET missing_ttl = :ttl, missing_checked_ts = :checked WHERE id = :id",
-            {'ttl': max(0, min(int(ttl), self._missing_ttl_max)), 'checked': checked_value, 'id': int(file_id)},
+            {'ttl': max(0, min(int(ttl), self.missing_ttl_max)), 'checked': checked_value, 'id': int(file_id)},
         )
 
     def _mark_link_healthy(self, file_id: int):
         row = self.db.fetch_one(
             "SELECT COALESCE(missing_ttl, :ttl) FROM attached_files WHERE id = :id",
-            {'id': int(file_id), 'ttl': self._missing_ttl_max},
+            {'id': int(file_id), 'ttl': self.missing_ttl_max},
         )
-        prev_ttl = int(row[0]) if row else self._missing_ttl_max
-        self._set_missing_ttl(file_id, self._missing_ttl_max)
-        if prev_ttl < self._missing_ttl_max:
-            log.info("TTL-recover link id=%d ttl=%d->%d", int(file_id), prev_ttl, self._missing_ttl_max)
+        prev_ttl = int(row[0]) if row else self.missing_ttl_max
+        self._set_missing_ttl(file_id, self.missing_ttl_max)
+        if prev_ttl < self.missing_ttl_max:
+            log.info("TTL-recover link id=%d ttl=%d->%d", int(file_id), prev_ttl, self.missing_ttl_max)
 
     def _link_health_state(self, file_id: int, mutate: bool = True) -> tuple[bool, int]:
         row = self.db.fetch_one(
             "SELECT file_name, project_id, COALESCE(missing_ttl, :ttl), COALESCE(missing_checked_ts, 0) "
             "FROM attached_files WHERE id = :id",
-            {'id': int(file_id), 'ttl': self._missing_ttl_max},
+            {'id': int(file_id), 'ttl': self.missing_ttl_max},
         )
         if not row:
             return False, 0
 
         file_name, project_id, missing_ttl, missing_checked_ts = row
-        missing_ttl = max(0, min(int(missing_ttl), self._missing_ttl_max))
+        missing_ttl = max(0, min(int(missing_ttl), self.missing_ttl_max))
         missing_checked_ts = int(missing_checked_ts or 0)
 
         clean_name = str(file_name).lstrip('@')
@@ -162,14 +160,14 @@ class FileManager:
         path_exists = os.path.exists(file_path)
 
         # If TTL is degraded, keep link hidden until explicit rescan restores it.
-        if path_exists and missing_ttl < self._missing_ttl_max:
+        if path_exists and missing_ttl < self.missing_ttl_max:
             return False, missing_ttl
 
         if path_exists:
             return True, missing_ttl
 
         now_ts = int(time.time())
-        should_degrade = mutate and (now_ts - missing_checked_ts >= self._missing_probe_cooldown_sec)
+        should_degrade = mutate and (now_ts - missing_checked_ts >= self.missing_probe_cooldown_sec)
         if should_degrade and missing_ttl > 0:
             next_ttl = missing_ttl - 1
             self._set_missing_ttl(file_id, next_ttl, now_ts)
@@ -317,7 +315,7 @@ class FileManager:
                 'content': None,
                 'ts': timestamp,
                 'file_name': f"@{file_name}",
-                'missing_ttl': self._missing_ttl_max,
+                'missing_ttl': self.missing_ttl_max,
                 'missing_checked_ts': int(time.time()),
                 'project_id': project_id
             },
@@ -358,7 +356,7 @@ class FileManager:
                     'content': None,
                     'file_name': f"@{file_name}",
                     'ts': timestamp,
-                    'missing_ttl': self._missing_ttl_max,
+                    'missing_ttl': self.missing_ttl_max,
                     'missing_checked_ts': int(time.time()),
                     'project_id': project_id
                 }
@@ -413,7 +411,7 @@ class FileManager:
                 values={
                     'file_name': effective_new_name,
                     'ts': int(time.time()),
-                    'missing_ttl': self._missing_ttl_max,
+                    'missing_ttl': self.missing_ttl_max,
                     'missing_checked_ts': int(time.time()),
                     'project_id': project_id
                 }
@@ -591,7 +589,7 @@ class FileManager:
             safe_ids = ','.join(str(int(i)) for i in file_ids)  # int cast prevents injection
             clauses.append(f'id IN ({safe_ids})')
         clauses.append('COALESCE(missing_ttl, :missing_ttl_max) >= :missing_ttl_max')
-        params['missing_ttl_max'] = self._missing_ttl_max
+        params['missing_ttl_max'] = self.missing_ttl_max
         query = (
             f"SELECT id, file_name, ts, project_id FROM attached_files "
             f"WHERE {' AND '.join(clauses)} ORDER BY file_name"
@@ -617,7 +615,7 @@ class FileManager:
         return result
 
     def ttl_status(self, project_id: int = None, sample_limit: int = 10) -> dict:
-        ttl_max = self._missing_ttl_max
+        ttl_max = self.missing_ttl_max
         sample_limit = max(1, min(int(sample_limit), 50))
 
         clauses = ["file_name LIKE '@%'"]
@@ -679,7 +677,7 @@ class FileManager:
 
     def project_stats(self, project_id: int) -> dict:
         """Return file link counts and backup/undo stack stats for a project."""
-        ttl_max = self._missing_ttl_max
+        ttl_max = self.missing_ttl_max
         row = self.db.fetch_one(
             "SELECT "
             "COUNT(*) AS total, "

@@ -1,6 +1,5 @@
 # /agent/routes/project_routes.py, updated 2026-03-26 — simplified sync indexing + cache
 import json
-import os
 import re
 import time
 import asyncio
@@ -10,6 +9,7 @@ from pathlib import Path
 from fastapi import APIRouter, Request, HTTPException, Query
 from managers.db import Database
 from managers.project import ProjectManager
+from managers.runtime_config import get_int
 from context_assembler import ContextAssembler
 from lib.sandwich_pack import SandwichPack
 from fnmatch import fnmatch
@@ -237,19 +237,11 @@ def _cmp(left: int, op: str, right: int) -> bool:
 
 
 def _chunk_limit_files_cap() -> int:
-    try:
-        v = int(os.environ.get("CQDS_SMART_GREP_CHUNK_LIMIT_FILES", "100"))
-        return max(1, min(v, 200))
-    except ValueError:
-        return 100
+    return get_int("CQDS_SMART_GREP_CHUNK_LIMIT_FILES", 100, 1, 200)
 
 
 def _chunk_max_hits_cap() -> int:
-    try:
-        v = int(os.environ.get("CQDS_SMART_GREP_CHUNK_MAX_HITS", "2000"))
-        return max(1, min(v, 50_000))
-    except ValueError:
-        return 2000
+    return get_int("CQDS_SMART_GREP_CHUNK_MAX_HITS", 2000, 1, 50_000)
 
 
 _NEXT_FILE_IDS_CAP = 500

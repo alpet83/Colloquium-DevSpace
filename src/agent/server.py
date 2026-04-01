@@ -1,5 +1,6 @@
 # /agent/server.py, updated 2025-07-19 09:55 EEST
 from fastapi import FastAPI, Request
+from starlette.requests import ClientDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -20,6 +21,7 @@ from routes.auth_routes import router as auth_router
 from routes.chat_routes import router as chat_router
 from routes.file_routes import router as file_router
 from routes.project_routes import router as project_router
+from routes.config_routes import router as config_router
 from post_processor import PostProcessor
 from managers.db import DataTable
 from managers.users import UserManager
@@ -28,6 +30,7 @@ from managers.posts import PostManager
 from managers.files import FileManager
 from managers.project import ProjectManager
 from managers.replication import ReplicationManager
+from managers.runtime_config import get_bool
 import globals
 from globals import CONFIG_FILE, LOG_DIR, LOG_FILE, LOG_SERV, LOG_FORMAT
 
@@ -42,7 +45,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://vps.vpn:8008", "http://localhost:8008"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "Cookie", "Set-Cookie", "Accept"],
     expose_headers=["Set-Cookie"]
 )
@@ -65,6 +68,8 @@ async def log_requests_and_exceptions(request: Request, call_next):
         return response
     except RequestValidationError as exc:
         log.error("Валидационная ошибка для %s %s: ~C95%s~C00", request.method, str(request.url), str(exc.errors()))
+        raise
+    except ClientDisconnect:
         raise
     except Exception as exc:
         log.excpt("Ошибка сервера для %s %s: ", request.method, str(request.url), e=exc)
@@ -130,9 +135,8 @@ def server_init():
         globals.file_manager = FileManager()
         # Сканирование всех проектов — только в фоне после поднятия uvicorn (см. _schedule_startup_project_scans).
         # Синхронный полный scan здесь блокировал bind :8080 и давал nginx 502 на /api/* при долгом скане.
-        dbg = os.getenv("DEBUG_MODE", "0").strip().lower()
-        debug_enabled = dbg in ("1", "true", "yes", "on")
-        log.debug("ENV DEBUG_MODE=%s parsed=%s", dbg, str(debug_enabled))
+        debug_enabled = get_bool("DEBUG_MODE", default=False)
+        log.debug("DEBUG_MODE (config/env) parsed=%s", str(debug_enabled))
         globals.replication_manager = ReplicationManager(debug_mode=debug_enabled)
         log.info("Менеджеры инициализированы")
         log.info("chown agent на /app/projects — в фоне (синхронный chown блокировал bind :8080 → nginx 502)")
@@ -151,8 +155,11 @@ def server_init():
         app.include_router(file_router)
         log.debug("Подключение project_router")
         app.include_router(project_router)
+        log.debug("Подключение config_router")
+        app.include_router(config_router)
 
         _schedule_startup_project_scans()
+        _schedule_core_scheduler()
 
     except Exception as e:
         log_msg("Ошибка инициализации сервера: %s" % str(e), "#ERROR")
@@ -184,6 +191,33 @@ def _schedule_startup_project_scans() -> None:
                 log.warn("Ошибка фонового сканирования проектов: %s", str(_e))
 
         asyncio.create_task(_run())
+
+
+def _schedule_core_scheduler() -> None:
+    try:
+        from managers.core_scheduler import start_core_scheduler, stop_core_scheduler
+    except ImportError as e:
+        log.warn(
+            "Планировщик ядра отключён (импорт managers.core_scheduler): %s — "
+            "в контейнере: пересоберите образ или дождитесь entrypoint pip install; локально: pip install -r agent/requirements-core.txt",
+            str(e),
+        )
+        return
+
+    @app.on_event("startup")
+    async def _core_scheduler_startup() -> None:
+        await asyncio.sleep(0.1)
+        try:
+            await start_core_scheduler()
+        except Exception as e:
+            log.warn("Планировщик ядра не запущен: %s", str(e))
+
+    @app.on_event("shutdown")
+    async def _core_scheduler_shutdown() -> None:
+        try:
+            await stop_core_scheduler()
+        except Exception as e:
+            log.warn("Остановка планировщика ядра: %s", str(e))
 
 
 async def lifespan(app: FastAPI):
