@@ -6,12 +6,14 @@ This page tracks MCP scripts and config locations after path migration.
 
 ### Repository paths
 
-- CQDS bridge server: [src/mcp-tools/copilot_mcp_tool.py](../../src/mcp-tools/copilot_mcp_tool.py)
+- CQDS MCP **mini** (предпочтительно для агентов, меньше контекста): [src/mcp-tools/cqds_mcp_mini.py](../../src/mcp-tools/cqds_mcp_mini.py)
+- CQDS MCP **full** (полный набор инструментов): [src/mcp-tools/cqds_mcp_full.py](../../src/mcp-tools/cqds_mcp_full.py)
 - Git Bash server: [src/mcp-tools/mcp_gitbash_stdio.py](../../src/mcp-tools/mcp_gitbash_stdio.py)
 
 ### Runtime paths
 
-- `/opt/docker/cqds/mcp-tools/copilot_mcp_tool.py`
+- `/opt/docker/cqds/mcp-tools/cqds_mcp_mini.py`
+- `/opt/docker/cqds/mcp-tools/cqds_mcp_full.py`
 - `/opt/docker/cqds/mcp-tools/mcp_gitbash_stdio.py`
 
 ## MCP Config Files
@@ -27,13 +29,15 @@ This page tracks MCP scripts and config locations after path migration.
 
 ## Related Documentation
 
-- [copilot_mcp_tool](../copilot_mcp_tool.md)
+- [cqds_mcp_mini](../cqds_mcp_mini.md) — компактный MCP (рекомендуется по умолчанию)
+- [cqds_mcp_full](../cqds_mcp_full.md)
 - [MCP_DELEGATION_QUICK_START](../MCP_DELEGATION_QUICK_START.md)
 - [MCP_DELEGATION_STRATEGY](../MCP_DELEGATION_STRATEGY.md)
 - [MCP_DELEGATION_TEMPLATE](../MCP_DELEGATION_TEMPLATE.md)
 
 ## Notes
 
+- Пароль MCP/full и раннеров: шаблон [cqds_mcp_auth.sample.secret](../../src/mcp-tools/cqds_mcp_auth.sample.secret) → локально `cqds_mcp_auth.secret` (в `.gitignore`).
 - Keep script path references consistent with `mcp-tools` in all `mcp.json` files.
 - Avoid shell redirection for document restore flows when Cyrillic text is involved.
 - Prefer byte-safe restore strategy (`git show` via programmatic bytes decode/encode) for docs recovery.

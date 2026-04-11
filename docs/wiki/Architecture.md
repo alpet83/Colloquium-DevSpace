@@ -18,7 +18,8 @@ High-level references for CQDS internals.
 ## MCP Layer
 
 - [MCP Tools](MCP-Tools.md)
-- [copilot_mcp_tool](../copilot_mcp_tool.md)
+- [cqds_mcp_mini](../cqds_mcp_mini.md)
+- [cqds_mcp_full](../cqds_mcp_full.md)
 
 ## Evolution Tracking
 

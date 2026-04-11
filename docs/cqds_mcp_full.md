@@ -1,6 +1,8 @@
-# copilot_mcp_tool — Интеграция GitHub Copilot с Colloquium-DevSpace
+# cqds_mcp_full — Интеграция GitHub Copilot с Colloquium-DevSpace
 
-MCP-сервер (`copilot_mcp_tool.py`) транслирует инструменты GitHub Copilot Agent в HTTP-запросы к Colloquium-DevSpace, позволяя Copilot читать чаты, отправлять сообщения и управлять файлами проекта через Colloquium.
+MCP-сервер (`cqds_mcp_full.py`) транслирует инструменты GitHub Copilot Agent в HTTP-запросы к Colloquium-DevSpace, позволяя Copilot читать чаты, отправлять сообщения и управлять файлами проекта через Colloquium.
+
+> **Предпочтительный вариант для агентов:** для Cursor/Copilot чаще лучше подключать **[cqds_mcp_mini](cqds_mcp_mini.md)** — тот же HTTP API, но **~6× меньше** объявленных MCP-инструментов и **~5× компактнее** JSON-схема `list_tools`, что снижает расход контекста у модели. Полный сервер оставляй для сценариев, где нужны отдельные тонкие инструменты (`cq_host_process_*`, `cq_query_db`, `cq_spawn_script`, пакеты `cq_docker_control_batch` и т.д.) без агрегации через `*_ctl`.
 
 ---
 
@@ -95,7 +97,7 @@ docker exec colloquium-core python3 /app/agent/create_user.py --list
 
 Содержимое секции сервера `colloquium` одно и то же; отличаются только обёртка и имя каталога. В Cursor для stdio-серверов нужно поле `"type": "stdio"` (см. [документацию Cursor по MCP](https://cursor.com/docs/context/mcp)).
 
-`copilot_mcp_tool.py` при поиске токена в файлах обходит вверх по дереву каталогов и читает **и** `.vscode/mcp.json`, **и** `.cursor/mcp.json`, в том числе блоки `servers` и `mcpServers`.
+`cqds_mcp_full.py` при поиске токена в файлах обходит вверх по дереву каталогов и читает **и** `.vscode/mcp.json`, **и** `.cursor/mcp.json`, в том числе блоки `servers` и `mcpServers`.
 
 ### Пример для VS Code (фрагмент `servers`)
 
@@ -103,7 +105,7 @@ docker exec colloquium-core python3 /app/agent/create_user.py --list
 "colloquium": {
   "command": "X:\\Python3\\python.exe",
   "args": [
-    "X:\\docker\\cqds\\copilot_mcp_tool.py",
+    "X:\\docker\\cqds\\cqds_mcp_full.py",
     "--url",  "http://localhost:8008",
     "--username", "copilot"
   ],
@@ -123,7 +125,7 @@ docker exec colloquium-core python3 /app/agent/create_user.py --list
       "type": "stdio",
       "command": "X:\\Python3\\python.exe",
       "args": [
-        "X:\\docker\\cqds\\copilot_mcp_tool.py",
+        "X:\\docker\\cqds\\cqds_mcp_full.py",
         "--url",
         "http://localhost:8008",
         "--username",
@@ -152,12 +154,12 @@ docker exec colloquium-core python3 /app/agent/create_user.py --list
 
 При старте Cursor подставит значение из окружения; в git остаётся только шаблон без секрета.
 
-Дополнительно в Cursor можно использовать `${workspaceFolder}` в путях к `python` и к `copilot_mcp_tool.py`, чтобы не дублировать абсолютный диск.
+Дополнительно в Cursor можно использовать `${workspaceFolder}` в путях к `python` и к `cqds_mcp_full.py`, чтобы не дублировать абсолютный диск.
 
 > **VS Code**: наличие такой же интерполяции в MCP-конфиге зависит от версии и хоста Copilot. Если `${env:...}` не сработает, оставьте токен только в переменной окружения пользователя (хост всё равно передаёт `env` в дочерний процесс при явной настройке) или держите отдельный локальный `mcp.json` / фрагмент вне репозитория и добавьте путь в `.gitignore`.
 
 `MCP_AUTH_TOKEN` используется инструментом `cq_docker_control` для авторизации вызовов к `cqds_ctl.py` через localhost HTTP API.
-Если значение не попало в окружение процесса, `copilot_mcp_tool.py` пробует прочитать токен из `mcp.json` (см. выше), и как последний fallback использует значение по умолчанию `Grok-xAI-Agent-The-Best`.
+Если значение не попало в окружение процесса, `cqds_mcp_full.py` пробует прочитать токен из `mcp.json` (см. выше), и как последний fallback использует значение по умолчанию `Grok-xAI-Agent-The-Best`.
 
 > **Источники `MCP_AUTH_TOKEN` (по приоритету)**:
 > 1. `MCP_AUTH_TOKEN` env-переменная окружения **процесса MCP** (в т.ч. заданная через `env` в `mcp.json`, в том числе после интерполяции `${env:...}`)
@@ -172,28 +174,27 @@ docker exec colloquium-core python3 /app/agent/create_user.py --list
 
 Рекомендуемый порядок (от мягкого к жёсткому):
 
-1. **Отключить сервер** в списке MCP → подождать пару секунд → **включить снова**. Имеет смысл, если зависло соединение; после правок в `copilot_mcp_tool.py` может оказаться недостаточно.
+1. **Отключить сервер** в списке MCP → подождать пару секунд → **включить снова**. Имеет смысл, если зависло соединение; после правок в `cqds_mcp_full.py` может оказаться недостаточно.
 2. **Reload Window** — палитра команд (`Ctrl+Shift+P` / `Cmd+Shift+P`) → **Developer: Reload Window**. Перезагружает окно редактора и часто **полностью пересоздаёт** stdio MCP-процессы без выхода из Cursor.
 3. **Полный выход из Cursor** (закрыть все окна приложения) и запуск заново — **самый надёжный** вариант после изменения `.cursor/mcp.json`, путей к `python`, аргументов, переменных окружения или когда пункты 1–2 не помогли.
 
 Дополнительно: **View → Output** → в выпадающем списке канал вроде **MCP** / **MCP Logs** — по логам видно, стартовал ли процесс и нет ли ошибки импорта/пути.
 
-**Логи вида `skipping invalid path file://p%3A` (Windows):** это обычно **не** `copilot_mcp_tool`, а клиент Cursor или MCP **filesystem**, когда в протокол передаётся корень рабочей папки как `file:`-URL. Символ `:` в диске (`P:`) кодируется как `%3A`; для части проверок такой URI **невалиден** (корректная форма для Windows чаще ближе к `file:///P:/...` с тремя слэшами и буквой диска). Сообщение означает «этот root пропускаем»; на **colloquium** и HTTP к CQDS это не влияет. Если страдает именно **filesystem** MCP, попробуй в `mcp.json` путь через **`${workspaceFolder}`**, букву диска в **верхнем регистре** в явном пути (`P:\\...`), либо открыть папку проекта так, чтобы корень workspace совпадал с аргументом сервера — см. также [issues по MCP filesystem на Windows](https://github.com/modelcontextprotocol/servers/issues).
+**Логи вида `skipping invalid path file://p%3A` (Windows):** это обычно **не** `cqds_mcp_full`, а клиент Cursor или MCP **filesystem**, когда в протокол передаётся корень рабочей папки как `file:`-URL. Символ `:` в диске (`P:`) кодируется как `%3A`; для части проверок такой URI **невалиден** (корректная форма для Windows чаще ближе к `file:///P:/...` с тремя слэшами и буквой диска). Сообщение означает «этот root пропускаем»; на **colloquium** и HTTP к CQDS это не влияет. Если страдает именно **filesystem** MCP, попробуй в `mcp.json` путь через **`${workspaceFolder}`**, букву диска в **верхнем регистре** в явном пути (`P:\\...`), либо открыть папку проекта так, чтобы корень workspace совпадал с аргументом сервера — см. также [issues по MCP filesystem на Windows](https://github.com/modelcontextprotocol/servers/issues).
 
 **VS Code** (GitHub Copilot + MCP): после правок `.vscode/mcp.json` или скрипта MCP обычно достаточно **Developer: Reload Window** или перезапуска VS Code.
 
-Предпочтительный локальный вариант: пароль хранится в отдельном файле рядом с `copilot_mcp_tool.py`
+Предпочтительный локальный вариант: пароль хранится в отдельном файле рядом с `cqds_mcp_full.py`
 или в другом защищённом месте на хосте.
 
 ### Рекомендуемый вариант: sidecar secret
 
-Создай файл `X:\docker\cqds\mcp-tools\copilot_mcp_tool.secret`, в котором находится только пароль, без JSON и без лишних строк:
+В репозитории лежит **шаблон** `mcp-tools/cqds_mcp_auth.sample.secret` (можно коммитить). Локально создай рабочий файл **`mcp-tools/cqds_mcp_auth.secret`** (он в `.gitignore`):
 
-```text
-мой_пароль
-```
+1. Скопируй образец: `Copy-Item cqds_mcp_auth.sample.secret cqds_mcp_auth.secret` (из каталога `mcp-tools`).
+2. Открой `cqds_mcp_auth.secret` и оставь в нём **ровно одну строку** — пароль пользователя `copilot`, без `#`, без JSON и без пробелов по краям.
 
-После этого `copilot_mcp_tool.py` подхватит пароль автоматически, даже если в `mcp.json` пароль не указан.
+После этого `cqds_mcp_full.py` подхватит пароль автоматически, даже если в `mcp.json` пароль не указан.
 
 ### Явное указание файла секрета
 
@@ -223,23 +224,23 @@ docker exec colloquium-core python3 /app/agent/create_user.py --list
 "env": { "COLLOQUIUM_PASSWORD": "мой_пароль" }
 ```
 
-> Не коммить пароль в git. Предпочтительный вариант теперь — отдельный локальный файл секрета.
+> Не коммитить пароль в git. В репозитории — только `cqds_mcp_auth.sample.secret`; рабочий `cqds_mcp_auth.secret` остаётся локально.
 
 ### Приоритет источников пароля
 
-`copilot_mcp_tool.py` ищет пароль в таком порядке:
+`cqds_mcp_full.py` ищет пароль в таком порядке:
 
 1. `--password`
 2. `--password-file`
 3. `COLLOQUIUM_PASSWORD`
 4. `COLLOQUIUM_PASSWORD_FILE`
-5. `copilot_mcp_tool.secret` рядом со скриптом
+5. `cqds_mcp_auth.secret` рядом со скриптом (если его нет — устаревший `copilot_mcp_tool.secret`)
 6. fallback: `devspace`
 
 При старте MCP-tool пишет в stderr диагностическую строку с источником пароля и коротким preview:
 
 ```text
-MCP auth password source: copilot_mcp_tool.secret; preview=tE...
+MCP auth password source: cqds_mcp_auth.secret; preview=tE...
 ```
 
 Это сделано для быстрой диагностики двух случаев:
@@ -249,8 +250,8 @@ MCP auth password source: copilot_mcp_tool.secret; preview=tE...
 
 Preview намеренно показывает только первые 2 символа, а не полный пароль.
 
-Альтернатива для локальной машины: дать `copilot_mcp_tool.py` возможность читать пароль из локального секрета рядом с размещением,
-например из файла вида `copilot_mcp_tool.secret` или через `COLLOQUIUM_PASSWORD_FILE`.
+Альтернатива для локальной машины: дать `cqds_mcp_full.py` возможность читать пароль из локального секрета рядом с размещением,
+например из файла вида `cqds_mcp_auth.secret` или через `COLLOQUIUM_PASSWORD_FILE`.
 
 Это разумно, если предполагается, что при получении локального доступа к хосту парольная защита уже не является главным барьером.
 В таком режиме в git хранится только путь к секрету, а не сам пароль.
@@ -564,7 +565,7 @@ docker start colloquium-core
 Логирование MCP-tool:
 
 ```text
-По умолчанию runtime-лог пишется в ./logs/copilot_mcp_tool.runtime.log
+По умолчанию runtime-лог пишется в ./logs/cqds_mcp_full.runtime.log
 ```
 
 Можно переопределить переменными окружения:
@@ -581,7 +582,7 @@ COLLOQUIUM_MCP_LOG_LEVEL уровень логирования (например
 Запусти сервер вручную — если стартует без ошибок, конфигурация верна:
 
 ```powershell
-python.exe X:\docker\cqds\mcp-tools\copilot_mcp_tool.py `
+python.exe X:\docker\cqds\mcp-tools\cqds_mcp_full.py `
   --url http://localhost:8008 --username copilot
 # Должен зависнуть (ожидает stdin от MCP-клиента) — Ctrl+C для выхода
 ```
@@ -689,6 +690,6 @@ wait     — для status: блокировать до stable/failed вмест
 
 - [ ] **Стратегия сервиса `copilot`** — считать `copilot` резидентным техническим пользователем MCP-tool. Не удалять и не пересоздавать его при обычных перезапусках. Все инструкции и runbook должны исходить из того, что пользователь уже существует.
 - [ ] **Ограничение входа по источнику (`host`)** — расширить схему `users`: добавить поле `host_policy` или `host`, которое будет ограничивать допустимый источник логина для конкретного пользователя. Поддерживаемые режимы: `any`, `localhost`, `local_subnet`, `exact_ip`. Проверка должна выполняться в `/login` по `Request.client.host` до создания сессии.
-- [x] **Секрет из локального файла** — `copilot_mcp_tool.py` умеет читать пароль из `COLLOQUIUM_PASSWORD_FILE` или sidecar-файла `copilot_mcp_tool.secret`, поэтому пароль можно не хранить в `mcp.json`.
+- [x] **Секрет из локального файла** — `cqds_mcp_full.py` умеет читать пароль из `COLLOQUIUM_PASSWORD_FILE` или sidecar `cqds_mcp_auth.secret` (шаблон для копирования: `cqds_mcp_auth.sample.secret`), поэтому пароль можно не хранить в `mcp.json`.
 - [ ] **Приоритет вариантов** — краткосрочно предпочтителен секретный файл на хосте: меньше изменений, нет миграции таблицы `users`, быстрее внедряется. Среднесрочно правильнее добавить `host`-ограничение в auth-схему, чтобы `copilot` был привязан к ожидаемому источнику доступа даже при утечке пароля.
 - [ ] **Принудительная смена пароля по умолчанию** — при первом логине с паролем `devspace` возвращать предупреждение в ответе (поле `warn`), чтобы оператор знал о необходимости смены.

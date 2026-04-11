@@ -22,9 +22,10 @@ Use this index as the entry point.
 ### MCP integration and toolchain
 
 1. [MCP Tools](MCP-Tools.md)
-2. [copilot_mcp_tool](../copilot_mcp_tool.md)
-3. [MCP_DELEGATION_QUICK_START](../MCP_DELEGATION_QUICK_START.md)
-4. [MCP_DELEGATION_STRATEGY](../MCP_DELEGATION_STRATEGY.md)
+2. [cqds_mcp_mini](../cqds_mcp_mini.md)
+3. [cqds_mcp_full](../cqds_mcp_full.md)
+4. [MCP_DELEGATION_QUICK_START](../MCP_DELEGATION_QUICK_START.md)
+5. [MCP_DELEGATION_STRATEGY](../MCP_DELEGATION_STRATEGY.md)
 
 ### Deployment and operations
 

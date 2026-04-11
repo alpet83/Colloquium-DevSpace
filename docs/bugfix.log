@@ -18,7 +18,7 @@
 ### Enhanced: MCP-tool logs scanning with time-window filter
 **Severity**: Low / Enhancement  
 **Area**: Development Tools / Diagnostics  
-**File**: `src/copilot_mcp_tool.py`
+**File**: `src/mcp-tools/cqds_mcp_full.py`
 
 **Description**: Added `cq_grep_logs` MCP tool with optional `since_seconds` parameter for time-based filtering of project logs. Supports multiple log file masks, partial line matching with context preservation for traceback blocks.
 

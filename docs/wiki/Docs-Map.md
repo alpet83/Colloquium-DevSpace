@@ -19,7 +19,8 @@ Canonical categorized map of documentation under `docs/`.
 
 ## MCP and Delegation
 
-- [copilot_mcp_tool](../copilot_mcp_tool.md)
+- [cqds_mcp_mini](../cqds_mcp_mini.md)
+- [cqds_mcp_full](../cqds_mcp_full.md)
 - [MCP_DELEGATION_QUICK_START](../MCP_DELEGATION_QUICK_START.md)
 - [MCP_DELEGATION_STRATEGY](../MCP_DELEGATION_STRATEGY.md)
 - [MCP_DELEGATION_TEMPLATE](../MCP_DELEGATION_TEMPLATE.md)

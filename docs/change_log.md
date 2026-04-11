@@ -68,7 +68,7 @@ Returns: `[{"file_id": int, "file_name": str, "index_num": int, "tokens": int, .
 
 This way the MCP tool, LLM agents, and `cq_list_files` all see the same unified index with both ID and index_num in one response — no ambiguity.
 
-**Affected files:** `routes/project_routes.py`, `context_assembler.py`, `copilot_mcp_tool.py` (`cq_list_files` tool description)
+**Affected files:** `routes/project_routes.py`, `context_assembler.py`, `cqds_mcp_full.py` (`cq_list_files` tool description)
 
 ---
 

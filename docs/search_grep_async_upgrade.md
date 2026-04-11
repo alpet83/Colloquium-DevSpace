@@ -260,7 +260,7 @@ rg 'POST /project/smart_grep/chunk' logs/colloquium_serv.log
 - [x] **B2.** Переименовать `cq_extra_result` → **`cq_fetch_result`**; семантика: следующий чанк + опционально дозагрузка из MCP page-store при склеенном режиме.
 - [x] **B3.** Обновить `cqds_client.py`: метод(ы) для `/project/smart_grep/chunk`.
 - [x] **B4.** Обновить `finalize_smart_grep_response` / TTL: **от момента `scan_complete`** при агрегировании в MCP (уточнить реализацию в `cqds_result_pages.py`).
-- [x] **B5.** Обновить `copilot_mcp_tool.md` и любые примеры в репозитории.
+- [x] **B5.** Обновить `cqds_mcp_full.md` и любые примеры в репозитории.
 
 ### Фаза C — фронт и совместимость
 
