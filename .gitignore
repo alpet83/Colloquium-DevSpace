@@ -1,4 +1,7 @@
 __pycache__/
+# Локальный пароль MCP / Colloquium (образец — src/mcp-tools/cqds_mcp_auth.sample.secret)
+src/mcp-tools/cqds_mcp_auth.secret
+src/mcp-tools/copilot_mcp_tool.secret
 *.py[cod]
 *.pyo
 .tmp/
