@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="520" height="320" viewBox="0 0 520 320">
+  <defs>
+    <style type="text/css"><![CDATA[
+      .box { fill: #f4f4f5; stroke: #27272a; stroke-width: 1.5; rx: 6; }
+      .title { font: 14px system-ui, sans-serif; fill: #18181b; }
+      .small { font: 12px system-ui, sans-serif; fill: #3f3f46; }
+      .arrow { stroke: #52525b; stroke-width: 1.5; fill: none; marker-end: url(#m); }
+    ]]></style>
+    <marker id="m" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" fill="#52525b"/>
+    </marker>
+  </defs>
+
+  <text x="260" y="28" text-anchor="middle" class="title">Зачем объём статистики (Phase 1)</text>
+
+  <rect class="box" x="40" y="50" width="140" height="56"/>
+  <text x="110" y="78" text-anchor="middle" class="title">Раннер</text>
+  <text x="110" y="96" text-anchor="middle" class="small">filewalk / сценарии</text>
+
+  <rect class="box" x="220" y="50" width="140" height="56"/>
+  <text x="290" y="78" text-anchor="middle" class="title">Colloquium</text>
+  <text x="290" y="96" text-anchor="middle" class="small">сбор контекста</text>
+
+  <rect class="box" x="400" y="50" width="80" height="56"/>
+  <text x="440" y="88" text-anchor="middle" class="title">Grok</text>
+
+  <path class="arrow" d="M180 78 L220 78"/>
+  <path class="arrow" d="M360 78 L400 78"/>
+
+  <rect class="box" x="100" y="150" width="320" height="72"/>
+  <text x="260" y="178" text-anchor="middle" class="title">context_cache_metrics</text>
+  <text x="260" y="198" text-anchor="middle" class="small">режим, reason, sent_tokens, build_ms, ошибки…</text>
+  <text x="260" y="214" text-anchor="middle" class="small">много строк = устойчивые распределения</text>
+
+  <path class="arrow" d="M290 106 L260 150"/>
+
+  <rect class="box" x="100" y="250" width="320" height="56"/>
+  <text x="260" y="278" text-anchor="middle" class="title">Дальше: решения по кэшу</text>
+  <text x="260" y="294" text-anchor="middle" class="small">пороги и стратегия — по цифрам, не вслепую</text>
+
+  <path class="arrow" d="M260 222 L260 250"/>
+</svg>
