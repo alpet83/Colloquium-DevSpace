@@ -13,7 +13,7 @@
   python src/tests/run_smart_grep_chunk_smoke.py --project-id 2 --query def \\
     --limit-files 200 --max-hits 50000 --stats-json
 
-Авторизация как compare_smart_grep_search_modes (cqds_credentials / copilot_mcp_tool.secret).
+Авторизация как compare_smart_grep_search_modes (cqds_credentials / cqds_mcp_auth.secret).
 """
 from __future__ import annotations
 

@@ -47,6 +47,8 @@ Canonical categorized map of documentation under `docs/`.
 
 - [change_log](../change_log.md)
 - [bugfix.log](../bugfix.log)
+- [PROCESS_MGMT_REPORT](../PROCESS_MGMT_REPORT.md)
+- [perf_issues_and_TODO](../perf_issues_and_TODO.md)
 
 ## Wiki Pages
 

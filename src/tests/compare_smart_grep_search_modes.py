@@ -7,9 +7,9 @@
 третий снова с project_refresh. Наборы попаданий (по file_name + line + тексту)
 должны совпадать, если между запросами файлы на диске не менялись.
 
-Авторизация (как copilot_mcp_tool): если нет --session / --session-file / SMART_GREP_SESSION,
+Авторизация (как cqds_mcp_full): если нет --session / --session-file / SMART_GREP_SESSION,
 выполняется POST /api/login на базу из COLLOQUIUM_URL (по умолчанию http://localhost:8008),
-пароль — COLLOQUIUM_PASSWORD, COLLOQUIUM_PASSWORD_FILE или mcp-tools/copilot_mcp_tool.secret
+пароль — COLLOQUIUM_PASSWORD, COLLOQUIUM_PASSWORD_FILE или mcp-tools/cqds_mcp_auth.secret
   (путь к секрету считается от каталога mcp-tools, где лежит cqds_credentials.py, не от cwd).
 
 Примеры:
@@ -571,7 +571,7 @@ def main() -> int:
     p.add_argument(
         "--password-file",
         default=None,
-        help="Файл с паролем (иначе COLLOQUIUM_PASSWORD_FILE или copilot_mcp_tool.secret)",
+        help="Файл с паролем (иначе COLLOQUIUM_PASSWORD_FILE или cqds_mcp_auth.secret)",
     )
     p.add_argument(
         "--login-timeout",
