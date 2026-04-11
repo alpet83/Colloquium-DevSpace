@@ -8,7 +8,7 @@
       <button @click="openCreateProjectModal">Создать проект</button>
       <button v-if="selectedProject" @click="openEditProjectModal">Редактировать проект</button>
       <select v-model="selectedProject" @change="selectProject">
-        <option value="">Все файлы</option>
+        <option value="">Проект не выбран</option>
         <option
           v-for="project in projects"
           :value="project.id"
@@ -74,7 +74,8 @@
         <FileManager :trees="fileTrees" @delete-file="fileStore.deleteFile" @update-file="fileStore.updateFile" />
       </div>
       <div v-else class="no-files">
-        <p>Файлы не найдены</p>
+        <p v-if="!selectedProject">Выберите проект — полное дерево по всем проектам не загружается (нагрузка на сервер).</p>
+        <p v-else>Файлы не найдены</p>
       </div>
     </div>
   </div>
@@ -194,7 +195,12 @@ export default defineComponent({
     },
     async loadProjectTree() {
       try {
-        const project_id = this.selectedProject ? parseInt(this.selectedProject) : null
+        if (!this.selectedProject) {
+          this.fileTrees = []
+          log_msg('FILE', 'Skipping file_tree: no project selected (avoids file_index for all projects)')
+          return
+        }
+        const project_id = parseInt(this.selectedProject, 10)
         log_msg('FILE', 'Loading shallow file tree for project_id:', project_id)
         const payload = await this.fileStore.fetchFileTree(project_id, '', 3)
         this.fileTrees = payload?.trees || []

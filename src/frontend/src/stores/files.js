@@ -17,6 +17,7 @@ export const useFileStore = defineStore('files', {
     lastRequestTimes: new Map(),
     minUpdateDelay: new Map([
       ['fetchFiles', 5000],
+      ['fetchFileMetadata', 3000],
       ['deleteFile', 5000],
       ['updateFile', 5000],
       ['uploadFile', 5000]
@@ -84,7 +85,7 @@ export const useFileStore = defineStore('files', {
         (Array.isArray(fileIds) ? fileIds : [])
           .map(fileId => parseInt(fileId, 10))
           .filter(fileId => Number.isInteger(fileId) && fileId > 0)
-      )]
+      )].sort((a, b) => a - b)
       if (normalizedIds.length === 0) return []
 
       const params = new URLSearchParams()
@@ -99,7 +100,7 @@ export const useFileStore = defineStore('files', {
         `/project/file_index?${params.toString()}`,
         { method: 'GET' },
         requestKey,
-        0
+        this.minUpdateDelay.get('fetchFileMetadata')
       )
       if (data) {
         this.mergeFileMetadata(data)

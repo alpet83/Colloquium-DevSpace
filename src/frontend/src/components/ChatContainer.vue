@@ -127,7 +127,7 @@
   import { log_msg, log_error, set_show_logs } from '../utils/debugging'
   import { handleModal, sendMessage, editPost, confirmFileUpload, showFilePreview, handleSelectFile, handleSelectDir } from '../utils/chat_actions'
   import { formatDateTime } from '../utils/common'
-  import { formatMessage, reformatMessages, checkAwaitedFiles } from '../utils/chat_format'
+  import { formatMessage, reformatMessages, syncAwaitedAttachedFiles } from '../utils/chat_format'
   
   function lineFromOffset(lines, offset) {
     let line = 1;
@@ -156,7 +156,8 @@
         debugLogs: [],
         filePreviewContent: '',
         logFilters: '',
-        awaited_files: {}
+        awaited_files: {},
+        _syncAttachedTimer: null,
       }
     },
     setup() {
@@ -194,7 +195,8 @@
       this.overrideConsole()
       this.fetchBackendLogs()
       this.backendLogInterval = setInterval(this.fetchBackendLogs, 30000)
-      this.logFilters = JSON.parse(localStorage.getItem('show_logs'))?.join(',') || 'CHAT,FILE,ACTION,ERROR,UI'      
+      this.logFilters = JSON.parse(localStorage.getItem('show_logs'))?.join(',') || 'CHAT,FILE,ACTION,ERROR,UI'
+      this.scheduleSyncAwaitedAttached()
     },
     beforeUnmount() {
       this.stopPolling()
@@ -204,6 +206,10 @@
       if (this.backendLogInterval) {
         clearInterval(this.backendLogInterval)
       }
+      if (this._syncAttachedTimer) {
+        clearTimeout(this._syncAttachedTimer)
+        this._syncAttachedTimer = null
+      }
     },
     watch: {
       'chatStore.history': {
@@ -211,11 +217,25 @@
           this.$nextTick(() => {
             this.applyHighlightJS();
           });
+          this.scheduleSyncAwaitedAttached();
+        },
+        deep: true
+      },
+      'fileStore.fileMetaById': {
+        handler() {
+          this.scheduleSyncAwaitedAttached();
         },
         deep: true
       }
     },
     methods: {
+      scheduleSyncAwaitedAttached() {
+        if (this._syncAttachedTimer) clearTimeout(this._syncAttachedTimer)
+        this._syncAttachedTimer = setTimeout(() => {
+          this._syncAttachedTimer = null
+          syncAwaitedAttachedFiles(this)
+        }, 150)
+      },
       formatDateTime,
       applyHighlightJS() {
         if (window.hljs) {
@@ -280,7 +300,7 @@
           this.pollInterval = setInterval(() => {
             if (this.chatStore.selectedChatId && !this.chatStore.isPolling) {
               this.chatStore.waitChanges = !this.chatStore.need_full_history
-              this.chatStore.fetchHistory().then(() => checkAwaitedFiles(this))
+              this.chatStore.fetchHistory()
             }
           }, 1000)
         }

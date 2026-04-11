@@ -41,6 +41,48 @@ export function lang_class(files, fileId) {
     return ''     
 }
 
+/** Regexes to find file_id references in raw post bodies (keep in sync with formatMessage). */
+const ATTACHED_FILE_REF_SCANS = [
+  /@(?:attach|attached_file)#(\d+)/g,
+  /<undo_file\s+file_id="(\d+)"/g,
+  /<replace\s+file_id="(\d+)"/g,
+  /<move_file\s+file_id="(\d+)"/g,
+]
+
+/**
+ * Scan chat history once for attached-file references missing from knownFiles; update awaited_files
+ * and optionally fetch metadata. Call from watchers / after history fetch — not from computed formatMessage.
+ */
+export function syncAwaitedAttachedFiles(context) {
+  const history = Object.values(context.chatStore.history).filter(p => p.action !== 'delete')
+  const knownIds = new Set(
+    context.fileStore.knownFiles.map(f => f.id).filter(id => Number.isInteger(id) && id > 0)
+  )
+  const referencedMissing = new Set()
+  for (const msg of history) {
+    const text = msg.message || ''
+    for (const re of ATTACHED_FILE_REF_SCANS) {
+      const r = new RegExp(re.source, 'g')
+      let m
+      while ((m = r.exec(text)) !== null) {
+        const id = parseInt(m[1], 10)
+        if (Number.isInteger(id) && id > 0 && !knownIds.has(id)) referencedMissing.add(id)
+      }
+    }
+  }
+  Object.keys(context.awaited_files).forEach((key) => {
+    const id = parseInt(key, 10)
+    if (knownIds.has(id) || !referencedMissing.has(id)) {
+      delete context.awaited_files[key]
+    }
+  })
+  referencedMissing.forEach((id) => {
+    const k = String(id)
+    if (!(k in context.awaited_files)) context.awaited_files[k] = 3
+  })
+  checkAwaitedFiles(context)
+}
+
 export function formatMessage(message, userName, timestamp, quotes, files, postId, context) {  
   let formatted = message || '[Post deleted]'
   // Replace @attach/@attached_file#ID with clickable file links
@@ -50,10 +92,6 @@ export function formatMessage(message, userName, timestamp, quotes, files, postI
       return `<span class="file-link" data-file-id="${file.id}">File: ${file.file_name} ` +
              `(@attached_file#${file.id}, ${formatDateTime(file.ts)})</span>`
     }
-    if (!(fileId in context.awaited_files)) {
-      context.awaited_files[fileId] = 3
-    }
-    checkAwaitedFiles(context)
     return `<span class="file-unavailable">Файл ${fileId} удалён или недоступен</span>`
   })
   // Replace @quote#ID with formatted quote blocks
@@ -122,11 +160,6 @@ export function formatMessage(message, userName, timestamp, quotes, files, postI
         return `<span class="file-link" data-file-id="${file.id}">File: ${file.file_name} ` +
                `(@attached_file#${file.id}, ${formatDateTime(file.ts)})</span>`
       }
-      if (!(fileId in context.awaited_files)) {
-        context.awaited_files[fileId] = 3
-      }
-      checkAwaitedFiles(context)
-      // log_msg('UI', `Processed undo_file tag for file_id: ${fileId}`)
       return `<span class="undo-file">восстановлен файл @attached_file#${fileId} (Файл ${fileId} недоступен)</span>`
     }
   )
@@ -139,10 +172,6 @@ export function formatMessage(message, userName, timestamp, quotes, files, postI
         return `<span class="file-link" data-file-id="${file.id}">File: ${file.file_name} ` +
                `(@attached_file#${file.id}, ${formatDateTime(file.ts)})</span>`
       }
-      if (!(fileId in context.awaited_files)) {
-        context.awaited_files[fileId] = 3
-      }
-      checkAwaitedFiles(context)
       const text = replaceTo
         ? `Замена в файле @attached_file#${fileId} (Файл ${fileId} недоступен) текста '${pattern}' на '${replaceTo}'`
         : `Удаление из файла @attached_file#${fileId} (Файл ${fileId} недоступен) текста '${pattern}'`
@@ -159,10 +188,6 @@ export function formatMessage(message, userName, timestamp, quotes, files, postI
         return `<span class="file-link" data-file-id="${file.id}">File: ${file.file_name} ` +
                `(@attached_file#${file.id}, ${formatDateTime(file.ts)})</span>`
       }
-      if (!(fileId in context.awaited_files)) {
-        context.awaited_files[fileId] = 3
-      }
-      checkAwaitedFiles(context)      
       return `<span class="move-file">Перемещение файла @attached_file#${fileId} (Файл ${fileId} недоступен), ` +
              `новое имя ${newName}</span>`
     }
@@ -234,27 +259,24 @@ export function formatMessage(message, userName, timestamp, quotes, files, postI
 }
 
 export function reformatMessages(context) {
-  if (Object.keys(context.awaited_files).length === 0) return
-  context.formattedMessages = Object.values(context.chatStore.history)
-    .filter(post => post.action !== 'delete')
-    .sort((a, b) => a.id - b.id)
-    .map(msg => ({
-      ...msg,
-      formatted: formatMessage(msg.message, msg.user_name, msg.timestamp, context.chatStore.quotes,
-                              context.fileStore.knownFiles, msg.id, context)
-    }))
-  Object.keys(context.awaited_files).forEach(fileId => {
-    if (!context.fileStore.knownFiles.some(f => f.id === parseInt(fileId)) && context.awaited_files[fileId] > 0) {
-      context.awaited_files[fileId]--
+  Object.keys(context.awaited_files).forEach((fileId) => {
+    const id = parseInt(fileId, 10)
+    if (context.fileStore.knownFiles.some(f => f.id === id)) {
+      delete context.awaited_files[fileId]
     }
   })
-  log_msg('UI', `Reformatted messages, updated awaited_files: ${JSON.stringify(context.awaited_files)}`)
+  log_msg('UI', `reformatMessages: pruned awaited_files → ${JSON.stringify(context.awaited_files)}`)
 }
 
 export function checkAwaitedFiles(context) {
+  const meta = context.fileStore.fileMetaById
   const activeFiles = Object.entries(context.awaited_files)
     .filter(([_, retries]) => retries > 0)
     .map(([fileId]) => fileId)
+    .filter(fileId => {
+      const id = parseInt(fileId, 10)
+      return Number.isInteger(id) && id > 0 && !meta[id]
+    })
   if (activeFiles.length > 0) {
     context.fileStore.fetchFileMetadata(activeFiles)
     log_msg('UI', `Requested file metadata for awaited_files: ${activeFiles}`)
