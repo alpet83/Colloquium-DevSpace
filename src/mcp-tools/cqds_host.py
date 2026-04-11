@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import threading
 import time
+from pathlib import Path
 from typing import Any
 import uuid
 
@@ -14,6 +17,100 @@ from cqds_run_ctx import RunContext
 
 _MAX_HOST_PROC_BUFF = 4 * 1024 * 1024
 _MAX_HOST_PROCS = 48
+
+_HOST_PROC_LOG_LOCK = threading.Lock()
+
+
+def _host_proc_log_enabled() -> bool:
+    v = (os.environ.get("CQDS_HOST_PROC_LOG") or "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _host_proc_log_path() -> Path:
+    raw = (os.environ.get("CQDS_HOST_PROC_LOG_FILE") or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return Path(__file__).resolve().parent / "logs" / "cqds_host_processes.log"
+
+
+def _host_proc_log_line(event: str, **fields: Any) -> None:
+    """Append one JSON line to the shared host-process log (spawn / ttl / finished)."""
+    if not _host_proc_log_enabled():
+        return
+    path = _host_proc_log_path()
+    payload = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": event, **fields}
+    line = json.dumps(payload, ensure_ascii=False) + "\n"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _HOST_PROC_LOG_LOCK:
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+    except OSError as exc:
+        LOGGER.warning("host_proc log write failed: %s", exc)
+
+
+async def _host_supervise_process(
+    process_guid: str,
+    proc: asyncio.subprocess.Process,
+    rec: HostProcRecord,
+    timeout_sec: int,
+) -> None:
+    """Wait for exit or TTL; log ttl warning (~90%%), natural finish, or ttl kill. Cancelled = external kill."""
+    warn_task: asyncio.Task[None] | None = None
+    if timeout_sec >= 60:
+
+        async def _ttl_warning() -> None:
+            await asyncio.sleep(max(30.0, float(timeout_sec) * 0.9))
+            if proc.returncode is None:
+                _host_proc_log_line(
+                    "host_proc_ttl_warning",
+                    process_guid=process_guid,
+                    pid=proc.pid,
+                    timeout_sec=timeout_sec,
+                    runtime_ms=int((time.monotonic() - rec.started) * 1000),
+                    command=rec.argv_desc[:300],
+                )
+
+        warn_task = asyncio.create_task(_ttl_warning())
+
+    try:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=float(timeout_sec))
+            rc = proc.returncode
+            reason = "natural"
+        except asyncio.TimeoutError:
+            _host_proc_log_line(
+                "host_proc_ttl_exceeded",
+                process_guid=process_guid,
+                pid=proc.pid,
+                timeout_sec=timeout_sec,
+                runtime_ms=int((time.monotonic() - rec.started) * 1000),
+                command=rec.argv_desc[:300],
+            )
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+            rc = proc.returncode
+            reason = "ttl_kill"
+        runtime_ms = int((time.monotonic() - rec.started) * 1000)
+        _host_proc_log_line(
+            "host_proc_finished",
+            process_guid=process_guid,
+            pid=proc.pid,
+            returncode=rc,
+            runtime_ms=runtime_ms,
+            reason=reason,
+            command=rec.argv_desc[:300],
+        )
+    except asyncio.CancelledError:
+        raise
+    finally:
+        if warn_task is not None and not warn_task.done():
+            warn_task.cancel()
+            try:
+                await warn_task
+            except asyncio.CancelledError:
+                pass
 
 
 async def _host_pump_stream(reader: asyncio.StreamReader | None, acc: bytearray, cap: int) -> None:
@@ -81,8 +178,10 @@ TOOLS: list[Tool] = [
             "Spawn a subprocess on the machine where this MCP server runs (local host), not in "
             "Colloquium/mcp-sandbox. Same interaction model as cq_process_spawn: use cq_host_process_io "
             "/ wait / status / kill afterward. command: shell string (asyncio.create_subprocess_shell) "
-            "or argv array (create_subprocess_exec). Optional cwd, env, timeout seconds (1–7200, default 3600) "
-            "after which the process is killed if still running."
+            "or argv array (create_subprocess_exec). Optional cwd, env, timeout seconds (default 3600, no upper cap) "
+            "after which the process is killed if still running. "
+            "Lifecycle is appended as JSON lines to CQDS_HOST_PROC_LOG_FILE (default mcp-tools/logs/cqds_host_processes.log); "
+            "set CQDS_HOST_PROC_LOG=0 to disable."
         ),
         inputSchema={
             "type": "object",
@@ -90,7 +189,11 @@ TOOLS: list[Tool] = [
                 "command": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}, "minItems": 1}], "description": "Shell string or argv list."},
                 "cwd": {"type": "string"},
                 "env": {"type": "object"},
-                "timeout": {"type": "integer", "description": "TTL in seconds; process killed if still alive (default 3600).", "default": 3600},
+                "timeout": {
+                    "type": "integer",
+                    "description": "Wall-clock TTL in seconds (default 3600); not capped on host (unlike sandbox spawn).",
+                    "default": 3600,
+                },
             },
             "required": ["command"],
         },
@@ -172,7 +275,13 @@ async def handle(name: str, arguments: dict[str, Any], ctx: RunContext) -> CallT
         if isinstance(env_arg, dict):
             for key, value in env_arg.items():
                 env_merged[str(key)] = str(value)
-        timeout_sec = max(1, min(int(arguments.get("timeout", 3600)), 7200))
+        try:
+            req_timeout = int(arguments.get("timeout", 3600))
+        except (TypeError, ValueError):
+            req_timeout = 3600
+        if req_timeout < 1:
+            return _text("timeout must be >= 1 (seconds until SIGKILL if process still alive)")
+        timeout_sec = req_timeout
 
         try:
             if isinstance(cmd, str):
@@ -208,12 +317,15 @@ async def handle(name: str, arguments: dict[str, Any], ctx: RunContext) -> CallT
         rec.pump_out = asyncio.create_task(_host_pump_stream(proc.stdout, rec.stdout_acc, _MAX_HOST_PROC_BUFF))
         rec.pump_err = asyncio.create_task(_host_pump_stream(proc.stderr, rec.stderr_acc, _MAX_HOST_PROC_BUFF))
 
-        async def _host_ttl_kill() -> None:
-            await asyncio.sleep(float(timeout_sec))
-            if proc.returncode is None:
-                proc.kill()
-
-        rec.ttl_task = asyncio.create_task(_host_ttl_kill())
+        _host_proc_log_line(
+            "host_proc_spawned",
+            process_guid=guid,
+            pid=proc.pid,
+            timeout_sec=timeout_sec,
+            cwd=cwd_s or "",
+            command=desc[:300],
+        )
+        rec.ttl_task = asyncio.create_task(_host_supervise_process(guid, proc, rec, timeout_sec))
         host_proc_registry[guid] = rec
         return _json_text({"process_guid": guid, "pid": proc.pid, "command": desc, "timeout": timeout_sec})
 
@@ -275,6 +387,17 @@ async def handle(name: str, arguments: dict[str, Any], ctx: RunContext) -> CallT
                     except asyncio.CancelledError:
                         pass
             host_proc_registry.pop(process_guid, None)
+        runtime_ms = int((time.monotonic() - rec.started) * 1000)
+        _host_proc_log_line(
+            "host_proc_finished",
+            process_guid=process_guid,
+            pid=rec.proc.pid,
+            returncode=rec.proc.returncode,
+            runtime_ms=runtime_ms,
+            reason="user_kill",
+            signal=signal_name,
+            command=rec.argv_desc[:300],
+        )
         return _json_text({"stopped": True, "returncode": rec.proc.returncode})
 
     if name == "cq_host_process_status":

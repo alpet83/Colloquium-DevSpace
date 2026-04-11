@@ -1,18 +1,28 @@
+"""Лаконичный MCP-интерфейс ко всему инструментарию CQDS (stdio, Colloquium HTTP API).
+
+Расположение: корень ``mcp-tools/`` (рядом с ``cqds_mcp_full.py``). Модули инструментов —
+в ``mcp-tools/runtime/`` (``cq_runtime_*``).
+
+Бывшие имена: ``copilot_mcp_runtime.py``, затем ``runtime/cqds_mcp_mini.py``.
+"""
 from __future__ import annotations
 
 import argparse
 import asyncio
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
-# Make parent mcp-tools importable; script dir (runtime/) is already on sys.path[0].
-_THIS_DIR = Path(__file__).resolve().parent
-_PARENT = _THIS_DIR.parent
-if str(_PARENT) not in sys.path:
-    sys.path.insert(0, str(_PARENT))
+# Импорты из корня mcp-tools (cqds_*) и из runtime/ (cq_runtime_*).
+_MCP_TOOLS_DIR = Path(__file__).resolve().parent
+_RUNTIME_DIR = _MCP_TOOLS_DIR / "runtime"
+for _p in (_MCP_TOOLS_DIR, _RUNTIME_DIR):
+    _s = str(_p)
+    if _s not in sys.path:
+        sys.path.insert(0, _s)
 
 from mcp.server import Server  # type: ignore[import]
 from mcp.server.stdio import stdio_server  # type: ignore[import]
@@ -38,6 +48,7 @@ import cq_runtime_docker_ctl
 import cq_runtime_exec_ctl
 import cq_runtime_files_ctl
 import cq_runtime_help
+import cq_runtime_host_heartbeat
 import cq_runtime_process_ctl
 import cq_runtime_project_ctl
 
@@ -75,7 +86,7 @@ def _registered_tools() -> list[Tool]:
 
 
 async def run_server(client: ColloquiumClient) -> None:
-    server = Server("cqds-mcp-runtime")
+    server = Server("cqds-mcp-mini")
     index_queue: asyncio.Queue[int] = asyncio.Queue()
     index_jobs: dict[int, dict[str, object]] = {}
     index_worker_task: asyncio.Task[None] | None = None
@@ -187,27 +198,47 @@ async def run_server(client: ColloquiumClient) -> None:
             CURRENT_TOOL.reset(token)
 
     async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+        hb_task: asyncio.Task[None] | None = None
+        if cq_runtime_host_heartbeat.should_run_heartbeat_loop():
+            hb_task = asyncio.create_task(
+                cq_runtime_host_heartbeat.host_project_heartbeat_loop(LOGGER),
+                name="cq-host-project-heartbeat",
+            )
+        try:
+            await server.run(read_stream, write_stream, server.create_initialization_options())
+        finally:
+            if hb_task is not None:
+                hb_task.cancel()
+                try:
+                    await hb_task
+                except asyncio.CancelledError:
+                    pass
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="CQDS runtime MCP (compact toolset)")
+    parser = argparse.ArgumentParser(description="CQDS MCP mini — компактный доступ к инструментарию CQDS")
     parser.add_argument("--url", default=os.environ.get("COLLOQUIUM_URL", "http://localhost:8008"))
     parser.add_argument("--username", default=os.environ.get("COLLOQUIUM_USERNAME", "copilot"))
     parser.add_argument("--password", default=os.environ.get("COLLOQUIUM_PASSWORD", "devspace"))
     args = parser.parse_args()
 
-    print_ident_stderr("runtime")
-    os.environ.setdefault("COLLOQUIUM_MCP_LOG_STEM", "cqds_mcp_runtime")
+    print_ident_stderr("mini")
+    os.environ.setdefault("COLLOQUIUM_MCP_LOG_STEM", "cqds_mcp_mini")
     _setup_logging()
     LOGGER.info(
-        "CQDS runtime MCP (compact) pid=%s url=%s user=%s",
+        "CQDS MCP mini pid=%s url=%s user=%s",
         os.getpid(),
         args.url,
         args.username,
     )
     if cq_hide_tool_names():
         LOGGER.info("CQ_HIDE_TOOLS active: %s", sorted(cq_hide_tool_names()))
+    if cq_runtime_host_heartbeat.heartbeat_enabled():
+        if not shutil.which("docker") and not cq_runtime_host_heartbeat.fallback_projects_parent_configured():
+            LOGGER.warning(
+                "CQDS_MCP_PROJECT_HEARTBEAT is on but docker CLI not found and CQDS_MCP_HEARTBEAT_PROJECTS_DIR unset; "
+                "host heartbeat will not write .cqds_mcp_active.pid (see cq_runtime_host_heartbeat)"
+            )
     client = ColloquiumClient(base_url=args.url, username=args.username, password=args.password)
     try:
         asyncio.run(run_server(client))

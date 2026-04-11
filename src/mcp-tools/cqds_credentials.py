@@ -1,5 +1,7 @@
 # cqds_credentials.py — пароль и сессия для HTTP API (MCP, интеграционные тесты)
-# Секрет по умолчанию: рядом с этим файлом, mcp-tools/copilot_mcp_tool.secret (путь от __file__, не от cwd).
+# Секрет по умолчанию: mcp-tools/cqds_mcp_auth.secret (путь от __file__, не от cwd).
+# Шаблон для копирования в репозитории: cqds_mcp_auth.sample.secret
+# Устаревшее имя sidecar: copilot_mcp_tool.secret — подхватывается, если нового файла нет.
 from __future__ import annotations
 
 import json
@@ -11,7 +13,34 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 _MCP_TOOLS_DIR = Path(__file__).resolve().parent
-_SIDECAR_SECRET = _MCP_TOOLS_DIR / "copilot_mcp_tool.secret"
+
+_SIDECAR_CANDIDATES: tuple[tuple[Path, str], ...] = (
+    (_MCP_TOOLS_DIR / "cqds_mcp_auth.secret", "cqds_mcp_auth.secret"),
+    (_MCP_TOOLS_DIR / "copilot_mcp_tool.secret", "copilot_mcp_tool.secret"),
+)
+
+
+def _existing_sidecar() -> tuple[Path, str] | None:
+    for path, label in _SIDECAR_CANDIDATES:
+        if path.is_file():
+            return path, label
+    return None
+
+
+def default_password_file_for_cli() -> str:
+    """Путь для argparse ``--password-file`` в HTTP-раннерах (как ``run_filewalk_batch.ps1``).
+
+    Приоритет: ``COLLOQUIUM_PASSWORD_FILE`` (env), иначе sidecar
+    (``cqds_mcp_auth.secret``, затем устаревший ``copilot_mcp_tool.secret``), если есть;
+    иначе пустая строка (тогда ``resolve_password`` снова проверит sidecar).
+    """
+    env = (os.environ.get("COLLOQUIUM_PASSWORD_FILE") or "").strip()
+    if env:
+        return env
+    pair = _existing_sidecar()
+    if pair:
+        return str(pair[0])
+    return ""
 
 
 def read_password_file(password_file: str) -> str:
@@ -26,7 +55,10 @@ def read_password_file(password_file: str) -> str:
 
 
 def resolve_password(cli_password: str | None, cli_password_file: str | None) -> tuple[str, str]:
-    """CLI → COLLOQUIUM_PASSWORD → COLLOQUIUM_PASSWORD_FILE → copilot_mcp_tool.secret → devspace."""
+    """CLI → COLLOQUIUM_PASSWORD → COLLOQUIUM_PASSWORD_FILE → sidecar → devspace.
+
+    Для argparse см. :func:`default_password_file_for_cli` (явный путь к sidecar в раннерах).
+    """
     if cli_password:
         return cli_password, "--password"
     if cli_password_file:
@@ -40,8 +72,9 @@ def resolve_password(cli_password: str | None, cli_password_file: str | None) ->
     if env_password_file:
         return read_password_file(env_password_file), "COLLOQUIUM_PASSWORD_FILE"
 
-    if _SIDECAR_SECRET.is_file():
-        return read_password_file(str(_SIDECAR_SECRET)), "copilot_mcp_tool.secret"
+    pair = _existing_sidecar()
+    if pair:
+        return read_password_file(str(pair[0])), pair[1]
 
     return "devspace", "default"
 

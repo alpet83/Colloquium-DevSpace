@@ -15,6 +15,7 @@ _ACTION_TO_LEGACY: dict[str, str] = {
     "wait_reply": "cq_wait_reply",
     "get_history": "cq_get_history",
     "chat_stats": "cq_chat_stats",
+    "copilot_chat_check": "cq_copilot_chat_check",
 }
 
 TOOLS = [

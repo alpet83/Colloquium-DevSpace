@@ -8,7 +8,7 @@ import cqds_docker
 from cqds_helpers import _json_text
 from cqds_run_ctx import RunContext
 
-_DOCKER_ACTIONS = frozenset({"compose", "cqds_ctl", "exec", "inspect", "logs"})
+_DOCKER_ACTIONS = frozenset({"compose", "cli", "cqds_ctl", "exec", "inspect", "logs"})
 
 
 async def _dispatch_one(action: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -18,6 +18,9 @@ async def _dispatch_one(action: str, args: dict[str, Any]) -> dict[str, Any]:
 
     if action == "compose":
         return await cqds_docker.docker_compose_run(args)
+
+    if action == "cli":
+        return await cqds_docker.docker_cli_run(args)
 
     if action == "cqds_ctl":
         cmd = str(args.get("command", "status"))
@@ -51,7 +54,8 @@ TOOLS: list[Tool] = [
     Tool(
         name="cq_docker_ctl",
         description=(
-            "Docker/Compose on MCP host: compose, cqds_ctl, exec, inspect, logs. "
+            "Docker on MCP host: compose (stack in a directory), cli (raw docker argv, e.g. ps), "
+            "cqds_ctl, exec, inspect, logs. "
             "BEST: batch — pass requests=[{action,args},…] for 2+ steps (fewer tool rounds, less rate-limit risk). "
             "Single step: action + args only."
         ),
@@ -60,7 +64,7 @@ TOOLS: list[Tool] = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["compose", "cqds_ctl", "exec", "inspect", "logs"],
+                    "enum": ["compose", "cli", "cqds_ctl", "exec", "inspect", "logs"],
                     "description": "Single-step only. Prefer requests[] if more than one operation.",
                 },
                 "args": {

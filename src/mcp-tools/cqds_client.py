@@ -1,9 +1,11 @@
 # cqds_client.py — Global MCP state, URL resolution, and ColloquiumClient
 from __future__ import annotations
 
+import base64
 import ipaddress
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -74,7 +76,7 @@ _PROJECT_MCP_URL_CACHE: dict[int, str] = {}
 _PROCESS_GUID_TO_MCP_URL: dict[str, str] = {}
 # Active project set by cq_select_project — used as implicit routing default.
 _ACTIVE_PROJECT_ID: int | None = None
-# Optional host-rewrite for Docker-internal URLs when copilot_mcp_tool runs on the host.
+# Optional host-rewrite for Docker-internal URLs when cqds_mcp_full runs on the host.
 # Set MCP_HOST_REMAP="nginx-router=localhost" in the MCP server env (e.g. mcp.json 'env').
 _MCP_HOST_REMAP: dict[str, str] = {}
 for _mcp_remap_pair in os.environ.get("MCP_HOST_REMAP", "").split(","):
@@ -153,10 +155,12 @@ class ColloquiumClient:
         self._base = base_url.rstrip("/")
         self._username = username
         self._password = password
+        # Логин и тяжёлые эндпоинты на слабой/загруженной машине могут превышать 30s.
+        self._http_timeout = float(os.environ.get("COLLOQUIUM_HTTP_TIMEOUT", "30") or "30")
         self._client = httpx.AsyncClient(
             base_url=self._base,
             follow_redirects=True,
-            timeout=30.0,
+            timeout=self._http_timeout,
             event_hooks={
                 "request": [self._log_request],
                 "response": [self._log_response],
@@ -218,10 +222,32 @@ class ColloquiumClient:
         resp.raise_for_status()
         return resp.json()["chat_id"]
 
+    async def delete_chat(self, chat_id: int) -> dict:
+        """Удалить чат (POST /api/chat/delete)."""
+        await self._ensure_login()
+        resp = await self._client.post(
+            "/api/chat/delete",
+            json={"chat_id": chat_id},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     async def post_message(self, chat_id: int, message: str) -> dict:
         await self._ensure_login()
         resp = await self._client.post(
             "/api/chat/post", json={"chat_id": chat_id, "message": message}
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def edit_post(self, post_id: int, message: str) -> dict:
+        """Редактирование поста (POST /api/chat/edit_post), тот же session cookie что и у post."""
+        await self._ensure_login()
+        resp = await self._client.post(
+            "/api/chat/edit_post",
+            json={"post_id": int(post_id), "message": message},
+            timeout=30.0,
         )
         resp.raise_for_status()
         return resp.json()
@@ -282,6 +308,7 @@ class ColloquiumClient:
         modified_since: int | None = None,
         file_ids: list[int] | None = None,
         include_size: bool = False,
+        request_timeout: float | None = None,
     ) -> list[dict]:
         """Return file index (no content) via /api/project/file_index."""
         await self._ensure_login()
@@ -292,9 +319,62 @@ class ColloquiumClient:
             params["file_ids"] = ",".join(str(i) for i in file_ids)
         if include_size:
             params["include_size"] = 1
-        resp = await self._client.get("/api/project/file_index", params=params)
+        req_timeout = (
+            httpx.Timeout(float(request_timeout) + 15.0)
+            if request_timeout is not None
+            else None
+        )
+        resp = await self._client.get(
+            "/api/project/file_index",
+            params=params,
+            timeout=req_timeout,
+        )
         resp.raise_for_status()
         return resp.json()
+
+    async def query_db(
+        self,
+        project_id: int,
+        query: str,
+        *,
+        allow_write: bool = False,
+        timeout: int = 30,
+    ) -> dict:
+        """Run SQL in agent DB context via /api/project/exec (same pipeline as cq_query_db)."""
+        q = str(query or "").strip()
+        if not q:
+            raise ValueError("query must be non-empty")
+
+        ql = q.lower().lstrip()
+        if not allow_write:
+            if not (ql.startswith("select") or ql.startswith("with") or ql.startswith("explain")):
+                raise ValueError(
+                    "Only read-only SQL is allowed (SELECT/WITH/EXPLAIN). "
+                    "Set allow_write=true for local/private endpoints only."
+                )
+            if re.search(
+                r"\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|comment)\b",
+                ql,
+            ):
+                raise ValueError(
+                    "Mutating SQL keywords are not allowed without allow_write=true"
+                )
+        elif not self.is_local_or_private_endpoint():
+            raise ValueError("allow_write=true is permitted only for local/private Colloquium endpoints")
+
+        encoded = base64.b64encode(q.encode("utf-8")).decode("ascii")
+        command = (
+            "PYTHONPATH=/app/agent /app/venv/bin/python - <<'PY'\n"
+            "import base64, json\n"
+            "from managers.db import Database\n"
+            f"q = base64.b64decode('{encoded}').decode('utf-8')\n"
+            "db = Database.get_database()\n"
+            "rows = db.fetch_all(q)\n"
+            "print(json.dumps({'status': 'success', 'rows': [list(r) for r in rows]}, ensure_ascii=False))\n"
+            "PY"
+        )
+        exec_timeout = min(max(int(timeout), 1), 300)
+        return await self.exec_command(project_id, command, exec_timeout)
 
     async def get_index(self, chat_id: int | None = None, project_id: int | None = None) -> dict:
         """Return the rich entity index for a chat or cached project index."""
@@ -340,7 +420,10 @@ class ColloquiumClient:
         resp.raise_for_status()
         ct = resp.headers.get("content-type", "")
         if "application/json" in ct:
-            return json.dumps(resp.json(), ensure_ascii=False, indent=2)
+            try:
+                return json.dumps(resp.json(), ensure_ascii=False, indent=2)
+            except json.JSONDecodeError:
+                return resp.text
         return resp.text
 
     async def exec_command(self, project_id: int, command: str, timeout: int = 30) -> dict:

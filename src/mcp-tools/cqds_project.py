@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import base64
-import re
 from typing import Any
 
 from mcp.types import CallToolResult, Tool  # type: ignore[import]
@@ -277,36 +275,9 @@ async def handle(name: str, arguments: dict[str, Any], ctx: RunContext) -> CallT
         query = str(arguments["query"] or "").strip()
         allow_write = bool(arguments.get("allow_write", False))
         timeout = int(arguments.get("timeout", 30))
-        if not query:
-            raise ValueError("query must be non-empty")
-
-        ql = query.lower().lstrip()
-        if not allow_write:
-            if not (ql.startswith("select") or ql.startswith("with") or ql.startswith("explain")):
-                raise ValueError(
-                    "Only read-only SQL is allowed (SELECT/WITH/EXPLAIN). Set allow_write=true for local/private endpoints."
-                )
-            if re.search(r"\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|comment)\b", ql):
-                raise ValueError(
-                    "Mutating SQL keywords are not allowed in cq_query_db without allow_write=true"
-                )
-        elif not client.is_local_or_private_endpoint():
-            raise ValueError(
-                "allow_write=true is permitted only for local/private Colloquium endpoints"
-            )
-
-        encoded = base64.b64encode(query.encode("utf-8")).decode("ascii")
-        command = (
-            "PYTHONPATH=/app/agent /app/venv/bin/python - <<'PY'\n"
-            "import base64, json\n"
-            "from managers.db import Database\n"
-            f"q = base64.b64decode('{encoded}').decode('utf-8')\n"
-            "db = Database.get_database()\n"
-            "rows = db.fetch_all(q)\n"
-            "print(json.dumps({'status': 'success', 'rows': [list(r) for r in rows]}, ensure_ascii=False))\n"
-            "PY"
+        result = await client.query_db(
+            project_id, query, allow_write=allow_write, timeout=timeout
         )
-        result = await client.exec_command(project_id, command, timeout)
         return _json_text(result)
 
     if name == "cq_set_sync_mode":

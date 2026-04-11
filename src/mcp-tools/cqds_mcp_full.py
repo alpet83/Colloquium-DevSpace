@@ -1,4 +1,4 @@
-# copilot_mcp_tool.py — thin MCP entrypoint for Colloquium-DevSpace
+# cqds_mcp_full.py — thin MCP entrypoint for Colloquium-DevSpace
 
 from __future__ import annotations
 
@@ -234,7 +234,7 @@ def main() -> None:
         print(
             "ERROR: Colloquium password is required. "
             "Set --password, --password-file, COLLOQUIUM_PASSWORD, "
-            "COLLOQUIUM_PASSWORD_FILE, or create copilot_mcp_tool.secret next to the script.",
+            "COLLOQUIUM_PASSWORD_FILE, or create cqds_mcp_auth.secret next to the script (see cqds_mcp_auth.sample.secret).",
             file=sys.stderr,
         )
         sys.exit(1)

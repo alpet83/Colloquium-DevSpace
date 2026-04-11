@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Сравнение объёма презентации инструментов: полный copilot_mcp_tool vs cqds_runtime."""
+"""Сравнение объёма презентации инструментов: полный cqds_mcp_full vs cqds_mcp_mini."""
 from __future__ import annotations
 
 import json
@@ -37,8 +37,8 @@ def _stats(tools: list) -> dict:
 
 
 def main() -> None:
-    import copilot_mcp_tool as full
-    import copilot_mcp_runtime as rt
+    import cqds_mcp_full as full
+    import cqds_mcp_mini as rt
 
     full_tools = full._registered_tools()
     rt_tools = rt._registered_tools()
@@ -46,10 +46,10 @@ def main() -> None:
     sr = _stats(rt_tools)
     ratio = sf["json_chars"] / max(sr["json_chars"], 1)
 
-    print("=== Полный copilot_mcp_tool (MODULE_HANDLERS) ===")
+    print("=== Полный cqds_mcp_full (MODULE_HANDLERS) ===")
     for k, v in sf.items():
         print(f"  {k}: {v}")
-    print("=== cqds_runtime (copilot_mcp_runtime) ===")
+    print("=== cqds_mcp_mini ===")
     for k, v in sr.items():
         print(f"  {k}: {v}")
     print("=== Соотношение (полный / runtime) ===")

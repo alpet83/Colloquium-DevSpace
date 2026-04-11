@@ -19,19 +19,19 @@ from mcp.types import CallToolResult, TextContent, Tool  # type: ignore[import]
 # Logging
 # ---------------------------------------------------------------------------
 
-LOGGER = logging.getLogger("copilot_mcp_tool")
-CURRENT_TOOL: ContextVar[str] = ContextVar("copilot_mcp_current_tool", default="-")
+LOGGER = logging.getLogger("cqds_mcp_full")
+CURRENT_TOOL: ContextVar[str] = ContextVar("cqds_mcp_current_tool", default="-")
 
 
 def _default_runtime_log_path() -> Path:
     """Имя журнала с меткой времени до минуты (без секунд), чтобы параллельные MCP не делили один файл.
 
-    Префикс: COLLOQUIUM_MCP_LOG_STEM (по умолчанию copilot_mcp_tool.runtime — как раньше у полного сервера).
-    Compact runtime задаёт stem=cqds_mcp_runtime до _setup_logging().
+    Префикс: COLLOQUIUM_MCP_LOG_STEM (по умолчанию cqds_mcp_full.runtime для полного MCP).
+    CQDS MCP mini (``cqds_mcp_mini.py``) задаёт stem=cqds_mcp_mini до _setup_logging().
     """
     logs_dir = Path(__file__).resolve().parent / "logs"
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
-    stem = (os.environ.get("COLLOQUIUM_MCP_LOG_STEM") or "copilot_mcp_tool.runtime").strip() or "copilot_mcp_tool.runtime"
+    stem = (os.environ.get("COLLOQUIUM_MCP_LOG_STEM") or "cqds_mcp_full.runtime").strip() or "cqds_mcp_full.runtime"
     candidate = logs_dir / f"{stem}.{stamp}.log"
     if candidate.exists():
         candidate = logs_dir / f"{stem}.{stamp}.{os.getpid()}.log"

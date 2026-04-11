@@ -182,8 +182,64 @@ async def _docker_exec_batch_item(raw: dict[str, Any]) -> dict[str, Any]:
 _COMPOSE_SUB_ALLOWED = frozenset({"up", "down", "stop", "start", "restart", "pull", "ps", "build"})
 
 
+async def docker_cli_run(raw: dict[str, Any]) -> dict[str, Any]:
+    """Произвольная команда ``docker <argv...>`` без compose (например ``ps -a``, ``container ls``)."""
+    try:
+        parts = raw.get("argv")
+        if parts is None:
+            parts = raw.get("docker_args")
+        if not isinstance(parts, list) or len(parts) == 0:
+            return {
+                "ok": False,
+                "error": 'argv must be a non-empty array of strings after "docker", e.g. ["ps", "-a"]',
+                "request": raw,
+            }
+        exe = _docker_cli_exe()
+        argv: list[str] = [exe] + [str(x) for x in parts]
+        cwd_raw = raw.get("cwd") or raw.get("working_directory")
+        cwd_kw: str | None = None
+        if cwd_raw is not None and str(cwd_raw).strip():
+            cp = Path(str(cwd_raw).strip()).expanduser().resolve()
+            if not cp.is_dir():
+                return {"ok": False, "error": f"cwd is not a directory: {cp}", "request": raw}
+            cwd_kw = str(cp)
+        timeout_sec = max(5, min(int(raw.get("timeout_sec", 120)), 7200))
+        LOGGER.info("docker cli: cwd=%s argv=%s", cwd_kw, argv)
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=cwd_kw,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+            env=os.environ.copy(),
+        )
+        try:
+            out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=float(timeout_sec))
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return {"ok": False, "error": f"docker cli timed out after {timeout_sec}s", "request": raw}
+        return {
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": out_b.decode("utf-8", errors="replace") if out_b else "",
+            "stderr": err_b.decode("utf-8", errors="replace") if err_b else "",
+            "request": raw,
+        }
+    except Exception as exc:
+        LOGGER.exception("docker_cli_run")
+        return {"ok": False, "error": str(exc), "request": raw}
+
+
 async def docker_compose_run(raw: dict[str, Any]) -> dict[str, Any]:
-    """docker compose <sub> в каталоге репозитория cqds."""
+    """docker compose <sub>.
+
+    - Без ``compose_cwd`` / ``working_directory``: как раньше — cwd = корень cqds, явный ``-f docker-compose.yml`` при наличии,
+      доп. файлы из ``compose_files`` относительно этого корня.
+    - С ``compose_cwd``: subprocess cwd = этот каталог; если ``compose_files`` не задан — **без** ``-f``, стандартное обнаружение
+      Compose (``docker-compose.yml`` + ``docker-compose.override.yml`` и др. в этом каталоге).
+    - Если задан ``compose_files`` — к каждому пути добавляется ``-f``; относительные пути считаются от ``compose_cwd`` (если есть) иначе от корня cqds.
+    """
     try:
         sub = str(raw.get("compose_command") or raw.get("subcommand") or "").strip().lower()
         if not sub:
@@ -196,19 +252,36 @@ async def docker_compose_run(raw: dict[str, Any]) -> dict[str, Any]:
             }
         services = [str(s) for s in (raw.get("services") or [])]
         root = docker_project_root()
-        compose_yml = root / "docker-compose.yml"
+        cwd_opt = raw.get("compose_cwd") or raw.get("working_directory")
+        if cwd_opt is not None and str(cwd_opt).strip():
+            work_dir = Path(str(cwd_opt).strip()).expanduser().resolve()
+            if not work_dir.is_dir():
+                return {"ok": False, "error": f"compose_cwd/working_directory is not a directory: {work_dir}", "request": raw}
+            use_compose_project_dir = True
+        else:
+            work_dir = root
+            use_compose_project_dir = False
+
         exe = _docker_cli_exe()
         argv: list[str] = [exe, "compose"]
-        if compose_yml.is_file():
-            argv.extend(["-f", str(compose_yml)])
         extra_files = raw.get("compose_files")
-        if isinstance(extra_files, list):
-            for cf in extra_files:
-                pth = Path(str(cf))
+        extra_list: list[str] = [str(x) for x in extra_files] if isinstance(extra_files, list) else []
+
+        if extra_list:
+            for cf in extra_list:
+                pth = Path(cf)
                 if not pth.is_absolute():
-                    pth = root / pth
+                    pth = work_dir / pth
                 if pth.is_file():
                     argv.extend(["-f", str(pth)])
+        elif use_compose_project_dir:
+            # Только каталог проекта — Compose сам подхватит docker-compose.yml и override.
+            pass
+        else:
+            compose_yml = root / "docker-compose.yml"
+            if compose_yml.is_file():
+                argv.extend(["-f", str(compose_yml)])
+
         for prof in raw.get("profiles") or []:
             argv.extend(["--profile", str(prof)])
         argv.append(sub)
@@ -231,10 +304,10 @@ async def docker_compose_run(raw: dict[str, Any]) -> dict[str, Any]:
                 argv.append("-a")
             argv.extend(services)
         timeout_sec = max(10, min(int(raw.get("timeout_sec", 600)), 7200))
-        LOGGER.info("docker compose: cwd=%s argv=%s", root, argv)
+        LOGGER.info("docker compose: cwd=%s argv=%s", work_dir, argv)
         proc = await asyncio.create_subprocess_exec(
             *argv,
-            cwd=str(root),
+            cwd=str(work_dir),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.DEVNULL,
@@ -354,7 +427,7 @@ TOOLS: list[Tool] = [
             "  rebuild     — docker compose up -d --build + wait for stable/failed\n"
             "  clear-logs  — truncate container json-file logs via Docker VM\n"
             "Optional 'services' list narrows the scope to specific compose services\n"
-            "(e.g. ['colloquium-core', 'frontend']). Omit to target all services.\n"
+            "(e.g. ['colloquium-core', 'frontend'] — ключи сервисов compose, не container_name).\n"
             "'wait' (bool, status only): block until stable or failed rather than snapshot.\n"
             "'timeout': seconds to wait for stable state (default 90, restart/rebuild only)."
         ),
@@ -362,7 +435,7 @@ TOOLS: list[Tool] = [
             "type": "object",
             "properties": {
                 "command": {"type": "string", "enum": ["status", "restart", "rebuild", "clear-logs"], "description": "Control action to perform."},
-                "services": {"type": "array", "items": {"type": "string"}, "description": "Optional list of compose service names, e.g. ['colloquium-core']."},
+                "services": {"type": "array", "items": {"type": "string"}, "description": "Optional compose service names, e.g. ['colloquium-core'] (имена сервисов в YAML, не префиксованные container_name)."},
                 "timeout": {"type": "integer", "description": "Seconds to wait for stable/failed state (default 90). Only for status/restart/rebuild.", "default": 90},
                 "wait": {"type": "boolean", "description": "For 'status': block until stable or failed before returning (default false).", "default": False},
             },

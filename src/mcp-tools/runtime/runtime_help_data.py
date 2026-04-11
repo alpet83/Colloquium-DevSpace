@@ -10,7 +10,7 @@ PROCESS_ACTIONS = {
             "engine": "bash|python (host=false only, default bash)",
             "cwd": "string (optional)",
             "env": "object (optional)",
-            "timeout": "seconds, default 3600",
+            "timeout": "seconds, default 3600; host spawn has no upper cap; sandbox spawn capped by CQDS_PROCESS_MAX_LIFETIME_SEC (default 86400s). Host: lifecycle JSON lines → CQDS_HOST_PROC_LOG_FILE (CQDS_HOST_PROC_LOG=0 off)",
         },
         "returns": {
             "process_guid": "uuid",
@@ -133,29 +133,45 @@ CQ_HELP_SELF = {
 DOCKER_CTL_OVERVIEW = {
     "tool": "cq_docker_ctl",
     "summary": (
-        "Docker/Compose on MCP host: compose, cqds_ctl, exec, inspect, logs. "
-        "Prefer batch requests[] for multiple steps (fewer rounds, rate limits)."
+        "Docker on MCP host: compose (project dir or cqds default), cli (docker ps etc.), "
+        "cqds_ctl, exec, inspect, logs. Prefer batch requests[] for multiple steps."
     ),
     "request_shape": {
-        "single": "action: compose|cqds_ctl|exec|inspect|logs; args: object",
+        "single": "action: compose|cli|cqds_ctl|exec|inspect|logs; args: object",
         "batch": "requests: [{action, args}, …]; stop_on_error: bool",
     },
 }
 
 DOCKER_CTL_ACTIONS = {
     "compose": {
-        "summary": "docker compose in cqds repo root (docker-compose.yml).",
+        "summary": (
+            "docker compose <sub>. Without compose_cwd: cwd=cqds root, -f docker-compose.yml if present (legacy). "
+            "With compose_cwd/working_directory: cwd=that dir; omit compose_files for auto-discovery "
+            "(docker-compose.yml + docker-compose.override.yml). Optional compose_files → extra -f (paths relative to that cwd or cqds root)."
+        ),
         "args": {
             "compose_command": "up|down|stop|start|restart|pull|ps|build (alias subcommand)",
+            "compose_cwd": "optional absolute project dir (alias working_directory); enables override.yml discovery when compose_files omitted",
+            "working_directory": "alias of compose_cwd",
             "services": "optional string[]",
             "detach": "bool, default true for up",
             "build": "bool for up --build",
             "profiles": "optional string[] → --profile",
-            "compose_files": "optional extra -f paths",
+            "compose_files": "optional -f list; if set, no implicit default file (only listed files)",
             "remove_orphans": "bool for down",
             "volumes": "bool for down -v",
             "all": "bool for ps -a",
             "timeout_sec": "default 600, max 7200",
+        },
+    },
+    "cli": {
+        "summary": "Raw docker CLI: docker <argv…> (no compose). Works from any cwd; optional cwd for subprocess.",
+        "args": {
+            "argv": "required string[], e.g. [\"ps\", \"-a\"] or [\"container\", \"ls\"]",
+            "docker_args": "alias of argv",
+            "cwd": "optional working_directory for subprocess",
+            "working_directory": "alias of cwd",
+            "timeout_sec": "default 120, max 7200",
         },
     },
     "cqds_ctl": {
@@ -234,6 +250,10 @@ CHAT_CTL_ACTIONS = {
     "wait_reply": {"summary": "Long-poll up to ~15s for new AI messages.", "payload": "chat_id"},
     "get_history": {"summary": "Snapshot history without waiting.", "payload": "chat_id"},
     "chat_stats": {"summary": "Usage stats; optional since_seconds.", "payload": "chat_id, since_seconds?"},
+    "copilot_chat_check": {
+        "summary": "Scan Copilot chat storage for invalid text blocks; optional auto_recovery backup+fix; root auto-detected when omitted.",
+        "payload": "root? (default: auto-detect), auto_recovery?",
+    },
 }
 
 PROJECT_CTL_OVERVIEW = {

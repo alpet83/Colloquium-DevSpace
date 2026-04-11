@@ -18,10 +18,10 @@
       ],
       "type": "stdio"
     },
-    "cqds_runtime": {
+    "cqds_mcp_mini": {
       "command": "C:\\Apps\\Python3\\python.exe",
       "args": [
-        "P:\\opt\\docker\\cqds\\mcp-tools\\runtime\\copilot_mcp_runtime.py",
+        "P:\\opt\\docker\\cqds\\mcp-tools\\cqds_mcp_mini.py",
         "--url",
         "http://localhost:8008",
         "--username",
@@ -32,7 +32,7 @@
         "MCP_AUTH_TOKEN": "Grok-xAI-Agent-The-Best",
         "MCP_HOST_REMAP": "nginx-router=localhost",
         "CQDS_BASE_URL": "http://localhost:8008",
-        "COLLOQUIUM_PASSWORD_FILE": "P:\\opt\\docker\\cqds\\mcp-tools\\copilot_mcp_tool.secret"
+        "COLLOQUIUM_PASSWORD_FILE": "P:\\opt\\docker\\cqds\\mcp-tools\\cqds_mcp_auth.secret"
       }
     }, 
     "gitbash": {
