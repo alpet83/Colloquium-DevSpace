@@ -1,5 +1,10 @@
 # Локальная разработка: доп. сервисы (cron-дампы, апгрейд PG) и привязки проектов.
 # Для «только базовый compose» (без этого файла):  docker compose -f docker-compose.yml …
+#
+# ВАЖНО: без блоков volumes ниже colloquium-core видит только ./projects с хоста. В нём должны лежать
+# каталоги с именами как в projects.project_name (например Colloquium-DevSpace/). Если каталога нет —
+# ядро не сканирует файлы, пути из attached_files не резолвятся, missing_ttl деградирует и индекс API пустой.
+# Bind-монты P:/… → /app/projects/<имя> как раз подставляют живые деревья с диска разработчика.
 # Том PG: cqds_postgres_data в docker-compose.yml; дампы — ./data/backups/pg на хосте.
 #
 # Планируемые дампы из ядра (APScheduler, таблицы scheduled_*): закомментируйте pg-backup-scheduler,
@@ -12,7 +17,11 @@ services:
     build:
       context: .
       dockerfile: postgres/Dockerfile.backup-cron
-    container_name: cqds-pg-backup-scheduler
+    container_name: ${COMPOSE_PROJECT_NAME:-cqds}-pg-backup-scheduler
+    networks:
+      devspace-net:
+        aliases:
+          - cqds-pg-backup-scheduler
     restart: unless-stopped
     depends_on:
       postgres:
@@ -31,8 +40,6 @@ services:
       - ./data/backups/pg:/backups/pg
       - ./secrets:/run/secrets:ro
       - ./postgres/backup_postgres.sh:/opt/backup/backup_postgres.sh:ro
-    networks:
-      - devspace-net
 
   # Шаг 1 — апгрейд каталога PG 16→17 in-place (только бинарный апгрейд ./data/pgdata).
   # Шаг 2 — перенос в том cqds_postgres_data через дамп + COUNT (надёжнее cp): pg-pipeline-pgdata-to-volume.
@@ -42,7 +49,7 @@ services:
   pg-upgrade-live16:
     profiles: ["upgrade"]
     image: pgautoupgrade/pgautoupgrade:17-alpine
-    container_name: cqds-pg-upgrade-live16
+    container_name: ${COMPOSE_PROJECT_NAME:-cqds}-pg-upgrade-live16
     user: "0:0"
     environment:
       POSTGRES_USER: postgres
@@ -59,7 +66,7 @@ services:
   pg-pipeline-pgdata-to-volume:
     profiles: ["upgrade"]
     image: postgres:17-alpine
-    container_name: cqds-pg-pipeline-pgdata
+    container_name: ${COMPOSE_PROJECT_NAME:-cqds}-pg-pipeline-pgdata
     user: root
     # У образа postgres CMD по умолчанию «postgres» — иначе лишний аргумент к sh.
     command: []
@@ -81,10 +88,20 @@ services:
       - ./postgres/pipeline_pgdata_to_volume.sh:/opt/cqds-pipeline/pipeline_pgdata_to_volume.sh:ro
       - ./postgres/restore_postgres.sh:/opt/cqds-pipeline/restore_postgres.sh:ro
       - ./postgres/init:/opt/cqds-pipeline/init:ro
+  # Attach nginx-router to mcp_debug_net so it can reach mcp_server.py
+  # injected into external containers (e.g. trd-bots-hive) on port 8084.
+  nginx-router:
+    networks:
+      devspace-net:
+        aliases:
+          - nginx-router
+      mcp_debug_net: {}
+
   colloquium-core:
     environment:
       - PYTHONUNBUFFERED=1
       - DEBUG_MODE=False
+      - SUBPATH_EXCLUDE_FILTER=/pgdata/base/:/var/lib/mysql/
     volumes:
       # Local deployment-only bind mounts for real project trees.
       - P:/vps.alpet.me/sigsys-ts:/app/projects/sigsys-ts
@@ -98,3 +115,11 @@ services:
       - P:/opt/docker:/app/projects/Colloquium-DevSpace
       - P:/opt/docker/trading-platform-php:/app/projects/trading-platform-php
       - P:/GitHub/alpet-libs-php:/app/projects/alpet-libs-php
+
+networks:
+  devspace-net:
+    external: true
+    name: cqds_devspace-net
+  mcp_debug_net:
+    external: true
+    name: mcp_debug_net

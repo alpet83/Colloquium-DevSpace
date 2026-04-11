@@ -1,7 +1,9 @@
+# Имена контейнеров: ${COMPOSE_PROJECT_NAME:-cqds}-<роль>. Сетевые aliases (colloquium-core, postgres, …)
+# сохраняют прежние DNS-имена внутри devspace-net. На хосте: docker compose exec <service> или имя из docker compose ps.
 services:
   postgres:
     image: postgres:17-alpine
-    container_name: cqds-postgres
+    container_name: ${COMPOSE_PROJECT_NAME:-cqds}-postgres
     entrypoint: ["/bin/sh", "/opt/cqds-postgres/start-with-startup-backup.sh"]
     environment:
       - POSTGRES_USER=postgres
@@ -25,7 +27,9 @@ services:
       - ./secrets:/run/secrets:ro
       - ./data/backups/pg:/backups/pg
     networks:
-      - devspace-net
+      devspace-net:
+        aliases:
+          - cqds-postgres
     healthcheck:                                                    
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
       interval: 10s
@@ -37,11 +41,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.core
-    container_name: colloquium-core
+    container_name: ${COMPOSE_PROJECT_NAME:-cqds}-core
     volumes:
       - ./data:/app/data
       - ./data/backups/pg:/backups/pg
       - ./logs:/app/logs
+      # Каталоги репозиториев: в БД projects.project_name → подпапка /app/projects/<project_name>/.
+      # Если её нет или пуста, scan не добавляет файлы, существующие ссылки в attached_files деградируют по TTL
+      # и пропадают из file_index. Для bind реальных деревьев с хоста см. docker-compose.override.yml.
       - ./projects:/app/projects
       - ./agent:/app/agent
       - ./tests:/app/tests
@@ -49,7 +56,9 @@ services:
       - ./postgres:/app/postgres:ro
       - ./secrets:/run/secrets:ro
     networks:
-      - devspace-net
+      devspace-net:
+        aliases:
+          - colloquium-core
     depends_on:
       mcp-sandbox:
         condition: service_started
@@ -57,7 +66,9 @@ services:
         condition: service_healthy
     environment:
       - PYTHONUNBUFFERED=1
-      - DEBUG_MODE=True
+      # Раскомментируйте для поиска «залипаний» API под нагрузкой (filewalk и т.п.):
+      # - CORE_SLOW_REQUEST_LOG_MS=400
+      - DEBUG_MODE=False
       - SQLITE_PATH=/app/data/multichat.db
       - RETENTION_DAYS=14
       - PGHOST=postgres
@@ -67,9 +78,23 @@ services:
       - PGDATABASE=cqds
       - MCP_SERVER_URL=http://mcp-sandbox:8084
       - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:?MCP_AUTH_TOKEN is required}
-    # ENTRYPOINT доустанавливает apscheduler в venv при необходимости; аргумент — скрипт ядра.
+      # Плановый перезапуск ядра (утечки/деградация). Время по IANA-зоне CORE_NIGHTLY_RESTART_TZ (например как на хосте).
+      - CORE_NIGHTLY_RESTART=1
+      - CORE_NIGHTLY_RESTART_CRON=0 3 * * *
+      - CORE_NIGHTLY_RESTART_TZ=Europe/Moscow
+      - CORE_MAINT_ENABLED=1
+      - CORE_MAINT_MUTATE=1      
+      # Phase-2 cache optimization toggles (safe rollout):
+      # - PROBE: validates prefix+delta candidate against baseline hash.
+      # - REUSE: allows CPU-saving fast path when candidate is valid.
+      - CQDS_CONTEXT_PREFIX_REUSE_PROBE=1
+      - CQDS_CONTEXT_PREFIX_REUSE=1
+      # Phase-3 provider-aware optimization (OpenRouter/Anthropic prompt caching).
+      - CQDS_PROVIDER_PREFIX_CACHE=1
+    # ENTRYPOINT 
     command: ["/app/agent/server.py"]
-    restart: on-failure
+    # unless-stopped: плановый SIGTERM от CoreScheduler (CORE_NIGHTLY_RESTART) снова поднимает контейнер.
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/docs"]
       interval: 30s
@@ -84,30 +109,35 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: mcp-sandbox
+    container_name: ${COMPOSE_PROJECT_NAME:-cqds}-mcp-sandbox
     ports:
       - "8084:8084"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+      # Должен совпадать с colloquium-core по деревьям проектов (те же bind’ы в override).
       - ./projects:/app/projects
       - /app/sandwiches
       - ./agent:/app/agent:ro
     environment:
       - RUST_LOG=debug
     networks:
-      - devspace-net
+      devspace-net:
+        aliases:
+          - mcp-sandbox
 
   frontend:
     build:
       context: .
       dockerfile: Dockerfile.frontend
-    container_name: frontend
+    container_name: ${COMPOSE_PROJECT_NAME:-cqds}-frontend
     volumes:
       - ./frontend:/app/frontend
       - ./logs:/app/logs
     networks:
-      - devspace-net
+      devspace-net:
+        aliases:
+          - frontend
     depends_on:
       - colloquium-core
 
@@ -115,13 +145,15 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.nginx
-    container_name: nginx-router
+    container_name: ${COMPOSE_PROJECT_NAME:-cqds}-nginx-router
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf
     ports:
       - "8008:8008"
     networks:
-      - devspace-net
+      devspace-net:
+        aliases:
+          - nginx-router
     depends_on:
       - colloquium-core
       - frontend
