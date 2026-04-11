@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from .db import Database, DataTable
 from .runtime_config import get_float
+from lib.file_link_prefix import strip_storage_prefix
 from lib.sandwich_pack import SandwichPack
 from lib.basic_logger import BasicLogger
 import globals
@@ -22,6 +23,26 @@ def _scan_budget_seconds() -> float:
         _SCAN_BUDGET_DEFAULT_SEC,
         5.0,
         600.0,
+    )
+
+
+def _scan_coop_interval_seconds() -> float:
+    """Интервал кооперативной уступки CPU во время скана (0 — отключено)."""
+    return get_float(
+        "CQDS_SCAN_COOP_INTERVAL_SEC",
+        1.0,
+        0.0,
+        60.0,
+    )
+
+
+def _scan_coop_sleep_seconds() -> float:
+    """Длительность микро-паузы в кооперативном режиме (сек)."""
+    return get_float(
+        "CQDS_SCAN_COOP_SLEEP_SEC",
+        0.003,
+        0.0,
+        1.0,
     )
 
 
@@ -83,7 +104,7 @@ class ProjectManager:
     def locate_file(self, file_name, project_id=None):
         """Возвращает Path для файла, используя project_name из БД, если project_id отличается."""
         base = self.projects_dir
-        file_name = file_name.lstrip('@')
+        file_name = strip_storage_prefix(str(file_name))
         default = self.abs_file_name(file_name, 'default')
 
         if project_id is None or project_id == self.project_id:
@@ -302,9 +323,16 @@ class ProjectManager:
             budget = _scan_budget_seconds()
             deadline = started + max(0.0, budget - _SCAN_BUDGET_MARGIN_SEC)
             time_limited = False
+            coop_interval = _scan_coop_interval_seconds()
+            coop_sleep = _scan_coop_sleep_seconds()
+            next_coop_yield = started + coop_interval if coop_interval > 0 and coop_sleep > 0 else 0.0
 
             _walk = iter(project_dir.rglob('*'))
             while True:
+                if next_coop_yield and time.monotonic() >= next_coop_yield:
+                    # Кооперативная уступка CPU/GIL: снижает «монополию» длительного скана.
+                    time.sleep(coop_sleep)
+                    next_coop_yield = time.monotonic() + coop_interval
                 try:
                     file_path = next(_walk)
                 except StopIteration:
@@ -353,8 +381,7 @@ class ProjectManager:
 
                 try:
                     name = file_path.name
-                    extension = '.' + file_path.suffix.lower().lstrip('.') if file_path.suffix else ''
-                    if not SandwichPack.supported_type(extension) and not SandwichPack.supported_type(name):
+                    if not globals.file_manager.is_acceptable_file(file_path):
                         continue
                     st_mtime = int(file_path.stat().st_mtime)
                     files.append({

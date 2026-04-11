@@ -4,15 +4,19 @@ import asyncio
 import datetime
 import time
 from pathlib import Path
-from llm_interactor import LLMInteractor, ContextInput
+from llm_cached_interactor import LLMCachedInteractor
+from llm_interactor import ContextInput
 from managers.chats import ChatLocker
 from chat_actor import ChatActor
 import globals as g
 
 log = g.get_logger("replication")
 
+# Если строка есть в тексте триггерного поста — interact без вызова провайдера (см. LLMInteractor.interact).
+DEBUG_BYPASS_TAG = "#debug_bypass"
 
-class ReplicationManager(LLMInteractor):
+
+class ReplicationManager(LLMCachedInteractor):
     """Управляет репликацией сообщений между LLM-актёрами."""
     def __init__(self, debug_mode: bool = False):
         """Инициализирует ReplicationManager с настройкой режима отладки.
@@ -157,7 +161,7 @@ class ReplicationManager(LLMInteractor):
         t_start = time.time()
 
         try:
-            ci.debug_mode = self.debug_mode
+            ci.debug_mode = bool(self.debug_mode or getattr(ci, "debug_bypass", False))
             # Reuse the early stub created by process_post() for this actor, if present.
             # This avoids showing two sequential spinners to the user.
             _existing = post_man.latest_post({'chat_id': ci.chat_id, 'user_id': actor.user_id})
@@ -370,6 +374,8 @@ class ReplicationManager(LLMInteractor):
                 log.debug(f"{action} диалог между %s и %s для chat_id=%d, trigger = %d", user_name, actor.user_name, chat_id, trigger)
                 content_blocks = self.collect_blocks(chat_id, exclude_id)
                 ci = ContextInput(content_blocks, users, chat_id, actor, exclude_id)
+                if DEBUG_BYPASS_TAG in (message or "").lower():
+                    ci.debug_bypass = True
                 coro = self._recursive_replicate(ci, rql + 1, max_rql=max_rql, session_id=session_id)
                 coro_list.append(coro)
                 processed_actors.add(actor.user_id)

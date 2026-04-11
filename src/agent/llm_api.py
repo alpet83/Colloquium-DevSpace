@@ -20,6 +20,21 @@ import datetime
 Optional = Dict = None
 log = globals.get_logger("llm_api")
 
+
+def sanitize_sandwich_entity_echoes(text: str) -> str:
+    """Убирает «утечки» внутренних маркеров сущностей из sandwich (content_block.compress).
+
+    В контекст попадает символ SI (U+000F) + id сущности; модель часто повторяет это как
+    литеральную ASCII-строку ``\\x0F123`` или копирует реальный ``\\x0f``. Заменяем на
+    читаемый ``@entity#<id>`` (не путать с ``@post#`` / ``file_id``).
+    """
+    if not text:
+        return text
+    text = re.sub(r"\\x0[fF]([0-9]+)", r"@entity#\1", text)
+    text = re.sub(r"\x0f([0-9]+)", r"@entity#\1", text)
+    return text
+
+
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 _openrouter_pricing_lock = threading.Lock()
 _openrouter_pricing_cache: dict | None = None  # {"t": float, "by_id": dict[str, tuple[float, float]]}
@@ -238,10 +253,38 @@ class LLMConnection:
             return {}
 
     def make_payload(self, prompt: str, extra=None) -> dict:
+        def _mk_content_parts(text: str, cache_prefix_chars: int) -> list[dict]:
+            body = str(text or "")
+            cut = max(0, min(int(cache_prefix_chars or 0), len(body)))
+            if cut <= 0:
+                return [{"type": "text", "text": body}]
+            return [
+                {
+                    "type": "text",
+                    "text": body[:cut],
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {
+                    "type": "text",
+                    "text": body[cut:],
+                },
+            ]
+
+        cache_hint = {}
+        if isinstance(extra, dict):
+            cache_hint = extra.pop("cache_hint", {}) or {}
         messages = []
         if self.pre_prompt:
-            messages.append({"role": "system", "content": self.pre_prompt})
-        messages.append({"role": "user", "content": prompt})
+            sys_cache = int(cache_hint.get("system_cache_prefix_chars", 0) or 0)
+            if sys_cache > 0:
+                messages.append({"role": "system", "content": _mk_content_parts(self.pre_prompt, sys_cache)})
+            else:
+                messages.append({"role": "system", "content": self.pre_prompt})
+        usr_cache = int(cache_hint.get("user_cache_prefix_chars", 0) or 0)
+        if usr_cache > 0:
+            messages.append({"role": "user", "content": _mk_content_parts(prompt, usr_cache)})
+        else:
+            messages.append({"role": "user", "content": prompt})
         self.payload = {
             "model": self.model,
             "messages": messages
@@ -252,6 +295,7 @@ class LLMConnection:
         return self.payload
 
     def clean_response(self, text: str) -> str:
+        text = sanitize_sandwich_entity_echoes(text)
         for token in self.flood:
             text = re.sub(token, '', text)  # response artefact removing
         return text

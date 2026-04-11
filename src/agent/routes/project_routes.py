@@ -1,5 +1,6 @@
 # /agent/routes/project_routes.py, updated 2026-03-26 — simplified sync indexing + cache
 import json
+import os
 import re
 import time
 import asyncio
@@ -195,6 +196,94 @@ def _build_tree_nodes(file_entries: list, base_path: str, depth: int, project_id
             node = dir_node['children']
 
     return _sort_tree_nodes(root)
+
+
+def _file_tree_build_sync(effective_project_id, normalized_path: str, depth: int) -> dict:
+    """Синхронная сборка дерева (индекс из БД + разбор путей). Вызывать из пула через asyncio.to_thread.
+
+    Ленивое дерево на фронте: depth — относительно текущего path. В БД хранится path_seg_count
+    (число сегментов пути от корня репозитория); граница base+depth даёт два среза:
+    «мелкий» (полные строки, path_seg_count <= base+depth) и «глубокий» (только имена, > bound)
+    для корректных has_more без загрузки тысяч полных записей для мелкой части.
+
+    verify_links отключён; missing_ttl в SQL + фоновые scan/check.
+    """
+    profile = os.getenv("CORE_PROFILE_FILE_TREE", "").strip() in ("1", "true", "yes")
+    t0 = time.perf_counter()
+    path_prefix = normalized_path.strip("/") if (normalized_path or "").strip() else None
+    base_segs = len([p for p in str(normalized_path or "").replace("\\", "/").strip("/").split("/") if p])
+    bound = base_segs + int(depth)
+
+    g.file_manager.ensure_tree_segments()
+
+    t_idx0 = time.perf_counter()
+    entries_shallow = g.file_manager.file_index(
+        effective_project_id,
+        verify_links=False,
+        path_prefix=path_prefix,
+        max_segments=bound,
+    )
+    t_idx1 = time.perf_counter()
+    entries_deep = g.file_manager.file_index(
+        effective_project_id,
+        verify_links=False,
+        path_prefix=path_prefix,
+        min_segments=bound,
+        name_only=True,
+    )
+    t_idx2 = time.perf_counter()
+    file_entries = entries_shallow + entries_deep
+    t1 = time.perf_counter()
+    grouped: dict = {}
+    for entry in file_entries:
+        proj_id = entry.get('project_id')
+        grouped.setdefault(proj_id, []).append(entry)
+
+    project_names = _project_name_map()
+    t2 = time.perf_counter()
+    trees = []
+    for grouped_project_id, entries in grouped.items():
+        nodes = _build_tree_nodes(entries, normalized_path, depth, grouped_project_id)
+        if not nodes:
+            continue
+        if grouped_project_id == 0:
+            project_name = '.chat-meta'
+        elif grouped_project_id is None:
+            project_name = 'Global'
+        else:
+            project_name = project_names.get(grouped_project_id) or f'project_{grouped_project_id}'
+        trees.append({
+            'project_id': grouped_project_id,
+            'project_name': project_name,
+            'path': normalized_path,
+            'nodes': nodes,
+        })
+
+    trees.sort(key=lambda tree: ((tree.get('project_id') or 0) <= 0, str(tree.get('project_name') or '').lower()))
+    t3 = time.perf_counter()
+    if profile:
+        log.info(
+            "CORE_PROFILE_FILE_TREE shallow_ms=%.1f deep_ms=%.1f total_index_ms=%.1f group_map_ms=%.1f build_trees_ms=%.1f "
+            "shallow_n=%d deep_n=%d total_n=%d bound=%d base_segs=%d trees=%d path_prefix=%r",
+            (t_idx1 - t_idx0) * 1000.0,
+            (t_idx2 - t_idx1) * 1000.0,
+            (t1 - t0) * 1000.0,
+            (t2 - t1) * 1000.0,
+            (t3 - t2) * 1000.0,
+            len(entries_shallow),
+            len(entries_deep),
+            len(file_entries),
+            bound,
+            base_segs,
+            len(trees),
+            path_prefix,
+        )
+    return {
+        'project_id': effective_project_id,
+        'path': normalized_path,
+        'depth': depth,
+        'trees': trees,
+    }
 
 
 def _parse_dt_to_ts(value: str) -> int:
@@ -567,6 +656,21 @@ async def create_project(request: Request):
             raise HTTPException(status_code=400, detail="Missing project_name")
         project_id = g.project_manager.create_project(project_name, description, local_git, public_git, dependencies, mcp_server_url)
         log.debug(g.with_session_tag(request, "Создан проект project_id=%d, project_name=%s для user_id=%d"), project_id, project_name, user_id)
+        try:
+            asyncio.create_task(
+                _run_project_scan_refresh(project_id),
+                name=f"scan-after-create-{project_id}",
+            )
+            log.info(
+                g.with_session_tag(request, "Фоновый scan_project_files после POST /project/create project_id=%d"),
+                project_id,
+            )
+        except RuntimeError as e:
+            log.warn(
+                g.with_session_tag(request, "Не удалось запланировать scan после create project_id=%d: %s"),
+                project_id,
+                str(e),
+            )
         return {"project_id": project_id}
     except HTTPException as e:
         log.error(g.with_session_tag(request, "HTTP ошибка в POST /project/create: %s"), str(e))
@@ -702,49 +806,23 @@ async def file_tree(
         normalized_path = str(path or '').lstrip('/').rstrip('/')
         depth = max(1, min(int(depth or 3), 6))
 
-        file_entries = g.file_manager.file_index(effective_project_id)
-        grouped = {}
-        for entry in file_entries:
-            proj_id = entry.get('project_id')
-            grouped.setdefault(proj_id, []).append(entry)
+        # file_index + дерево — чистый CPU/IO без await; в async-роуте блокирует весь event loop
+        # (long-poll /chat/get и прочие запросы на том же воркере «замирают» на время ответа).
+        body = await asyncio.to_thread(_file_tree_build_sync, effective_project_id, normalized_path, depth)
 
-        project_names = _project_name_map()
-        trees = []
-        for grouped_project_id, entries in grouped.items():
-            nodes = _build_tree_nodes(entries, normalized_path, depth, grouped_project_id)
-            if not nodes:
-                continue
-            if grouped_project_id == 0:
-                project_name = '.chat-meta'
-            elif grouped_project_id is None:
-                project_name = 'Global'
-            else:
-                project_name = project_names.get(grouped_project_id) or f'project_{grouped_project_id}'
-            trees.append({
-                'project_id': grouped_project_id,
-                'project_name': project_name,
-                'path': normalized_path,
-                'nodes': nodes,
-            })
-
-        trees.sort(key=lambda tree: ((tree.get('project_id') or 0) <= 0, str(tree.get('project_name') or '').lower()))
         duration = time.monotonic() - started
+        n_trees = len(body.get('trees') or [])
         if duration >= 2:
             log.warn(
                 g.with_session_tag(request, 'PERF_WARN GET /project/file_tree project_id=%s path=%s depth=%s took=%.2fs trees=%d'),
-                str(effective_project_id), normalized_path or '/', depth, duration, len(trees)
+                str(effective_project_id), normalized_path or '/', depth, duration, n_trees
             )
         else:
             log.debug(
                 g.with_session_tag(request, 'GET /project/file_tree project_id=%s path=%s depth=%s took=%.2fs trees=%d'),
-                str(effective_project_id), normalized_path or '/', depth, duration, len(trees)
+                str(effective_project_id), normalized_path or '/', depth, duration, n_trees
             )
-        return {
-            'project_id': effective_project_id,
-            'path': normalized_path,
-            'depth': depth,
-            'trees': trees,
-        }
+        return body
     except HTTPException:
         raise
     except Exception as e:

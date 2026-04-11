@@ -33,6 +33,8 @@ class PostManager:
                 "rql INTEGER",
                 "reply_to INTEGER",
                 "elapsed FLOAT",   # сколько секунд ответ "обдумывался" или обрабатывался
+                "deleted_at INTEGER",
+                "tombstone_text TEXT",
                 "FOREIGN KEY (chat_id) REFERENCES chats(id)",
                 "FOREIGN KEY (user_id) REFERENCES users(id)"
             ]
@@ -148,6 +150,8 @@ class PostManager:
             columns=['llm_class', 'user_name']
         )
         user_name = user_row[1] if user_row else 'unknown'
+        # Ответы LLM-актёров иногда содержат литералы \\x.. / \\u.. вместо символов UTF-8.
+        is_llm_actor = bool(user_row and user_row[0])
         t_start = time.time()
         replication_progress_post_id = None
 
@@ -182,7 +186,13 @@ class PostManager:
         if user_id != g.AGENT_UID:
             try:
                 pp = g.post_processor
-                result = await pp.process_response(chat_id, user_id, message, post_id)  # может занять много времени, если выполнять команды MCP
+                result = await pp.process_response(
+                    chat_id,
+                    user_id,
+                    message,
+                    post_id,
+                    unescape_display=is_llm_actor,
+                )
                 log.debug("Результат process_response: handled_cmds=%d, failed_cmds=%d, processed_msg=%s",
                           result["handled_cmds"], result["failed_cmds"], result["processed_msg"][:50])
                 if isinstance(result, dict):
@@ -280,11 +290,23 @@ class PostManager:
 
     def latest_post(self, filters=None):
         keys = ['id', 'chat_id', 'user_id', 'message', 'rql', 'reply_to']
-        row = self.posts_table.select_row(
-            columns=keys,
-            conditions=filters,
-            order_by="id DESC"
-        )
+        if isinstance(filters, dict):
+            cond = "deleted_at IS NULL"
+            params = {}
+            for k, v in filters.items():
+                cond += f" AND {k} = :{k}"
+                params[k] = v
+            row = self.db.fetch_one(
+                "SELECT id, chat_id, user_id, message, rql, reply_to "
+                "FROM posts WHERE " + cond + " ORDER BY id DESC LIMIT 1",
+                params,
+            )
+        else:
+            row = self.posts_table.select_row(
+                columns=keys,
+                conditions=filters,
+                order_by="id DESC"
+            )
         result = {}
         if not row:
             log.error("latest_posts: Нет сообщений для ограничения %s ", json.dumps(filters))
@@ -340,12 +362,14 @@ class PostManager:
         if before_id is not None:
             conditions.append(('id', '<=', before_id))
         rows = self.posts_table.select_from(
-            columns=['p.id', 'p.chat_id', 'p.user_id', 'p.message', 'p.timestamp', 'u.user_name', 'p.rql', 'p.reply_to', 'p.elapsed'],
+            columns=['p.id', 'p.chat_id', 'p.user_id', 'p.message', 'p.timestamp', 'u.user_name', 'p.rql', 'p.reply_to', 'p.elapsed', 'p.deleted_at'],
             conditions=conditions,
             joins=[('users', 'u', 'p.user_id = u.user_id')],
             order_by='p.id'
         )
         for row in rows:
+            if row[9] is not None:
+                continue
             pid = row[0]
             elps = round(row[8], 1) if row[8] else 0
             history[pid] = {
@@ -404,12 +428,14 @@ class PostManager:
                     else:
                         conditions.append(('id', 'IN', post_ids))
                     rows = self.posts_table.select_from(
-                        columns=['p.id', 'p.chat_id', 'p.user_id', 'p.message', 'p.timestamp', 'u.user_name', 'p.rql', 'p.reply_to'],
+                        columns=['p.id', 'p.chat_id', 'p.user_id', 'p.message', 'p.timestamp', 'u.user_name', 'p.rql', 'p.reply_to', 'p.deleted_at'],
                         conditions=conditions,
                         joins=[('users', 'u', 'p.user_id = u.user_id')],
                         order_by='p.id'
                     )
                     for row in rows:
+                        if row[8] is not None:
+                            continue
                         action = "delete" if row[0] in deleted_ids else "add"
                         message = None if action == "delete" else row[3]
                         history[row[0]] = {
@@ -520,8 +546,29 @@ class PostManager:
             if post_user_id != user_id and self.user_manager.get_user_role(user_id) != 'admin':
                 log.info("Пользователь user_id=%d не имеет прав для удаления post_id=%d", user_id, post_id)
                 return {"error": "Permission denied"}
-            self.posts_table.delete_from(conditions={'id': post_id})
+            self.posts_table.update(
+                conditions={'id': post_id},
+                values={
+                    'deleted_at': int(time.time()),
+                    'tombstone_text': '#deleted_by:user',
+                    'timestamp': int(time.time()),
+                }
+            )
             self.add_change(chat_id, post_id, "delete")
+            # Принудительно рвём cache-цепочку у LLM-актёров, чтобы следующий ход был FULL
+            # и мог безопасно применить tombstone-патчи для удалённых постов.
+            try:
+                rm = getattr(g, "replication_manager", None)
+                if rm is not None and hasattr(rm, "actors"):
+                    for actor in getattr(rm, "actors", []):
+                        if not getattr(actor, "llm_connection", None):
+                            continue
+                        aid = int(getattr(actor, "user_id", 0) or 0)
+                        if aid <= 0:
+                            continue
+                        rm.invalidate_context(chat_id=chat_id, actor_id=aid, reason="post_deleted_tombstone")
+            except Exception as e:
+                log.warn("Не удалось выполнить invalidate_context для chat_id=%d: %s", chat_id, str(e))
             log.debug("Удалено сообщение post_id=%d для user_id=%d", post_id, user_id)
             return {"status": "ok"}
         except Exception as e:

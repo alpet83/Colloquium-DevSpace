@@ -176,19 +176,19 @@ async def get_chat(request: Request, chat_id: int, wait_changes: int = 0):
             while _elps < max_wait:
                 _elps = time.time() - _start
                 _loops += 1
-                status = g.chat_manager.chat_status(chat_id)
+                status = await asyncio.to_thread(g.chat_manager.chat_status, chat_id)
                 if status['status'] == 'busy' and max_wait > 1:
                     log.debug(g.with_session_tag(request, " Ожидание сокращено, поскольку чат занят пользователем %s "), status['actor'])
                     max_wait = 1
-                active = g.chat_manager.active_chat(user_id, session_id)
+                active = await asyncio.to_thread(g.chat_manager.active_chat, user_id, session_id)
                 if active is None:
                     active = 0
 
                 if active <= 0 < chat_id:  # автоматическая активация чата, если не выбран.
                     active = chat_id
-                    g.chat_manager.select_chat(session_id, user_id, chat_id)
+                    await asyncio.to_thread(g.chat_manager.select_chat, session_id, user_id, chat_id)
 
-                history = g.post_manager.get_history(chat_id, wait_changes == 1)
+                history = await asyncio.to_thread(g.post_manager.get_history, chat_id, wait_changes == 1)
                 if history != {"chat_history": "no changes"}:
                     quotes = g.post_manager.get_quotes(history)
                     return {"posts": history, "chat_id": chat_id, "quotes": quotes, "status": status}

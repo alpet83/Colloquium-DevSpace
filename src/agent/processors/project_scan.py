@@ -3,6 +3,7 @@
 
 import re
 import globals as g
+from lib.text_bytes import decode_file_bytes
 from processors.block_processor import BlockProcessor, res_error, res_success, ProcessorError
 
 log = g.get_logger("project_scan")
@@ -48,11 +49,11 @@ class ProjectScanProcessor(BlockProcessor):
                 if raw is None:
                     continue
                 if isinstance(raw, bytes):
-                    try:
-                        content = raw.decode('utf-8')
-                    except UnicodeDecodeError:
-                        log.debug("Skipping binary file %s (file_id=%d)", file_name, file_id)
+                    dec = decode_file_bytes(raw)
+                    if dec is None:
+                        log.debug("Skipping non-text bytes %s (file_id=%d)", file_name, file_id)
                         continue
+                    content, _enc, _eol = dec
                 else:
                     content = raw
                 lines = content.splitlines()

@@ -8,6 +8,8 @@ import time
 import globals as g
 from pathlib import Path
 
+from lib.text_bytes import decode_known_text_bytes
+
 MCP_URL = "http://mcp-sandbox:8084"
 log = globals.get_logger("llm_proc")
 
@@ -144,7 +146,7 @@ class BlockProcessor:
             raise ProcessorError(f"Error: File @attach#{file_id} has no contents", user_name)
 
         if isinstance(source, bytes):
-            source = source.decode('utf-8', errors='replace')
+            source, _enc, _eol = decode_known_text_bytes(source)
         log.debug("Retrieved file data for file_id=%d, file_name=%s, project_id=%s", file_id, file_name, project_id)
         return file_name, source, project_id
 

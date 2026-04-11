@@ -1,4 +1,4 @@
-# Зависимости образа colloquium-core (Dockerfile.core). Установка: pip install -r requirements-core.txt
+# Зависимости образа ядра CQDS / сервиса colloquium-core (Dockerfile.core). Установка: pip install -r requirements-core.txt
 apscheduler>=3.10.4,<4
 fastapi
 uvicorn
@@ -12,3 +12,4 @@ sqlalchemy
 aiohttp
 colorama
 psycopg2-binary
+charset-normalizer>=3.2,<4

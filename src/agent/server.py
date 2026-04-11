@@ -6,6 +6,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 import asyncio
 import logging
+import time
 import socket
 import os
 import signal
@@ -30,7 +31,7 @@ from managers.posts import PostManager
 from managers.files import FileManager
 from managers.project import ProjectManager
 from managers.replication import ReplicationManager
-from managers.runtime_config import get_bool
+from managers.runtime_config import get_bool, is_runtime_config_set
 import globals
 from globals import CONFIG_FILE, LOG_DIR, LOG_FILE, LOG_SERV, LOG_FORMAT
 
@@ -40,6 +41,20 @@ class UnicornException(Exception):
 
 app = FastAPI()
 log = globals.get_logger("core")
+_BOOT_T0 = time.perf_counter()
+_maint_child_proc: subprocess.Popen | None = None
+
+
+def _boot_ms() -> float:
+    """Milliseconds elapsed since process boot for startup profiling."""
+    return (time.perf_counter() - _BOOT_T0) * 1000.0
+
+
+def _log_boot_phase(phase: str, started_at: float) -> float:
+    """Log one startup phase duration and global elapsed time."""
+    dur_ms = (time.perf_counter() - started_at) * 1000.0
+    log.info("CORE_BOOT phase=%s dur_ms=%.1f since_boot_ms=%.1f", phase, dur_ms, _boot_ms())
+    return dur_ms
 
 app.add_middleware(
     CORSMiddleware,
@@ -76,6 +91,33 @@ async def log_requests_and_exceptions(request: Request, call_next):
         raise
 
 
+def _slow_request_threshold_ms() -> int:
+    """CORE_SLOW_REQUEST_LOG_MS>0 — в colloquium_core.log пишутся запросы дольше порога (диагностика под нагрузкой)."""
+    try:
+        return max(0, int(os.getenv("CORE_SLOW_REQUEST_LOG_MS", "0")))
+    except ValueError:
+        return 0
+
+
+_SLOW_REQ_MS = _slow_request_threshold_ms()
+if _SLOW_REQ_MS > 0:
+
+    @app.middleware("http")
+    async def slow_request_middleware(request: Request, call_next):
+        t0 = time.perf_counter()
+        response = await call_next(request)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        if elapsed_ms >= _SLOW_REQ_MS:
+            log.warn(
+                "CORE_SLOW_REQ %s %s %.0fms status=%s",
+                request.method,
+                request.url.path,
+                elapsed_ms,
+                getattr(response, "status_code", "?"),
+            )
+        return response
+
+
 @app.exception_handler(UnicornException)
 async def unicorn_exception_handler(request: Request, exc: UnicornException):
     log.excpt("Unicorn raised ", e=exc)
@@ -101,10 +143,13 @@ def log_init():
 
 def server_init():
     try:
+        _t_server_init = time.perf_counter()
         log_msg("Сервер Colloquium запускается...", "#INIT")
         if not os.path.exists(LOG_DIR):
             os.makedirs(LOG_DIR)
         log_init()
+        log.info("CORE_BOOT phase=server_init_start since_boot_ms=%.1f", _boot_ms())
+        _t_phase = time.perf_counter()
         globals.sessions_table = DataTable(table_name='sessions',
                                            template=[
                                                'session_id TEXT PRIMARY KEY',
@@ -113,16 +158,28 @@ def server_init():
                                                'active_project INTEGER'
                                            ]
                                            )
+        _log_boot_phase("sessions_table", _t_phase)
 
         log.info("Инициализация менеджеров")
+        _t_phase = time.perf_counter()
         globals.user_manager = UserManager()
+        _log_boot_phase("user_manager", _t_phase)
+        _t_phase = time.perf_counter()
         globals.chat_manager = ChatManager()
+        _log_boot_phase("chat_manager", _t_phase)
+        _t_phase = time.perf_counter()
         globals.post_processor = PostProcessor()
+        _log_boot_phase("post_processor", _t_phase)
+        _t_phase = time.perf_counter()
         globals.post_manager = PostManager(globals.user_manager)
+        _log_boot_phase("post_manager", _t_phase)
         globals.project_registry = {}
+        _t_phase = time.perf_counter()
         globals.project_manager = ProjectManager()
+        _log_boot_phase("project_manager_default", _t_phase)
         # Auto-load first project as default so processors work after restart
         try:
+            _t_auto = time.perf_counter()
             first = globals.project_manager.projects_table.select_from(
                 columns=['id'], limit=1
             )
@@ -130,14 +187,20 @@ def server_init():
                 globals.project_manager = ProjectManager(first[0][0])
                 globals.project_registry[first[0][0]] = globals.project_manager
                 log.info("Авто-загружен проект id=%d как дефолтный", first[0][0])
+            _log_boot_phase("project_manager_autoload", _t_auto)
         except Exception as _e:
             log.warn("Не удалось авто-загрузить проект: %s", str(_e))
+        _t_phase = time.perf_counter()
         globals.file_manager = FileManager()
-        # Сканирование всех проектов — только в фоне после поднятия uvicorn (см. _schedule_startup_project_scans).
+        _log_boot_phase("file_manager", _t_phase)
+        # Сканирование и проверка ссылок — только в фоне после поднятия uvicorn (см. _schedule_startup_file_maintenance).
         # Синхронный полный scan здесь блокировал bind :8080 и давал nginx 502 на /api/* при долгом скане.
+        # Важно: не запускать scan_project_files и FileManager.check() параллельно — гонка по attached_files / missing_ttl.
         debug_enabled = get_bool("DEBUG_MODE", default=False)
         log.debug("DEBUG_MODE (config/env) parsed=%s", str(debug_enabled))
+        _t_phase = time.perf_counter()
         globals.replication_manager = ReplicationManager(debug_mode=debug_enabled)
+        _log_boot_phase("replication_manager", _t_phase)
         log.info("Менеджеры инициализированы")
         log.info("chown agent на /app/projects — в фоне (синхронный chown блокировал bind :8080 → nginx 502)")
         subprocess.Popen(
@@ -148,18 +211,30 @@ def server_init():
         )
 
         log.debug("Подключение auth_router")
+        _t_phase = time.perf_counter()
         app.include_router(auth_router)
+        _log_boot_phase("router_auth", _t_phase)
         log.debug("Подключение chat_router")
+        _t_phase = time.perf_counter()
         app.include_router(chat_router)
+        _log_boot_phase("router_chat", _t_phase)
         log.debug("Подключение file_router")
+        _t_phase = time.perf_counter()
         app.include_router(file_router)
+        _log_boot_phase("router_file", _t_phase)
         log.debug("Подключение project_router")
+        _t_phase = time.perf_counter()
         app.include_router(project_router)
+        _log_boot_phase("router_project", _t_phase)
         log.debug("Подключение config_router")
+        _t_phase = time.perf_counter()
         app.include_router(config_router)
+        _log_boot_phase("router_config", _t_phase)
 
-        _schedule_startup_project_scans()
+        _schedule_startup_file_maintenance()
         _schedule_core_scheduler()
+        _schedule_maint_child()
+        _log_boot_phase("startup_hooks_scheduled", _t_server_init)
 
     except Exception as e:
         log_msg("Ошибка инициализации сервера: %s" % str(e), "#ERROR")
@@ -168,27 +243,70 @@ def server_init():
 shutdown_event = asyncio.Event()
 
 
-def _schedule_startup_project_scans() -> None:
-    """Заполняет attached_files без блокировки старта HTTP (избегает 502 от nginx)."""
+def _maint_child_will_start() -> bool:
+    """Те же условия, что и в _schedule_maint_child: будет ли запущен core_maint_loop.py."""
+    if not get_bool("CORE_MAINT_CHILD_ENABLED", default=True):
+        return False
+    if not get_bool("CORE_MAINT_ENABLED", default=False):
+        return False
+    return os.path.isfile("/app/agent/scripts/core_maint_loop.py")
+
+
+def _startup_file_maintenance_enabled() -> bool:
+    """Полный scan проектов + FileManager.check() сразу после старта HTTP.
+
+    Если ``CORE_STARTUP_FILE_MAINT_ENABLED`` задан явно (env/config) — только он.
+    Иначе по умолчанию **не** гоняем тяжёлый проход, когда поднимается дочерний
+    ``core_maint_loop`` (find/reconcile/ленивый scan там).
+    """
+    if is_runtime_config_set("CORE_STARTUP_FILE_MAINT_ENABLED"):
+        return get_bool("CORE_STARTUP_FILE_MAINT_ENABLED", default=True)
+    return not _maint_child_will_start()
+
+
+def _schedule_startup_file_maintenance() -> None:
+    """После поднятия HTTP: последовательно scan всех проектов, затем FileManager.check().
+
+    Один фоновый проход вместо двух почти параллельных задач — меньше гонок между
+    scan/add_file и массовой проверкой ссылок в attached_files.
+    Отключается, если задано CORE_STARTUP_FILE_MAINT_ENABLED=0 или (по умолчанию)
+    при активном дочернем CORE_MAINT — см. _startup_file_maintenance_enabled().
+    """
 
     @app.on_event("startup")
-    async def _startup_scan_background() -> None:
+    async def _startup_file_maintenance() -> None:
         async def _run() -> None:
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.25)
+            if not _startup_file_maintenance_enabled():
+                log.info(
+                    "CORE_STARTUP_FILE_MAINT off: skip startup scan+check "
+                    "(set CORE_STARTUP_FILE_MAINT_ENABLED=1 to force, or disable maint child)"
+                )
+                return
+            _t_total = time.perf_counter()
             try:
                 pm0 = globals.project_manager
-                if pm0 is None:
-                    return
-                all_projects = pm0.projects_table.select_from(columns=["id"], conditions="id > 0")
-                for proj_row in all_projects or []:
-                    pid = proj_row[0]
-                    pm = ProjectManager.get(pid)
-                    if pm is None:
-                        continue
-                    log.info("Фоновое сканирование файлов проекта id=%d после старта HTTP", pid)
-                    await asyncio.to_thread(pm.scan_project_files)
+                if pm0 is not None:
+                    all_projects = pm0.projects_table.select_from(columns=["id"], conditions="id > 0")
+                    for proj_row in all_projects or []:
+                        _t_proj = time.perf_counter()
+                        pid = proj_row[0]
+                        pm = ProjectManager.get(pid)
+                        if pm is None:
+                            continue
+                        log.info("Фоновое сканирование файлов проекта id=%d после старта HTTP", pid)
+                        await asyncio.to_thread(pm.scan_project_files)
+                        _log_boot_phase(f"startup_scan_project_{pid}", _t_proj)
+                fm = globals.file_manager
+                if fm is not None:
+                    _t_chk = time.perf_counter()
+                    log.info("Фоновая проверка ссылок attached_files после сканов проектов")
+                    await asyncio.to_thread(fm.check)
+                    _log_boot_phase("startup_file_check_after_scans", _t_chk)
             except Exception as _e:
-                log.warn("Ошибка фонового сканирования проектов: %s", str(_e))
+                log.warn("Ошибка фонового обслуживания файлов/проектов: %s", str(_e))
+            finally:
+                _log_boot_phase("startup_file_maintenance_total", _t_total)
 
         asyncio.create_task(_run())
 
@@ -218,6 +336,75 @@ def _schedule_core_scheduler() -> None:
             await stop_core_scheduler()
         except Exception as e:
             log.warn("Остановка планировщика ядра: %s", str(e))
+
+
+def _schedule_maint_child() -> None:
+    """Запуск maintenance-цикла как дочернего процесса ядра (опционально)."""
+    global _maint_child_proc
+
+    @app.on_event("startup")
+    async def _maint_child_startup() -> None:
+        global _maint_child_proc
+        child_on = get_bool("CORE_MAINT_CHILD_ENABLED", default=True)
+        maint_on = get_bool("CORE_MAINT_ENABLED", default=False)
+        if not child_on:
+            log.info("CORE_MAINT child disabled (CORE_MAINT_CHILD_ENABLED=0)")
+            return
+        if not maint_on:
+            log.info("CORE_MAINT child skipped (CORE_MAINT_ENABLED=0)")
+            return
+        if _maint_child_proc is not None and _maint_child_proc.poll() is None:
+            log.info("CORE_MAINT child already running pid=%s", str(_maint_child_proc.pid))
+            return
+        script = "/app/agent/scripts/core_maint_loop.py"
+        if not os.path.exists(script):
+            log.warn("CORE_MAINT child not started: script missing %s", script)
+            return
+        env = os.environ.copy()
+        env.setdefault("CORE_MAINT_ENABLED", "1")
+        try:
+            _maint_child_proc = subprocess.Popen(
+                [sys.executable, script],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                env=env,
+            )
+            log.info(
+                "CORE_MAINT child started pid=%d mutate=%s",
+                _maint_child_proc.pid,
+                env.get("CORE_MAINT_MUTATE", "0"),
+            )
+            # Быстрая sanity-проверка: процесс не должен завершаться сразу после старта.
+            await asyncio.sleep(0.2)
+            rc = _maint_child_proc.poll()
+            if rc is not None:
+                log.warn("CORE_MAINT child exited immediately rc=%s", str(rc))
+        except Exception as e:
+            log.warn("CORE_MAINT child start failed: %s", str(e))
+
+    @app.on_event("shutdown")
+    async def _maint_child_shutdown() -> None:
+        global _maint_child_proc
+        proc = _maint_child_proc
+        if proc is None:
+            return
+        if proc.poll() is not None:
+            _maint_child_proc = None
+            return
+        try:
+            proc.terminate()
+            await asyncio.to_thread(proc.wait, 3)
+            log.info("CORE_MAINT child stopped pid=%d", proc.pid)
+        except Exception:
+            try:
+                proc.kill()
+                log.warn("CORE_MAINT child killed pid=%d", proc.pid)
+            except Exception as e:
+                log.warn("CORE_MAINT child stop failed: %s", str(e))
+        finally:
+            _maint_child_proc = None
 
 
 async def lifespan(app: FastAPI):

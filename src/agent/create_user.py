@@ -7,9 +7,10 @@
     python3 /app/agent/create_user.py copilot devspace
     python3 /app/agent/create_user.py --delete copilot
 
-Запуск через docker exec (из PowerShell на хосте):
-    docker exec colloquium-core python3 /app/agent/create_user.py copilot devspace
-    docker exec colloquium-core python3 /app/agent/create_user.py --delete copilot
+Запуск с хоста (предпочтительно по имени сервиса compose):
+    docker compose exec colloquium-core python3 /app/agent/create_user.py copilot devspace
+    docker compose exec colloquium-core python3 /app/agent/create_user.py --delete copilot
+    # либо docker exec <имя_контейнера> … (по умолчанию cqds-core, см. container_name в docker-compose.yml)
 """
 
 import hashlib

@@ -1,5 +1,6 @@
 # /agent/managers/chats.py, updated 2025-07-20 15:45 EEST
 from .db import Database, DataTable
+from lib.file_link_prefix import strip_storage_prefix
 from datetime import datetime
 import globals as g
 import asyncio
@@ -52,7 +53,10 @@ class ChatManager:
                 "content BLOB",
                 "ts INTEGER",
                 "file_name TEXT",
+                "path_seg_count INTEGER",
                 "project_id INTEGER",
+                "file_encoding TEXT",
+                "file_eol TEXT",
                 "FOREIGN KEY(project_id) REFERENCES projects(id)"
             ]
         )
@@ -118,13 +122,15 @@ class ChatManager:
         now = datetime.utcnow().timestamp()
         stats = self.chat_lock_stats.get(chat_id, {})
         if not busy:
+            _acq = max(stats.get('acquires', 0), 1)
+            _rel = max(stats.get('releases', 0), 1)
             return {
                 'status': 'free',
                 'actor': '',
                 'elapsed': 0,
-                'lock_wait_ms_avg': round(stats.get('wait_total', 0.0) / stats.get('acquires', 1), 1) if stats else 0.0,
+                'lock_wait_ms_avg': round(stats.get('wait_total', 0.0) / _acq, 1) if stats else 0.0,
                 'lock_wait_ms_max': round(stats.get('wait_max', 0.0), 1) if stats else 0.0,
-                'lock_hold_ms_avg': round(stats.get('hold_total', 0.0) / stats.get('releases', 1), 1) if stats else 0.0,
+                'lock_hold_ms_avg': round(stats.get('hold_total', 0.0) / _rel, 1) if stats else 0.0,
                 'lock_hold_ms_max': round(stats.get('hold_max', 0.0), 1) if stats else 0.0,
                 'lock_acquires': stats.get('acquires', 0),
             }
@@ -134,11 +140,13 @@ class ChatManager:
             oldest = min(oldest, from_ts)
         result = {'status': 'busy', 'from_ts': oldest}
         if result:
+            _acq_b = max(stats.get('acquires', 0), 1)
+            _rel_b = max(stats.get('releases', 0), 1)
             result['elapsed'] = int(now - oldest)
             result['actor'] = ', '.join(busy.keys())  # TODO: better user actors
-            result['lock_wait_ms_avg'] = round(stats.get('wait_total', 0.0) / stats.get('acquires', 1), 1) if stats else 0.0
+            result['lock_wait_ms_avg'] = round(stats.get('wait_total', 0.0) / _acq_b, 1) if stats else 0.0
             result['lock_wait_ms_max'] = round(stats.get('wait_max', 0.0), 1) if stats else 0.0
-            result['lock_hold_ms_avg'] = round(stats.get('hold_total', 0.0) / stats.get('releases', 1), 1) if stats else 0.0
+            result['lock_hold_ms_avg'] = round(stats.get('hold_total', 0.0) / _rel_b, 1) if stats else 0.0
             result['lock_hold_ms_max'] = round(stats.get('hold_max', 0.0), 1) if stats else 0.0
             result['lock_acquires'] = stats.get('acquires', 0)
         return result
@@ -259,10 +267,14 @@ class ChatManager:
 
     def delete_chat(self, chat_id, user_id: int):
         try:
-            # Проверяем наличие подчатов
-            sub_chats = self.chats_table.select_from(
-                conditions={'parent_msg_id': f"(SELECT id FROM posts WHERE chat_id = {chat_id})"},
-                columns=['chat_id']
+            # Подчаты: parent_msg_id ссылается на пост родительского чата (корректный JOIN, не сырой подзапрос в =).
+            sub_chats = self.db.fetch_all(
+                """
+                SELECT c.chat_id FROM chats c
+                INNER JOIN posts p ON p.id = c.parent_msg_id
+                WHERE p.chat_id = :chat_id
+                """,
+                {"chat_id": chat_id},
             )
             if sub_chats:
                 log.info("Невозможно удалить чат chat_id=%d, так как он имеет подчаты", chat_id)
@@ -272,9 +284,13 @@ class ChatManager:
             self.db.execute('DELETE FROM posts WHERE chat_id = :chat_id', {'chat_id': chat_id})
 
             # Удаляем чат
-            result = self.chats_table.delete_from(
-                conditions={'chat_id': chat_id, 'user_list': user_id}
-            )
+            is_admin = g.user_manager.get_user_role(user_id) == 'admin'
+            if is_admin:
+                result = self.chats_table.delete_from(conditions={'chat_id': chat_id})
+            else:
+                result = self.chats_table.delete_from(
+                    conditions={'chat_id': chat_id, 'user_list': user_id}
+                )
             if result.rowcount == 0:
                 log.info("Чат chat_id=%d не найден или пользователь user_id=%d не авторизован", chat_id, user_id)
                 return {"error": "Chat not found or unauthorized"}
@@ -318,7 +334,7 @@ class ChatManager:
                 "files": [
                     {
                         "file_id": file[0],
-                        "file_name": file[1].lstrip('@'),
+                        "file_name": strip_storage_prefix(file[1]),
                         "timestamp": file[2]
                     } for file in files
                 ]

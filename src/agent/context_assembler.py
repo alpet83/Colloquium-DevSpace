@@ -5,7 +5,11 @@ import re
 from datetime import datetime, timezone
 from managers.db import Database, DataTable
 from lib.content_block import ContentBlock, SpanBlock
+from lib.relevance_window_anchor import get_anchor
+from lib.session_context import get_session_id
+from lib.file_link_prefix import REF
 from lib.sandwich_pack import SandwichPack
+from lib.file_type_detector import ctx_allows_text
 import globals as g
 import json, math, time
 from pathlib import Path
@@ -80,29 +84,49 @@ class ContextAssembler:
         for file_id in unique_files.values():
             file_data = g.file_manager.get_file(file_id)
             if file_data:
-                extension = '.' + file_data['file_name'].rsplit('.', 1)[-1].lower() if '.' in file_data['file_name'] else ''
-                if not SandwichPack.supported_type(extension):
-                    log.warn("Неподдерживаемое расширение файла '%s' для file_id=%d, пропуск", extension, file_id)
-                    continue
+                base_name = file_data['file_name']
+                extension = '.' + base_name.rsplit('.', 1)[-1].lower() if '.' in base_name else ''
+                sandwich_ok = SandwichPack.supported_type(extension) or SandwichPack.supported_type(base_name)
+                disk_path = g.file_manager.resolve_disk_path(base_name, file_data['project_id'])
+                path_ok = disk_path.exists()
+                if not sandwich_ok:
+                    if not ctx_allows_text(
+                        disk_path if path_ok else None,
+                        extension,
+                        utf8_content=file_data.get('content'),
+                    ):
+                        log.warn(
+                            "Файл не в белом списке SandwichPack и не распознан как текст (MIME/эвристика), "
+                            "пропуск file_id=%d ext=%s",
+                            file_id,
+                            extension or "(нет)",
+                        )
+                        continue
                 try:
                     content_text = file_data['content']
                     relevance = file_data.get('relevance', 50)
+                    block_ext = extension if sandwich_ok else '.txt'
                     if '.rulz' == extension:
                         relevance = 100
                     content_block = SandwichPack.create_block(
                         content_text=content_text,
-                        content_type=extension,
-                        file_name=file_data['file_name'],
+                        content_type=block_ext,
+                        file_name=base_name,
                         timestamp=datetime.utcfromtimestamp(file_data['ts']).strftime(g.SQL_TIMESTAMP + "Z"),
                         file_id=file_id,
-                        relevance=relevance
+                        relevance=relevance,
+                        revision_ts=file_data['ts'],
                     )
                     content_blocks.append(content_block)
                     log.debug(
-                        "Добавлен в сэндвич file_id=%d, file_name=%s, block_class=%s, size=%d chars",
-                        file_id, file_data['file_name'], content_block.__class__.__name__, len(content_text)
+                        "Добавлен в сэндвич file_id=%d, file_name=%s, block_class=%s, size=%d chars, content_type=%s",
+                        file_id,
+                        base_name,
+                        content_block.__class__.__name__,
+                        len(content_text),
+                        block_ext,
                     )
-                    file_map[file_id] = file_data['file_name']
+                    file_map[file_id] = base_name
                 except Exception as e:
                     log.excpt("Ошибка обработки file_id=%d: ", file_id, e=e)
                     continue
@@ -115,12 +139,18 @@ class ContextAssembler:
         log.debug("Сборка постов для chat_id=%d", chat_id)
         history = g.post_manager.scan_history(chat_id)
         log.debug("Получено %d постов для chat_id=%d", len(history), chat_id)
-        count = 0
+        included_count = 0
+        count_tail = 0
         self.fresh_files = set()
         self.fresh_spans = set()
         fresh_window = time.time() - 600
         base_rel = 10
         ref_relevance = {}
+        try:
+            _sid = get_session_id() or ""
+        except Exception:
+            _sid = ""
+        anchor = get_anchor(chat_id, _sid)
 
         for post in reversed(history.values()):  # история нужна реверсированной, для эффективной обработки LLM
             file_ids = set()
@@ -132,14 +162,20 @@ class ContextAssembler:
             message = re.sub(g.ATTACHES_REGEX, lambda m: self._resolve_file_id(m, file_ids, file_map), message, re.M)
             post_refs = re.findall(r'@post#(\d+)', message)   # если данный пост ссылается на ранние посты, будет список id
             pinned = ("#post_pinned" in message) or ("#pinned_post" in message)
-            rel_offset = 20 if pinned else (base_rel - count)
+            # Спад релевантности по «глубине» только у хвоста (post_id > anchor). Якорь сдвигается
+            # только при FULL в LLMInteractor — иначе каждое новое сообщение сдвигало бы всех на −1.
+            pid_i = int(post_id or 0)
+            if pid_i > anchor:
+                rel_offset = 20 if pinned else (base_rel - count_tail)
+            else:
+                rel_offset = 20 if pinned else base_rel
             relevance = post.get('relevance', 50) + rel_offset
             relevance += ref_relevance.get(post_id, 0)
 
             relevance = min(100, relevance)
             relevance = max(0, relevance)
             attached_files.update(file_ids)
-            if post_t >= fresh_window or count < 20:
+            if post_t >= fresh_window or included_count < 20:
                 self.fresh_files.update(file_ids)
                 # Extract @span#hash from message
                 spans = re.findall(r'@span#(\w+)', message)
@@ -149,7 +185,10 @@ class ContextAssembler:
             for ref_id in post_refs:
                 ref_relevance[ref_id] = ref_relevance.get(ref_id, 0) + relevance * 0.1  # добавление релевантности более старым постам
 
-            count += 1
+            if pid_i > anchor:
+                count_tail += 1
+
+            included_count += 1
 
             content_blocks.append(ContentBlock(
                 content_text=message,
@@ -158,7 +197,8 @@ class ContextAssembler:
                 timestamp=dt.strftime(g.SQL_TIMESTAMP + "Z"),
                 post_id=post_id,
                 user_id=post["user_id"],
-                relevance=math.floor(relevance)
+                relevance=math.floor(relevance),
+                revision_ts=post_t,
             ))
         log.debug(" Относительная релевантность постов %s после сборки ", str(ref_relevance))
         return content_blocks
@@ -206,8 +246,18 @@ class ContextAssembler:
             _proj_man.scan_project_files()
             dir_name = match.group(1)
             log.debug("Обработка @attach_dir#%s", dir_name)
-            query = "SELECT id, file_name FROM attached_files WHERE file_name LIKE :dir_name OR file_name LIKE :ref_name"
-            rows = self.db.fetch_all(query, {'dir_name': f"{dir_name}%", 'ref_name': f"@{dir_name}%"})
+            query = (
+                "SELECT id, file_name FROM attached_files WHERE file_name LIKE :dir_name "
+                "OR file_name LIKE :ref_at OR file_name LIKE :ref_reg"
+            )
+            rows = self.db.fetch_all(
+                query,
+                {
+                    "dir_name": f"{dir_name}%",
+                    "ref_at": f"@{dir_name}%",
+                    "ref_reg": f"{REF}{dir_name}%",
+                },
+            )
             for row in rows:
                 file_id = row[0]
                 _add(row[1])

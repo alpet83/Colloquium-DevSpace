@@ -41,6 +41,8 @@ class BasicLogger:
         self.last_create = 0
         self.log_dir = "/app/logs/"
         self.initializing = False  # Флаг для предотвращения рекурсии
+        # Если запись лога на диск невозможна (ENOSPC, права, битый bind-mount) — не крутим open() на каждое сообщение.
+        self._disk_log_disabled = False
         # Инициализация verbosity из переменной окружения
         verbosity_str = os.getenv("LOG_VERBOSITY", "DEBUG")
         try:
@@ -73,6 +75,18 @@ class BasicLogger:
             os.chdir(cwd)
         self.close("logger destruct")
 
+    def _emit_log_setup_error(self, msg: str, exc: BaseException | None = None) -> None:
+        """Сообщение о сбое настройки лога: не через log_msg (рекурсия / initializing)."""
+        suffix = f": {exc}" if exc is not None else ""
+        try:
+            logging.error("BasicLogger[%s] %s%s", self.log_prefix, msg, suffix)
+        except Exception:
+            pass
+        try:
+            print(f"BasicLogger[{self.log_prefix}] {msg}{suffix}", file=sys.stderr)
+        except Exception:
+            pass
+
     def log_filename(self, create_link=True):
         if self.file_name and os.path.exists(self.file_name):
             return self.file_name
@@ -87,7 +101,11 @@ class BasicLogger:
         path = os.path.join(base, day_dir)
         relative = os.path.join(".", self.sub_dir, day_dir)
         if not os.path.exists(path):
-            os.makedirs(path, mode=0o770, exist_ok=True)
+            try:
+                os.makedirs(path, mode=0o770, exist_ok=True)
+            except OSError as e:
+                self._emit_log_setup_error("makedirs для каталога лога", e)
+                raise
 
         # Ссылка на каталог текущего дня: /app/logs/<sub_dir>.td -> ./<sub_dir>/YYYY-MM-DD
         syml = os.path.join(self.log_dir, f"{self.log_prefix}.td")
@@ -99,7 +117,9 @@ class BasicLogger:
             with open(result, "wb") as f:
                 f.write("☺".encode("utf-8"))
         except Exception as e:
-            self.log_msg("#EXCEPTION: %s from %s", str(e), self._format_backtrace(), echo=lambda x: print(x, file=sys.stderr))
+            self._emit_log_setup_error(
+                f"тестовая запись лога {result!r} (проверка прав/места на диске)", e
+            )
 
         # Ссылка на текущий лог-файл: /app/logs/<prefix>.log -> ./<sub_dir>/YYYY-MM-DD/<prefix>_HHMM.log
         relative = result.replace(self.log_dir, "./")
@@ -239,10 +259,20 @@ class BasicLogger:
         self.initializing = True
         try:
             msg = format_color(fmt, *args)
-            if not self.log_fd or (self.log_fd and self.log_fd.fileno() == -1):
+            if (
+                not self._disk_log_disabled
+                and (not self.log_fd or (self.log_fd and self.log_fd.fileno() == -1))
+            ):
                 self.file_name = self.log_filename()
-                self.log_fd = open(self.file_name, "ab")
-                self.last_create = time.time()
+                try:
+                    self.log_fd = open(self.file_name, "ab")
+                    self.last_create = time.time()
+                except OSError as e:
+                    self._disk_log_disabled = True
+                    self.log_fd = None
+                    self._emit_log_setup_error(
+                        f"open лога {self.file_name!r} (режим только echo/stderr)", e
+                    )
 
             if len(msg) > 20480:
                 msg = f"#TRUNCATED: {msg[:20480]}"
@@ -283,18 +313,35 @@ class BasicLogger:
 
             self.lines += msg.count("\n") + 1
 
-            size = self.file_size()
-            minute = datetime.now().minute
-            huge_size = size > self.size_limit
-            if huge_size or (minute == 0 and self.lines >= 15000):
-                self.close(f"log size {size}, lines {self.lines}")
-                self.file_name = self.log_filename()
-                self.log_fd = open(self.file_name, "ab")
-                msg = format_color("#LOG_ROTATE: %s reaches size %.1f MiB, check for flood", self.file_name, size / 1024 / 1024)
-                if huge_size:
-                    raise Exception(msg)
-                else:
-                    self.log_msg(msg, echo=echo)
+            if not self._disk_log_disabled:
+                size = self.file_size()
+                minute = datetime.now().minute
+                huge_size = size > self.size_limit
+                if huge_size or (minute == 0 and self.lines >= 15000):
+                    self.close(f"log size {size}, lines {self.lines}")
+                    rot_err: OSError | None = None
+                    try:
+                        self.file_name = self.log_filename()
+                        self.log_fd = open(self.file_name, "ab")
+                        self.last_create = time.time()
+                    except OSError as e:
+                        rot_err = e
+                        self._disk_log_disabled = True
+                        self.log_fd = None
+                        self._emit_log_setup_error("ротация лога: не удалось открыть новый файл", e)
+                    msg = format_color(
+                        "#LOG_ROTATE: %s reaches size %.1f MiB, check for flood",
+                        self.file_name,
+                        size / 1024 / 1024,
+                    )
+                    if huge_size:
+                        if rot_err is not None:
+                            raise Exception(msg) from rot_err
+                        raise Exception(msg)
+                    if rot_err is None:
+                        self.log_msg(msg, echo=echo)
+                    else:
+                        self._emit_log_setup_error("периодическая ротация: новый лог не открыт", rot_err)
         finally:
             self.initializing = False
 

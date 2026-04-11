@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import re
+import signal
 from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -27,6 +28,21 @@ _DEFAULT_PG_DUMP_CRON = "0 3 * * *"  # раз в сутки, 03:00 UTC
 _DEFAULT_PG_DUMP_MISS_AFTER_SEC = 129_600  # 36 ч — допуск к «раз в сутки»
 _MISS_CHECK_INTERVAL_MIN = 15
 _PG_BACKUP_SCRIPT = "/app/postgres/backup_postgres.sh"
+_NIGHTLY_RESTART_JOB = "core_nightly_restart"
+
+
+def _sql_jobs_enabled(db: Database, *, alias: str | None = None) -> str:
+    """SQLite хранит enabled как INTEGER; PostgreSQL — BOOLEAN."""
+    col = f"{alias}.enabled" if alias else "enabled"
+    return f"{col} IS TRUE" if db.is_postgres() else f"{col} = 1"
+
+
+def _param_enabled_true(db: Database) -> bool | int:
+    return True if db.is_postgres() else 1
+
+
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _parse_ts(value: Any) -> datetime | None:
@@ -77,6 +93,7 @@ class CoreScheduler:
             return
         db = Database.get_database()
         self._maybe_seed_pg_backup(db)
+        self._maybe_seed_core_nightly_restart(db)
         self._ap = AsyncIOScheduler(timezone=ZoneInfo("UTC"))
         interval_min = _MISS_CHECK_INTERVAL_MIN
         self._ap.add_job(
@@ -117,7 +134,7 @@ class CoreScheduler:
         db = Database.get_database()
         rows = db.fetch_all(
             "SELECT job_id, cron_expr, COALESCE(timezone, 'UTC') AS tz "
-            "FROM scheduled_jobs WHERE enabled = 1"
+            f"FROM scheduled_jobs WHERE {_sql_jobs_enabled(db)}"
         )
         for row in rows or []:
             job_id, cron_expr, tz_name = int(row[0]), str(row[1]), str(row[2] or "UTC")
@@ -157,14 +174,70 @@ class CoreScheduler:
         db.execute(
             """
             INSERT INTO scheduled_jobs (name, enabled, cron_expr, timezone, kind, config_json, miss_after_sec)
-            VALUES (:name, 1, :cron, 'UTC', 'pg_dump_script', '{}', :miss)
+            VALUES (:name, :en, :cron, 'UTC', 'pg_dump_script', '{}', :miss)
             """,
-            {"name": "pg_dump_daily", "cron": cron, "miss": miss_sec},
+            {
+                "name": "pg_dump_daily",
+                "en": _param_enabled_true(db),
+                "cron": cron,
+                "miss": miss_sec,
+            },
         )
         log.info(
             "Seeded scheduled_jobs: pg_dump_daily cron=%r UTC miss_after_sec=%d (изменить — через БД/API)",
             cron,
             miss_sec,
+        )
+
+    def _maybe_seed_core_nightly_restart(self, db: Database) -> None:
+        """Раз в сутки SIGTERM процессу ядра → Docker поднимает контейнер снова (restart: unless-stopped)."""
+        if not _env_truthy("CORE_NIGHTLY_RESTART"):
+            return
+        exists = db.fetch_all(
+            "SELECT 1 FROM scheduled_jobs WHERE name = :n LIMIT 1",
+            {"n": _NIGHTLY_RESTART_JOB},
+        )
+        if exists:
+            return
+        cron = (os.getenv("CORE_NIGHTLY_RESTART_CRON") or "0 3 * * *").strip()
+        if not _cron_valid(cron):
+            log.warn(
+                "CORE_NIGHTLY_RESTART_CRON=%r некорректен, сид ночного перезапуска пропущен",
+                cron,
+            )
+            return
+        tz_name = (
+            os.getenv("CORE_NIGHTLY_RESTART_TZ")
+            or os.getenv("TZ")
+            or "UTC"
+        ).strip() or "UTC"
+        try:
+            ZoneInfo(tz_name)
+        except ZoneInfoNotFoundError:
+            log.warn(
+                "CORE_NIGHTLY_RESTART_TZ=%r неизвестна, сид ночного перезапуска пропущен",
+                tz_name,
+            )
+            return
+        miss_sec = int(os.getenv("CORE_NIGHTLY_RESTART_MISS_SEC", "93600"))
+        db.execute(
+            """
+            INSERT INTO scheduled_jobs (name, enabled, cron_expr, timezone, kind, config_json, miss_after_sec)
+            VALUES (:name, :en, :cron, :tz, 'core_graceful_restart', '{}', :miss)
+            """,
+            {
+                "name": _NIGHTLY_RESTART_JOB,
+                "en": _param_enabled_true(db),
+                "cron": cron,
+                "tz": tz_name,
+                "miss": miss_sec,
+            },
+        )
+        log.info(
+            "Seeded scheduled_jobs: %s cron=%r tz=%s (отключить: CORE_NIGHTLY_RESTART=0 и enabled=0 в БД)",
+            _NIGHTLY_RESTART_JOB,
+            cron,
+            tz_name,
         )
 
     async def _miss_check_tick(self) -> None:
@@ -175,14 +248,14 @@ class CoreScheduler:
 
     def _miss_check_sync(self) -> None:
         db = Database.get_database()
-        q = """
-            SELECT j.job_id, j.name, j.miss_after_sec, j.created_at,
-                   MAX(CASE WHEN r.status = 'success' THEN r.finished_at END) AS last_ok
-            FROM scheduled_jobs j
-            LEFT JOIN scheduled_job_runs r ON r.job_id = j.job_id
-            WHERE j.enabled = 1
-            GROUP BY j.job_id, j.name, j.miss_after_sec, j.created_at
-        """
+        q = (
+            "SELECT j.job_id, j.name, j.miss_after_sec, j.created_at,\n"
+            "       MAX(CASE WHEN r.status = 'success' THEN r.finished_at END) AS last_ok\n"
+            "FROM scheduled_jobs j\n"
+            "LEFT JOIN scheduled_job_runs r ON r.job_id = j.job_id\n"
+            f"WHERE {_sql_jobs_enabled(db, alias='j')}\n"
+            "GROUP BY j.job_id, j.name, j.miss_after_sec, j.created_at"
+        )
         rows = db.fetch_all(q)
         now = _utcnow()
         for row in rows or []:
@@ -221,7 +294,8 @@ class CoreScheduler:
     async def _run_job(self, job_id: int, trigger_kind: str) -> None:
         db = Database.get_database()
         row = db.fetch_one(
-            "SELECT kind, config_json FROM scheduled_jobs WHERE job_id = :id AND enabled = 1",
+            "SELECT kind, config_json FROM scheduled_jobs WHERE job_id = :id AND "
+            + _sql_jobs_enabled(db),
             {"id": job_id},
         )
         if not row:
@@ -234,6 +308,23 @@ class CoreScheduler:
             cfg = {}
         started = _utcnow()
         run_id = self._insert_run_start(db, job_id, started, trigger_kind)
+        if kind == "core_graceful_restart":
+            self._insert_run_finish(
+                db,
+                run_id,
+                _utcnow(),
+                "success",
+                0,
+                "nightly restart: SIGTERM self",
+                "",
+            )
+            log.warn(
+                "core_graceful_restart job_id=%d: перезапуск ядра через 2 с (см. cron/timezone задания в scheduled_jobs)",
+                job_id,
+            )
+            await asyncio.sleep(2)
+            os.kill(os.getpid(), signal.SIGTERM)
+            return
         stdout_b, stderr_b, exit_code, status = await self._dispatch(kind, cfg)
         finished = _utcnow()
         out_t = (stdout_b or b"").decode("utf-8", errors="replace")[-_OUT_TAIL:]

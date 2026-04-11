@@ -66,6 +66,12 @@ def get_bool(key: str, *, default: bool = False) -> bool:
     return raw.lower() in ("1", "true", "yes", "on")
 
 
+def is_runtime_config_set(key: str) -> bool:
+    """True, если для ключа задано непустое effective-значение (config или env)."""
+    raw = _resolve_raw(key)
+    return raw is not None and raw != ""
+
+
 def get_int(key: str, default: int, lo: int, hi: int) -> int:
     raw = _resolve_raw(key)
     if raw is None or raw == "":

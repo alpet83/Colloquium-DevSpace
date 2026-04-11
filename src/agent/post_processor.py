@@ -5,6 +5,7 @@ import globals as g
 from managers.chats import ChatLocker
 from managers.db import DataTable
 from llm_hands import process_message
+from lib.text_unescape import unescape_utf8_literal_escapes
 
 log = g.get_logger("postproc")
 
@@ -38,7 +39,15 @@ class PostProcessor:
         )
         log.debug("Инициализирован PostProcessor с таблицей quotes")
 
-    async def process_response(self, chat_id: int, user_id: int, response: str, post_id: int = None) -> dict:
+    async def process_response(
+        self,
+        chat_id: int,
+        user_id: int,
+        response: str,
+        post_id: int = None,
+        *,
+        unescape_display: bool = False,
+    ) -> dict:
         """Обрабатывает ответ LLM, извлекая цитаты, команды редактирования, файлы и патчи, вызывая llm_hands."""
         log.debug("Обработка ответа для chat_id=%d, user_id=%d, post_id=%s, response_type=%s, response=%s",
                   chat_id, user_id, str(post_id) if post_id is not None else "None", type(response), response[:50])
@@ -51,6 +60,9 @@ class PostProcessor:
             log.error("Неверный тип ответа: %s", type(response))
             return {"handled_cmds": 0, "failed_cmds": 1, "processed_msg": response,
                     "agent_reply": "Error: Invalid response type"}
+
+        if unescape_display and "\\" in response:
+            response = unescape_utf8_literal_escapes(response)
 
         # Извлекаем @post#post_id для reply_to
         reply_to = post_id

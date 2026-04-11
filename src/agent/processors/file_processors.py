@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from managers.project import ProjectManager
 from processors.block_processor import BlockProcessor, res_error, res_success, ProcessorError
+from lib.text_bytes import decode_file_bytes
 
 log = g.get_logger("llm_proc")
 
@@ -150,8 +151,13 @@ class FileUndoProcessor(BlockProcessor):
                     emsg += f" Oldest file have age {current_time - oldest} seconds"
                 raise ProcessorError(emsg, user_name)
 
-            with latest_backup.open('r', encoding='utf-8') as f:
-                backup_content = f.read()
+            raw_b = latest_backup.read_bytes()
+            dec = decode_file_bytes(raw_b)
+            if dec is None:
+                raise ProcessorError(
+                    f"Error: Backup for file_id={file_id} is not decodable as text", user_name
+                )
+            backup_content, _enc, _eol = dec
             old_lines_count = len(source.splitlines())
             result = self.save_file(file_id, file_name, backup_content, project_id, user_name,
                                    timestamp=latest_timestamp)
