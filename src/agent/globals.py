@@ -3,10 +3,9 @@ from lib.basic_logger import BasicLogger
 from fastapi import Request, HTTPException
 import threading
 import contextvars
-import base64
-import hashlib
-import hmac
 import os
+
+from lib.token_crypto import decrypt_token_with_secret, encrypt_token_with_secret, is_encrypted_token
 
 user_manager = None
 """ user_manager (UserManager) - control users/actors"""
@@ -200,25 +199,10 @@ def _load_token_secret() -> str | None:
     return _token_secret_cache
 
 
-def _token_key() -> bytes | None:
-    secret = _load_token_secret()
-    if not secret:
-        return None
-    return hashlib.sha256(secret.encode('utf-8')).digest()
-
-
-def _keystream(key: bytes, nonce: bytes, length: int) -> bytes:
-    out = bytearray()
-    counter = 0
-    while len(out) < length:
-        block = hmac.new(key, nonce + counter.to_bytes(8, 'big'), hashlib.sha256).digest()
-        out.extend(block)
-        counter += 1
-    return bytes(out[:length])
-
-
-def is_encrypted_token(value: str | None) -> bool:
-    return isinstance(value, str) and value.startswith('enc:v1:')
+def clear_token_secret_cache() -> None:
+    """Сброс кэша секрета (например после внешней ротации пароля БД в том же процессе — редко нужно)."""
+    global _token_secret_cache
+    _token_secret_cache = None
 
 
 def encrypt_token(value: str | None) -> str | None:
@@ -227,17 +211,12 @@ def encrypt_token(value: str | None) -> str | None:
     if is_encrypted_token(value):
         return value
 
-    key = _token_key()
-    if not key:
+    secret = _load_token_secret()
+    if not secret:
         get_logger('tokensec').warn('Token encryption key not configured; llm_token will remain plaintext')
         return value
 
-    plain = value.encode('utf-8')
-    nonce = os.urandom(16)
-    cipher = bytes([a ^ b for a, b in zip(plain, _keystream(key, nonce, len(plain)))])
-    tag = hmac.new(key, b'enc:v1:' + nonce + cipher, hashlib.sha256).digest()[:16]
-    packed = base64.urlsafe_b64encode(nonce + tag + cipher).decode('ascii').rstrip('=')
-    return 'enc:v1:' + packed
+    return encrypt_token_with_secret(value, secret)
 
 
 def decrypt_token(value: str | None) -> str | None:
@@ -246,22 +225,9 @@ def decrypt_token(value: str | None) -> str | None:
     if not is_encrypted_token(value):
         return value
 
-    key = _token_key()
-    if not key:
+    secret = _load_token_secret()
+    if not secret:
         get_logger('tokensec').warn('Token decryption key not configured')
         return None
 
-    raw = value[len('enc:v1:'):]
-    padding = '=' * (-len(raw) % 4)
-    blob = base64.urlsafe_b64decode(raw + padding)
-    if len(blob) < 32:
-        raise ValueError('Encrypted token payload is too short')
-
-    nonce = blob[:16]
-    tag = blob[16:32]
-    cipher = blob[32:]
-    expected = hmac.new(key, b'enc:v1:' + nonce + cipher, hashlib.sha256).digest()[:16]
-    if not hmac.compare_digest(tag, expected):
-        raise ValueError('Encrypted token integrity check failed')
-    plain = bytes([a ^ b for a, b in zip(cipher, _keystream(key, nonce, len(cipher)))])
-    return plain.decode('utf-8')
+    return decrypt_token_with_secret(value, secret)
