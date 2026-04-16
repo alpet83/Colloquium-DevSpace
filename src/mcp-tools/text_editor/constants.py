@@ -1,0 +1,17 @@
+from __future__ import annotations
+
+LINE_EDITED = 0x0001
+LINT_SUCCESS = 0x10000
+SAVED_TO_DISK = 0x20000
+
+DEFAULT_MAX_VIEW_LINES = 80
+HARD_MAX_VIEW_LINES = 120
+MAX_NUMBERED_LINES = 120
+MAX_WRAPPED_SEGMENTS_PER_LINE = 12
+DEFAULT_WRAP_WIDTH = 120
+
+DEFAULT_RECENT_OPS_LIMIT = 3
+MAX_RECENT_OPS_LIMIT = 5
+
+RESPONSE_MODES = {"viewport", "numbered_lines", "full_diff", "changed_lines", "minimal"}
+

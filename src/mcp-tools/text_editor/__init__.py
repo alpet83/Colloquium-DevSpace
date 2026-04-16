@@ -1,0 +1,2 @@
+"""Text editor MCP package."""
+
