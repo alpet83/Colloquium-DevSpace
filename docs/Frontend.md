@@ -373,20 +373,3 @@ Performance:
 Implement lazy loading for long chat histories to reduce initial render time.
 
 
----
-
-## Локальная разработка (Vite, каталог `src/frontend`)
-
-Стандартный цикл для шаблона Vue 3 + Vite:
-
-```sh
-cd src/frontend
-npm install
-npm run dev
-npm run build
-npm run lint
-```
-
-Подробнее: [Vite Configuration Reference](https://vite.dev/config/). Рекомендуемый редактор: VS Code + [Volar](https://marketplace.visualstudio.com/items?itemName=Vue.volar).
-
-

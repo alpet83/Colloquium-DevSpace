@@ -1,0 +1,1 @@
+Backend Python logs use BasicLogger for each module via globals.get_logger(<name>). Use % formatting or ~Cxxx ~C00 tags for complex structures. ~Cxxx tags match ANSI codes (0–110) for text style, color, or background. Use only with BasicLogger or esctext functions; avoid in print(f) or logging to prevent output pollution.

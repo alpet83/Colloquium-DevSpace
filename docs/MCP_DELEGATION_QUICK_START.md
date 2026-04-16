@@ -23,8 +23,8 @@
 ```powershell
 # Create chat via CQDS UI or MCP
 # Copy-paste prepared root message below
-# IMPORTANT: Wait 3 seconds for chat to stabilize (NO model tags yet)
-# Do NOT proceed until status = "stable"
+# NOTE: Wait 3 seconds for chat to stabilize (do not tag models yet)
+# Continue only after status becomes "stable"
 ```
 
 **Root Message Template** (copy-paste and customize):
