@@ -1,0 +1,99 @@
+[ignore]
+dirs = [
+  ".git",
+  "__pycache__",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".ruff_cache",
+  ".tox",
+  ".venv",
+  "node_modules",
+  "data",
+  "logs",
+  "projects",
+  "secrets",
+  "postgres",
+  ".tmp",
+]
+file_patterns = [
+  "*.pyc",
+  "*.pyo",
+  "*.log",
+  "*.secret",
+  "tmp_*",
+  "*.dump",
+  "*.sqlite",
+  "*.jsonl",
+  "commit_prepare_report.json",
+]
+
+[scan]
+text_extensions = [
+  ".py", ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".ini",
+  ".cfg", ".env", ".sh", ".ps1", ".sql", ".js", ".ts", ".tsx",
+  ".jsx", ".css", ".scss", ".html", ".vue", ".mjs",
+]
+infra_patterns = [
+  "C:\\\\",
+  "P:\\\\",
+]
+
+[commit]
+public_repo = "{main_repo}"
+
+[[mappings]]
+name = "main_src"
+src = "{target_dir}"
+dst = "{main_repo}/src"
+exclude_globs = [
+  "agent/requirements_sandwich.txt",
+  "cqds_mcp_auth.secret",
+  "copilot_mcp_tool.secret",
+  "commit_prepare.py",
+  "stats/**",
+  ".gitignore",
+  ".gitattributes",
+  ".editorconfig",
+  "mcp-tools/*.bak",
+  "backups/**",
+  "tests/**",
+  "docs/**",
+  "NOTES_DEPLOY_ROOT.txt",
+  "agent/lib/*_block.py",
+  "agent/lib/code_stripper.py",
+  "agent/lib/deps_builder.py",
+  "agent/lib/entity_parser.py",
+  "agent/lib/iter_regex.py",
+  "agent/lib/llm_tools.py",
+  "agent/lib/sandwich_pack.py",
+]
+exclude_rel_prefixes = ["src/tests"]
+
+[[mappings]]
+name = "main_tests"
+src = "{target_dir}/src/tests"
+dst = "{main_repo}/src/tests"
+
+[[mappings]]
+name = "main_docs"
+src = "{target_parent}/docs"
+dst = "{main_repo}/docs"
+
+[[mappings]]
+name = "sandwich_lib"
+src = "{target_dir}/agent/lib"
+dst = "{sandwich_repo}/src/lib"
+exclude_globs = [
+  "basic_logger.py",
+  "esctext.py",
+  "execute_commands.py",
+  "file_watchdog.py",
+  "session_context.py",
+  "smart_grep_scope_cache.py",
+  "test_log.py",
+]
+
+[[mappings]]
+name = "sandwich_requirements"
+src = "{target_dir}/agent/requirements_sandwich.txt"
+dst = "{sandwich_repo}/requirements.txt"
