@@ -277,6 +277,37 @@ _PUB_REPOS: set[str] = set()
 _APPLY_DRY_RUN_TTL_SEC = 300
 
 
+def _repo_key(path: str) -> str:
+    return str(Path(path).resolve()).lower()
+
+
+async def _git_is_clean(repo_path: str, bash_path: str) -> bool | None:
+    command = f"cd {shlex.quote(repo_path)} && git status --porcelain"
+    proc = await asyncio.create_subprocess_exec(
+        bash_path,
+        "-lc",
+        command,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=repo_path,
+        env=os.environ.copy(),
+    )
+    stdout_b, _ = await proc.communicate()
+    if proc.returncode != 0:
+        return None
+    return not bool((stdout_b or b"").decode("utf-8", errors="replace").strip())
+
+
+def _drop_binding_for_public_repo(pub_key: str) -> None:
+    _PUB_REPOS.discard(pub_key)
+    runtime_keys = [rk for rk, pk in _REPO_MAP.items() if pk == pub_key]
+    for rk in runtime_keys:
+        _REPO_MAP.pop(rk, None)
+        _LAST_DRY_RUN_TS_BY_REPO.pop(rk, None)
+        _LAST_DRY_RUN_TOKEN_BY_REPO.pop(rk, None)
+
+
 def _find_commit_prepare(repo_path: str) -> str | None:
     for rel in _COMMIT_PREPARE_LOCATIONS:
         candidate = Path(repo_path) / rel
@@ -798,7 +829,7 @@ async def _handle_git_safe_commit(arguments: dict[str, Any]) -> CallToolResult:
                 "token_ok": True,
             }
 
-    repo_key = str(Path(repo_path).resolve()).lower()
+    repo_key = _repo_key(repo_path)
     repo_resolved = str(Path(repo_path).resolve())
     now_ts = time.monotonic()
     dry_run_guard: dict[str, Any] = {
@@ -889,6 +920,7 @@ async def _handle_git_safe_commit(arguments: dict[str, Any]) -> CallToolResult:
             }
         )
 
+    commit_warnings: list[str] = []
     if mode == "commit":
         commit_files: list[str] = []
         if commit_files_raw is None:
@@ -985,19 +1017,25 @@ async def _handle_git_safe_commit(arguments: dict[str, Any]) -> CallToolResult:
         if public_repo:
             expected_candidates = sorted(_PUB_REPOS)
             if not expected_candidates:
-                return CallToolResult(
-                    isError=True,
-                    content=[
-                        TextContent(
-                            type="text",
-                            text=warning
-                            + "\nERROR: expected public commit repository is unknown.\n"
-                            + "Run dry_run/apply on the runtime repo first so commit_prepare report provides "
-                            + "the bound public_commit_repo path.",
-                        )
-                    ],
-                )
-            if repo_resolved.lower() not in _PUB_REPOS:
+                repo_clean = await _git_is_clean(repo_path, bash_path)
+                if repo_clean is False:
+                    commit_warnings.append(
+                        "WARN: commit allowed without active dry_run/apply token; change origin is unknown."
+                    )
+                else:
+                    return CallToolResult(
+                        isError=True,
+                        content=[
+                            TextContent(
+                                type="text",
+                                text=warning
+                                + "\nERROR: expected public commit repository is unknown.\n"
+                                + "Run dry_run/apply on the runtime repo first so commit_prepare report provides "
+                                + "the bound public_commit_repo path, or ensure repo has pending changes.",
+                            )
+                        ],
+                    )
+            elif repo_resolved.lower() not in _PUB_REPOS:
                 return CallToolResult(
                     isError=True,
                     content=[
@@ -1076,13 +1114,15 @@ async def _handle_git_safe_commit(arguments: dict[str, Any]) -> CallToolResult:
     }
     if mode == "commit":
         result["commit_scope"] = commit_scope
+        if commit_warnings:
+            result["warnings"] = commit_warnings
     if mode == "dry_run" and exit_code == 0:
         _LAST_DRY_RUN_TS_BY_REPO[repo_key] = now_ts
         dry_run_token = secrets.token_urlsafe(24)
         _LAST_DRY_RUN_TOKEN_BY_REPO[repo_key] = dry_run_token
         expected_public = _report_public_repo(repo_path)
         if expected_public:
-            expected_key = str(Path(expected_public).resolve()).lower()
+            expected_key = _repo_key(expected_public)
             _REPO_MAP[repo_key] = expected_key
             _PUB_REPOS.add(expected_key)
         result["dry_run_guard"] = {
@@ -1098,13 +1138,18 @@ async def _handle_git_safe_commit(arguments: dict[str, Any]) -> CallToolResult:
         result["dry_run_guard"] = dry_run_guard
         expected_public = _report_public_repo(repo_path)
         if expected_public:
-            expected_key = str(Path(expected_public).resolve()).lower()
+            expected_key = _repo_key(expected_public)
             _REPO_MAP[repo_key] = expected_key
             _PUB_REPOS.add(expected_key)
             result["expected_public_commit_repo"] = expected_public
         if exit_code == 0:
-            _LAST_DRY_RUN_TS_BY_REPO.pop(repo_key, None)
-            _LAST_DRY_RUN_TOKEN_BY_REPO.pop(repo_key, None)
+            # Keep apply token/binding for iterative fragment commits.
+            # Cleanup happens when public repo becomes clean (git status --porcelain).
+            bound_pub = _REPO_MAP.get(repo_key)
+            if bound_pub:
+                is_clean = await _git_is_clean(str(Path(bound_pub).resolve()), bash_path)
+                if is_clean:
+                    _drop_binding_for_public_repo(bound_pub)
     text = warning + "\n" + json.dumps(result, ensure_ascii=False, indent=2)
     return CallToolResult(
         isError=exit_code != 0,
@@ -1871,6 +1916,24 @@ async def _handle_git_repo_status(arguments: dict[str, Any]) -> CallToolResult:
     )
     stdout_b, stderr_b = await proc.communicate()
     exit_code = proc.returncode if proc.returncode is not None else -1
+    decoded = (stdout_b or b"").decode("utf-8", errors="replace")
+    nonempty_lines = [ln.strip() for ln in decoded.splitlines() if ln.strip()]
+    # When show_branch=true, git status includes a leading "## <branch...>" line
+    # even if there are no other changes. Treat it as header-only.
+    if show_branch and nonempty_lines and nonempty_lines[0].startswith("##"):
+        nonempty_lines = nonempty_lines[1:]
+    clean_status = exit_code == 0 and not bool(nonempty_lines)
+    repo_k = _repo_key(repo_path)
+    if clean_status:
+        if repo_k in _PUB_REPOS:
+            _drop_binding_for_public_repo(repo_k)
+        else:
+            mapped_pub = _REPO_MAP.get(repo_k)
+            if mapped_pub:
+                maybe_clean = await _git_is_clean(str(Path(mapped_pub).resolve()), bash_path)
+                if maybe_clean:
+                    _drop_binding_for_public_repo(mapped_pub)
+
     result: dict[str, Any] = {
         "result_code": "success" if exit_code == 0 else "error",
         "repo_path": repo_path,
@@ -1878,6 +1941,7 @@ async def _handle_git_repo_status(arguments: dict[str, Any]) -> CallToolResult:
         "stdout": (stdout_b or b"").decode("utf-8", errors="replace"),
         "stderr": (stderr_b or b"").decode("utf-8", errors="replace"),
         "argv": argv,
+        "clean": clean_status,
     }
     return CallToolResult(
         isError=exit_code != 0,
