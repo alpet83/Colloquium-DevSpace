@@ -14,6 +14,7 @@ _ACTION_TO_LEGACY: dict[str, str] = {
     "undo_file": "cq_undo_file",
     "list_files": "cq_list_files",
     "get_index": "cq_get_index",
+    "index_job_status": "cq_index_job_status",
     "rebuild_index": "cq_rebuild_index",
     "get_code_index": "cq_get_code_index",
     "grep_entity": "cq_grep_entity",

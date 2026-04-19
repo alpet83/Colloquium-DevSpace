@@ -1,4 +1,5 @@
 # /agent/routes/project_routes.py, updated 2026-03-26 — simplified sync indexing + cache
+import copy
 import json
 import os
 import re
@@ -17,6 +18,19 @@ from fnmatch import fnmatch
 import globals as g
 from lib.basic_logger import BasicLogger
 from lib.smart_grep_scope_cache import filters_fingerprint, get_scope_cache, normalize_path_prefix
+from lib import maint_pool as maint_pool_lib
+from lib.background_task_registry import get_background_task_registry
+from lib.code_index_incremental import (
+    attach_full_metadata,
+    compute_dirty,
+    env_dirty_use_size,
+    env_incremental_enabled,
+    merge_index,
+    need_fingerprint_seed,
+    should_force_full,
+    stamp_rebuild_duration,
+    validate_cache,
+)
 
 router = APIRouter()
 log = g.get_logger("projectman")
@@ -54,8 +68,10 @@ def get_project_index_status(project_id: int, project_name: str) -> dict:
     cache_path = project_index_cache_path(project_name)
     cache_exists = cache_path.exists()
     cache_mtime = int(cache_path.stat().st_mtime) if cache_exists else None
-    file_entries = g.file_manager.file_index(project_id)
-    latest_file_ts = max((int(entry.get('ts') or 0) for entry in file_entries), default=0) or None
+    # Do not call file_index(verify_links=True) here: it touches disk per row and blocks the event loop
+    # at tens of thousands of links (e.g. after maint). MAX(ts) matches the active-link filter in file_index.
+    raw_ts = g.file_manager.active_files_latest_ts(project_id)
+    latest_file_ts = int(raw_ts) if raw_ts else None
     stale = bool(cache_exists and latest_file_ts and cache_mtime and latest_file_ts > cache_mtime)
     return {
         'project_id': project_id,
@@ -83,11 +99,20 @@ def _resolve_project(project_id: int) -> tuple[ProjectManager, str]:
     return pm, pm.project_name
 
 
-def _build_project_index_sync(project_id: int, project_name: str) -> tuple[dict, int, int, int, str]:
+def _write_project_index_cache(project_name: str, index_dict: dict) -> str:
+    cache_path = project_index_cache_path(project_name)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(index_dict, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(cache_path)
+
+
+def _build_project_index_full(project_id: int, project_name: str) -> tuple[dict, int, int, int, str]:
+    """Полный scan: все файлы проекта → pack → кеш с file_fingerprints и rebuild_revision=0."""
+    t0 = time.monotonic()
     file_entries = g.file_manager.file_index(project_id)
     if not file_entries:
         raise HTTPException(status_code=404, detail=f"No files in project {project_id}")
-    file_ids_set = {entry['id'] for entry in file_entries}
+    file_ids_set = {entry["id"] for entry in file_entries}
 
     assembler = ContextAssembler()
     file_map = {}
@@ -98,12 +123,101 @@ def _build_project_index_sync(project_id: int, project_name: str) -> tuple[dict,
     packer = SandwichPack(project_name, max_size=10_000_000, compression=True)
     result = packer.pack(blocks)
     entities_count = len(packer.entities) if packer.entities is not None else 0
+    index_dict = json.loads(result["index"])
+    index_dict = attach_full_metadata(
+        index_dict, file_entries, duration_sec=time.monotonic() - t0
+    )
+    cache_path = _write_project_index_cache(project_name, index_dict)
+    return index_dict, len(file_ids_set), len(blocks), entities_count, cache_path
 
-    cache_path = project_index_cache_path(project_name)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(result['index'], encoding='utf-8')
 
-    return json.loads(result['index']), len(file_ids_set), len(blocks), entities_count, str(cache_path)
+def _build_project_index_sync(project_id: int, project_name: str, *, force_full: bool = False) -> tuple[dict, int, int, int, str]:
+    """Полный или инкрементальный ребилд кеша индекса (sandwiches_index)."""
+    if force_full or not env_incremental_enabled():
+        return _build_project_index_full(project_id, project_name)
+
+    cached = read_project_cached_index(project_name)
+    if cached is None or not validate_cache(cached):
+        return _build_project_index_full(project_id, project_name)
+
+    if need_fingerprint_seed(cached):
+        log.info("project index: no file_fingerprints in cache, full rebuild project_id=%s", project_id)
+        return _build_project_index_full(project_id, project_name)
+
+    max_rev = env_max_incremental_revisions()
+    if should_force_full(cached, max_rev):
+        log.info(
+            "project index: rebuild_revision cap (%s), full rebuild project_id=%s",
+            max_rev,
+            project_id,
+        )
+        return _build_project_index_full(project_id, project_name)
+
+    use_size = env_dirty_use_size()
+    file_entries = g.file_manager.file_index(project_id, include_size=use_size)
+    if not file_entries:
+        raise HTTPException(status_code=404, detail=f"No files in project {project_id}")
+
+    dirty, removed = compute_dirty(cached, file_entries, use_size=use_size)
+    t_step = time.monotonic()
+
+    if not dirty and not removed:
+        path = str(project_index_cache_path(project_name))
+        n_ent = len(cached.get("entities") or [])
+        out = copy.deepcopy(cached)
+        stamp_rebuild_duration(out, time.monotonic() - t_step)
+        return out, len(file_entries), 0, n_ent, path
+
+    if dirty:
+        assembler = ContextAssembler()
+        file_map = {}
+        blocks = assembler.assemble_files(set(dirty), file_map)
+        assembled_ids = {getattr(b, "file_id", None) for b in blocks if getattr(b, "file_id", None) is not None}
+        if not blocks or assembled_ids != dirty:
+            log.info(
+                "project index: incremental assemble mismatch or empty (dirty=%s assembled=%s), full rebuild project_id=%s",
+                sorted(dirty),
+                sorted(assembled_ids) if blocks else [],
+                project_id,
+            )
+            return _build_project_index_full(project_id, project_name)
+
+        packer = SandwichPack(project_name, max_size=10_000_000, compression=True)
+        result = packer.pack(blocks)
+        partial = json.loads(result["index"])
+        try:
+            new_rev = int(cached.get("rebuild_revision", 0)) + 1
+        except (TypeError, ValueError):
+            new_rev = 1
+        merged = merge_index(
+            cached,
+            partial,
+            dirty_ids=dirty,
+            removed_ids=removed,
+            file_entries=file_entries,
+            new_revision=new_rev,
+            duration_sec=time.monotonic() - t_step,
+        )
+        cache_path = _write_project_index_cache(project_name, merged)
+        n_ent = len(merged.get("entities") or [])
+        return merged, len(file_entries), len(blocks), n_ent, cache_path
+
+    try:
+        new_rev = int(cached.get("rebuild_revision", 0)) + 1
+    except (TypeError, ValueError):
+        new_rev = 1
+    merged = merge_index(
+        cached,
+        None,
+        dirty_ids=set(),
+        removed_ids=removed,
+        file_entries=file_entries,
+        new_revision=new_rev,
+        duration_sec=time.monotonic() - t_step,
+    )
+    cache_path = _write_project_index_cache(project_name, merged)
+    n_ent = len(merged.get("entities") or [])
+    return merged, len(file_entries), 0, n_ent, cache_path
 
 
 def _is_mode_match(file_name: str, mode: str) -> bool:
@@ -456,7 +570,7 @@ def _scan_state(project_id: int, project_name: str | None = None) -> dict:
     }
 
 
-def _collect_project_problems(project_id: int, project_name: str) -> tuple[list[dict], dict, dict, int]:
+def _collect_project_problems(project_id: int, project_name: str) -> tuple[list[dict], dict, dict, int, dict]:
     problems: list[dict] = []
 
     scan = _scan_state(project_id, project_name)
@@ -567,7 +681,7 @@ def _collect_project_problems(project_id: int, project_name: str) -> tuple[list[
         overall_rank = max(overall_rank, severity_rank.get(str(p.get('severity', 'ok')), 0))
     overall = next((k for k, v in severity_rank.items() if v == overall_rank), 'ok')
 
-    return problems, scan, index, overall_rank
+    return problems, scan, index, overall_rank, ttl
 
 
 async def _run_project_scan_refresh(project_id: int):
@@ -845,6 +959,29 @@ async def project_scan_state(request: Request, project_id: int = Query(...)):
         raise
 
 
+def _project_status_payload_sync(project_id: int, project_name: str) -> dict:
+    """CPU/DB/FS-heavy parts of GET /project/status (run in a worker thread)."""
+    problems, scan, index, _overall_rank, ttl = _collect_project_problems(project_id, project_name)
+    overall = 'ok'
+    for candidate in ['info', 'warning', 'error']:
+        if any(str(p.get('severity')) == candidate for p in problems):
+            overall = candidate
+
+    stats = g.file_manager.project_stats(project_id=project_id)
+    return {
+        'project_id': project_id,
+        'project_name': project_name,
+        'status': overall,
+        'problems': problems,
+        'scan': scan,
+        'index': index,
+        'links': ttl,
+        'files': stats['files'],
+        'backups': stats['backups'],
+        'updated_at': int(time.time()),
+    }
+
+
 @router.get("/project/status")
 async def project_status(request: Request, project_id: int = Query(...)):
     try:
@@ -853,32 +990,15 @@ async def project_status(request: Request, project_id: int = Query(...)):
         if pm is None or pm.project_name is None:
             raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
 
-        problems, scan, index, _overall_rank = _collect_project_problems(project_id, pm.project_name)
-        overall = 'ok'
-        for candidate in ['info', 'warning', 'error']:
-            if any(str(p.get('severity')) == candidate for p in problems):
-                overall = candidate
-
-        stats = g.file_manager.project_stats(project_id=project_id)
-        payload = {
-            'project_id': project_id,
-            'project_name': pm.project_name,
-            'status': overall,
-            'problems': problems,
-            'scan': scan,
-            'index': index,
-            'links': g.file_manager.ttl_status(project_id=project_id, sample_limit=10),
-            'files': stats['files'],
-            'backups': stats['backups'],
-            'updated_at': int(time.time()),
-        }
+        project_name = pm.project_name
+        payload = await asyncio.to_thread(_project_status_payload_sync, project_id, project_name)
 
         log.debug(
             g.with_session_tag(request, 'GET /project/status project_id=%d project_name=%s status=%s problems=%d'),
             project_id,
-            pm.project_name,
-            overall,
-            len(problems),
+            project_name,
+            payload.get('status'),
+            len(payload.get('problems') or []),
         )
         return payload
     except HTTPException:
@@ -936,21 +1056,94 @@ async def project_scan_refresh(request: Request):
         raise
 
 
+@router.post("/project/maint_enqueue")
+async def project_maint_enqueue(request: Request):
+    """Поставить задачу в очередь maint-пула (подпроцессы core_maint_loop). kind=code_index — ребилд индекса без HTTP code_index."""
+    try:
+        g.check_session(request)
+        data = await request.json()
+        project_id = int(data.get("project_id") or 0)
+        kind = str(data.get("kind") or "").strip().lower()
+        if project_id <= 0:
+            raise HTTPException(status_code=400, detail="Missing or invalid project_id")
+        if kind not in ("code_index", "reconcile_tick"):
+            raise HTTPException(status_code=400, detail="kind must be code_index or reconcile_tick")
+
+        pm = ProjectManager.get(project_id)
+        if pm is None or pm.project_name is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+        db = Database.get_database()
+        maint_pool_lib.ensure_maint_pool_tables(db.engine)
+        status = maint_pool_lib.enqueue_maint_job(db.engine, project_id, kind)
+        return {"ok": True, "enqueue": status, "project_id": project_id, "kind": kind}
+    except HTTPException:
+        raise
+    except Exception as e:
+        g.handle_exception("Ошибка в POST /project/maint_enqueue", e)
+        raise
+
+
+def _merge_rebuilt_now(payload: dict, in_progress: bool) -> dict:
+    """Добавить ``rebuilt_now: 1``, если по проекту ещё идёт пересборка индекса."""
+    if not in_progress:
+        return payload
+    out = dict(payload)
+    out["rebuilt_now"] = 1
+    return out
+
+
 @router.get("/project/code_index")
 def code_index(
     request: Request,
     project_id: int = Query(...),
     timeout: int = Query(default=300, description="Max seconds the caller is willing to wait (informational — not enforced server-side; enforced by nginx/proxy)."),
+    cache_only: bool = Query(
+        default=False,
+        description="Без scan/пересборки: готовый result из session registry (code_index + meta.project_id), иначе файл кеша; поле rebuilt_now=1 если ребилд ещё идёт (registry pending или maint-пул).",
+    ),
 ):
     """Build and return the rich entity index for a project synchronously.
 
     Always saves result to cache file for MCP-tool to read.
-    Background queuing handled by MCP-tool (background=1 parameter no longer needed).
+    Фон без удержания HTTP: POST /project/maint_enqueue с kind=code_index (очередь maint-пула).
+    MCP background=1 — отдельный asyncio-воркер процесса MCP, всё ещё бьёт в этот sync endpoint.
     `timeout` is a client hint; actual cutoff is the nginx proxy_read_timeout.
+
+    При ``cache_only=true`` — try-retrieve: сначала готовый результат фоновой задачи сессии (POST /core/background_tasks
+    с kind=code_index и meta.project_id), затем чтение файла кеша; если индекс ещё пересобирается — к ответу
+    добавляется ``rebuilt_now: 1``.
     """
     try:
         g.check_session(request)
         pm, project_name = _resolve_project(project_id)
+
+        if cache_only:
+            sid = request.cookies.get("session_id")
+            if not sid:
+                raise HTTPException(status_code=401, detail="No session")
+            reg = get_background_task_registry()
+            ready = reg.pop_ready_result(str(sid), "code_index", project_id)
+            if ready is not None:
+                log.debug(
+                    g.with_session_tag(request, "GET /project/code_index cache_only: try-retrieve ready project_id=%d"),
+                    project_id,
+                )
+                return ready
+            cached = read_project_cached_index(project_name)
+            db = Database.get_database()
+            maint_pool_lib.ensure_maint_pool_tables(db.engine)
+            maint_busy = maint_pool_lib.code_index_active(db.engine, project_id)
+            pending_bg = reg.has_pending(str(sid), "code_index", project_id)
+            in_progress = maint_busy or pending_bg
+            if cached is not None:
+                return _merge_rebuilt_now(cached, in_progress)
+            if in_progress:
+                return {"rebuilt_now": 1}
+            raise HTTPException(
+                status_code=404,
+                detail=f"No cached code index for project_id={project_id}; run full GET without cache_only or POST /project/maint_enqueue.",
+            )
 
         # Always refresh attached_files via ProjectManager before index regeneration.
         scan_started = time.monotonic()

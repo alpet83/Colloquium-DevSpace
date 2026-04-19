@@ -80,6 +80,9 @@ async def handle_ctl(
     if name != tool_name:
         return None
 
+    if not isinstance(arguments, dict):
+        arguments = {}
+
     raw_reqs = arguments.get("requests")
     if isinstance(raw_reqs, list) and len(raw_reqs) > 0:
         stop_on_error = bool(arguments.get("stop_on_error", False))

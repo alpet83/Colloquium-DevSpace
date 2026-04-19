@@ -107,14 +107,18 @@ services:
       - P:/vps.alpet.me/sigsys-ts:/app/projects/sigsys-ts
       - P:/opt/docker:/app/projects/Colloquium-DevSpace
       - P:/opt/docker/trading-platform-php:/app/projects/trading-platform-php
-      - P:/GitHub/alpet-libs-php:/app/projects/alpet-libs-php
+      - P:/opt/docker/alpet-libs-php:/app/projects/alpet-libs-php
+      - P:/opt/docker/trade_report:/app/projects/trade_report
+      - P:/opt/docker/PWM-cryptocurrency:/app/projects/PWM-cryptocurrency
   mcp-sandbox:
     volumes:
       # Keep sandbox view consistent with core.
       - P:/vps.alpet.me/sigsys-ts:/app/projects/sigsys-ts
       - P:/opt/docker:/app/projects/Colloquium-DevSpace
       - P:/opt/docker/trading-platform-php:/app/projects/trading-platform-php
-      - P:/GitHub/alpet-libs-php:/app/projects/alpet-libs-php
+      - P:/opt/docker/alpet-libs-php:/app/projects/alpet-libs-php
+      - P:/opt/docker/trade_report:/app/projects/trade_report
+      - P:/opt/docker/PWM-cryptocurrency:/app/projects/PWM-cryptocurrency
 
 networks:
   devspace-net:

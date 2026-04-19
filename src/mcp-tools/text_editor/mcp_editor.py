@@ -6,15 +6,40 @@ from typing import Any
 from mcp.server import Server  # type: ignore[import]
 from mcp.types import CallToolResult, TextContent, Tool  # type: ignore[import]
 
+from pathlib import Path
+
+from lib.version_guard import VersionGuard
+
 from .basic_logger import make_logger
 from .config import default_data_dir, load_policy, policy_meta, workspace_discovery_debug
 from .errors import EditorError
 from .service import EditorService
 from .storage import Storage
 
+_MCP_OBSOLETE_RESTART_WARN = "WARN: obsolete MCP server was used, restart for check new version."
+_VERSION_GUARD = VersionGuard(
+    base_dir=Path(__file__).resolve().parents[1],
+    message=_MCP_OBSOLETE_RESTART_WARN,
+    track_new_modules=True,
+    check_interval_sec=1.0,
+)
+
 
 def _result(payload: dict[str, Any], *, is_error: bool = False) -> CallToolResult:
-    return CallToolResult(content=[TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))], isError=is_error)
+    warn = _VERSION_GUARD.get_warning()
+    if warn:
+        if isinstance(payload, dict):
+            warnings = payload.get("warnings")
+            if not isinstance(warnings, list):
+                warnings = []
+            if warn not in warnings:
+                warnings.append(warn)
+            payload = dict(payload)
+            payload["warnings"] = warnings
+    return CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))],
+        isError=is_error,
+    )
 
 
 def create_server() -> Server:

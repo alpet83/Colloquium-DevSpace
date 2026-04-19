@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 from pathlib import Path
 import re
 import time
@@ -16,6 +17,7 @@ from cqds_host_grep_jobs import host_grep_poll_hint_sec, start_host_grep_job
 from cqds_smart_grep_host import smart_grep_host_fs
 
 from cqds_helpers import (
+    LOGGER,
     _build_file_tree_from_index,
     _file_id_to_name_map,
     _index_counts,
@@ -29,6 +31,18 @@ from cqds_helpers import (
 )
 from cqds_run_ctx import RunContext
 from cqds_result_pages import DEFAULT_SCAN_HIT_CAP, finalize_smart_grep_response, get_page_store
+
+
+def _mcp_index_background_via_maint_pool() -> bool:
+    v = (os.environ.get("CQDS_MCP_INDEX_BACKGROUND_VIA_MAINT") or "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _mcp_sync_code_index_http_max_sec() -> float:
+    try:
+        return max(5.0, float(os.environ.get("CQDS_MCP_SYNC_CODE_INDEX_MAX_SEC", "30")))
+    except ValueError:
+        return 30.0
 
 
 TOOLS: list[Tool] = [
@@ -141,6 +155,8 @@ TOOLS: list[Tool] = [
             "Runs context assembly (loads all project files → SandwichPack.pack) and returns\n"
             "the full sandwiches_index.jsl format JSON with 'entities' and 'filelist'.\n"
             "When background=true, MCP tool queues or reports a background build and stores the result in /app/projects/.cache/{project_name}_index.jsl.\n"
+            "When cache_only=true, no full rebuild: GET /project/code_index?cache_only=true — try-retrieve session result, else file cache; may include rebuilt_now:1 while maint code_index is active.\n"
+            "По умолчанию фон = maint_enqueue на ядре — опрос cq_help#core_status (maint_pool.active_jobs). Fallback = локальная очередь MCP; тогда опрос cq_files_ctl#index_job_status. CQDS_MCP_INDEX_BACKGROUND_VIA_MAINT=0 отключает maint-путь.\n"
             "Use this to understand project structure, find functions/classes, or plan edits.\n"
             "'entities' is a list of CSV strings: vis,type,parent,name,file_id,start-end,tokens\n"
             "  e.g. 'pub,function,,fetchData,3,45-67,120'\n"
@@ -151,6 +167,11 @@ TOOLS: list[Tool] = [
             "properties": {
                 "project_id": {"type": "integer", "description": "Project ID (use cq_list_projects to get IDs)."},
                 "background": {"type": "boolean", "description": "If true, queue/report a background build and save cache to /app/projects/.cache/{project_name}_index.jsl.", "default": False},
+                "cache_only": {
+                    "type": "boolean",
+                    "description": "If true, no scan/full build: backend returns cached index and/or rebuilt_now (see GET /project/code_index?cache_only=true). Ignores background.",
+                    "default": False,
+                },
                 "timeout": {"type": "integer", "description": "Max seconds to wait for the index build (default: 300). Passed to the backend as a hint and used as the HTTP client timeout.", "default": 300},
             },
             "required": ["project_id"],
@@ -167,6 +188,11 @@ TOOLS: list[Tool] = [
             "properties": {
                 "project_id": {"type": "integer", "description": "Project ID (use cq_list_projects to get IDs)."},
                 "background": {"type": "boolean", "description": "If true, queue/report a background build and save cache to /app/projects/.cache/{project_name}_index.jsl.", "default": False},
+                "cache_only": {
+                    "type": "boolean",
+                    "description": "If true, no scan/full build: backend returns cached index and/or rebuilt_now (see GET /project/code_index?cache_only=true). Ignores background.",
+                    "default": False,
+                },
                 "timeout": {"type": "integer", "description": "Max seconds to wait for the index build (default: 300). Passed to the backend as a hint and used as the HTTP client timeout.", "default": 300},
             },
             "required": ["project_id"],
@@ -402,11 +428,121 @@ async def handle(name: str, arguments: dict[str, Any], ctx: RunContext) -> CallT
         index = await client.get_index(chat_id=chat_id, project_id=project_id)
         return _json_text(index)
 
+    if name == "cq_index_job_status":
+        """Только снимок очереди code_index в процессе MCP — без постановки в очередь и без лишнего HTTP."""
+        if ctx.queue_status is None:
+            raise RuntimeError("index job tracking is not configured in this MCP process")
+        qsz = int(ctx.index_queue.qsize()) if ctx.index_queue is not None else 0
+        raw_pid = arguments.get("project_id")
+        if raw_pid is not None:
+            project_id = int(raw_pid)
+            return _json_text(
+                {
+                    "job_kind": "mcp_code_index",
+                    "note": "Фоновый GET /api/project/code_index в этом процессе cqds_mcp_mini (не maint_pool ядра).",
+                    "queue_size": qsz,
+                    "projects": [ctx.queue_status(project_id)],
+                }
+            )
+        rows: list[dict[str, Any]] = []
+        for pid in sorted(ctx.index_jobs.keys()):
+            rows.append(ctx.queue_status(int(pid)))
+        return _json_text(
+            {
+                "job_kind": "mcp_code_index",
+                "note": "Снимок всех известных проектов с состоянием code_index в этом процессе MCP.",
+                "queue_size": qsz,
+                "projects": rows,
+            }
+        )
+
     if name in {"cq_rebuild_index", "cq_get_code_index"}:
         project_id = int(arguments["project_id"])
+        cache_only = bool(arguments.get("cache_only", False))
         background = bool(arguments.get("background", False))
         timeout = int(arguments.get("timeout", 300))
+
+        if cache_only:
+            if background:
+                LOGGER.info(
+                    "cq_rebuild_index: cache_only=true ignores background (project_id=%s)",
+                    project_id,
+                )
+            cap_web = max(15.0, min(45.0, float(_mcp_sync_code_index_http_max_sec())))
+            try:
+                index = await client.get_code_index(
+                    project_id,
+                    timeout=min(int(timeout), 120),
+                    client_http_max_sec=cap_web,
+                    cache_only=True,
+                )
+            except httpx.HTTPStatusError as exc:
+                if exc.response is not None and exc.response.status_code == 404:
+                    detail = ""
+                    try:
+                        detail = (exc.response.text or "")[:1200]
+                    except Exception:
+                        pass
+                    return _json_text(
+                        {
+                            "ok": False,
+                            "code": "cache_only_miss",
+                            "project_id": project_id,
+                            "http_status": 404,
+                            "error": str(exc),
+                            "detail": detail,
+                            "hint": (
+                                "No cached index for cache_only path; run full rebuild_index or "
+                                "background maint_enqueue first."
+                            ),
+                        }
+                    )
+                raise
+            except httpx.TimeoutException as exc:
+                return _json_text(
+                    {
+                        "ok": False,
+                        "code": "cache_only_timeout",
+                        "project_id": project_id,
+                        "client_http_max_sec": cap_web,
+                        "error": str(exc),
+                    }
+                )
+            entities_count, files_count = _index_counts(index)
+            ctx.index_jobs[project_id] = {
+                "project_id": project_id,
+                "status": "ready",
+                "running": False,
+                "queued": False,
+                "started_at": None,
+                "finished_at": int(time.time()),
+                "error": None,
+                "files": files_count,
+                "entities": entities_count,
+                "source": "cache_only",
+            }
+            return _json_text(index)
+
         if background:
+            if _mcp_index_background_via_maint_pool():
+                try:
+                    out = await client.maint_enqueue(project_id, "code_index")
+                    return _json_text(
+                        {
+                            **out,
+                            "via": "maint_pool",
+                            "poll": (
+                                "cq_help#core_status → core.maint_pool.active_jobs "
+                                "(kind=code_index, busy_sec, progress); локальная очередь MCP не используется."
+                            ),
+                        }
+                    )
+                except Exception as exc:
+                    LOGGER.warning(
+                        "maint_enqueue fallback to mcp local index queue project_id=%s: %s",
+                        project_id,
+                        str(exc),
+                    )
             if ctx.ensure_index_worker is None or ctx.queue_status is None:
                 raise RuntimeError("index worker callbacks are not configured")
             await ctx.ensure_index_worker()
@@ -449,7 +585,33 @@ async def handle(name: str, arguments: dict[str, Any], ctx: RunContext) -> CallT
             await ctx.index_queue.put(project_id)
             return _json_text(ctx.queue_status(project_id))
 
-        index = await client.get_code_index(project_id, timeout=timeout)
+        cap = _mcp_sync_code_index_http_max_sec()
+        try:
+            index = await client.get_code_index(
+                project_id,
+                timeout=min(int(timeout), int(cap)),
+                client_http_max_sec=cap,
+            )
+        except httpx.TimeoutException as exc:
+            return _json_text(
+                {
+                    "ok": False,
+                    "code": "sync_code_index_client_timeout",
+                    "task_in_progress": None,
+                    "note": (
+                        "Ядро могло продолжить работу после обрыва HTTP; стабильного id пока нет "
+                        "(заготовка task_in_progress:${id} — при появлении async API ядра)."
+                    ),
+                    "client_http_max_sec": cap,
+                    "project_id": project_id,
+                    "error": str(exc),
+                    "protocol": (
+                        "Норма: не держать долгий синхронный MCP→ядро. "
+                        "cq_files_ctl#rebuild_index с background:true (maint_enqueue), "
+                        "затем cq_help#core_status → maint_pool.active_jobs."
+                    ),
+                }
+            )
         entities_count, files_count = _index_counts(index)
         ctx.index_jobs[project_id] = {
             "project_id": project_id,

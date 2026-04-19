@@ -1,6 +1,18 @@
 // /frontend/rtm/src/stores/chat.js, updated 2025-07-26 15:15 EEST
 import { defineStore } from 'pinia'
 import { log_msg, log_error } from '../utils/debugging'
+import { readFetchJsonOrText, formatHttpFailureMessage, isServerOrGatewayFailure } from '../utils/apiErrors'
+
+/** Читает тело; при 5xx от шлюза/ядра выставляет backendError + chatError и failed=true. */
+async function handleChatServerFailure(res, store, contextLabel) {
+  const body = await readFetchJsonOrText(res)
+  if (!isServerOrGatewayFailure(res)) return { failed: false, body }
+  const msg = formatHttpFailureMessage(res, body)
+  log_error(null, new Error(msg), contextLabel)
+  store.backendError = true
+  store.chatError = msg
+  return { failed: true, body }
+}
 
 export const useChatStore = defineStore('chat', {
   state: () => ({
@@ -31,13 +43,10 @@ export const useChatStore = defineStore('chat', {
           method: 'GET',
           credentials: 'include'
         })
-        if (res.status === 500 || res.status === 502) {
-          log_error(null, new Error(`Server error: ${res.status}`), 'fetch chats')
-          this.backendError = true
-          return
-        }
-        const data = await res.json()
-        if (res.ok && !data.error) {
+        const { failed, body } = await handleChatServerFailure(res, this, 'fetch chats')
+        if (failed) return
+        const data = body.json
+        if (res.ok && data && !data.error) {
           this.chats = await this.buildChatTree(data)
           log_msg('CHAT', 'Fetched chats:', JSON.stringify(this.chats, null, 2))
           const activeChat = this.chats.find(chat => chat.active)
@@ -50,8 +59,9 @@ export const useChatStore = defineStore('chat', {
           this.backendError = false
           this.chatError = ''
         } else {
-          log_error(null, new Error(data.error || 'Failed to fetch chats'), 'fetch chats')
-          this.chatError = data.error || 'Failed to fetch chats'
+          const err = (data && (data.error || data.detail)) || 'Failed to fetch chats'
+          log_error(null, new Error(err), 'fetch chats')
+          this.chatError = err
         }
       } catch (e) {
         log_error(null, e, 'fetch chats')
@@ -79,13 +89,10 @@ export const useChatStore = defineStore('chat', {
           signal: controller.signal
         })
         clearTimeout(timeoutId)
-        if (res.status === 500 || res.status === 502) {
-          log_error(null, new Error(`Server error: ${res.status}`), 'fetch history')
-          this.backendError = true
-          return
-        }
-        const data = await res.json()
-        if (res.ok && !data.error) {
+        const { failed, body } = await handleChatServerFailure(res, this, 'fetch history')
+        if (failed) return
+        const data = body.json
+        if (res.ok && data && !data.error) {
           if (data.chat_id !== this.selectedChatId) {
             log_msg('CHAT', 'Ignoring history response for outdated chat_id:', data.chat_id, 'Current:', this.selectedChatId)
             return
@@ -145,8 +152,9 @@ export const useChatStore = defineStore('chat', {
           this.backendError = false
           this.chatError = ''
         } else {
-          log_error(null, new Error(data.error || 'Failed to fetch chat history'), 'fetch history')
-          this.chatError = data.error || 'Failed to fetch chat history'
+          const err = (data && (data.error || data.detail)) || 'Failed to fetch chat history'
+          log_error(null, new Error(err), 'fetch history')
+          this.chatError = err
         }
       } catch (e) {
         if (e.name === 'AbortError') {
@@ -177,8 +185,10 @@ export const useChatStore = defineStore('chat', {
           method: 'GET',
           credentials: 'include'
         })
-        if (res.ok) {
-          const data = await res.json()
+        const { failed, body } = await handleChatServerFailure(res, this, 'fetch chat stats')
+        if (failed) return
+        if (res.ok && body.json) {
+          const data = body.json
           this.stats = {
             tokens: data.tokens,
             num_sources_used: data.num_sources_used
@@ -220,20 +230,18 @@ export const useChatStore = defineStore('chat', {
           }),
           credentials: 'include'
         })
-        if (res.status === 500 || res.status === 502) {
-          log_error(null, new Error(`Server error: ${res.status}`), 'send message')
-          this.backendError = true
-          return
-        }
-        const data = await res.json()
-        if (res.ok && !data.error) {
+        const { failed, body } = await handleChatServerFailure(res, this, 'send message')
+        if (failed) return
+        const data = body.json
+        if (res.ok && data && !data.error) {
           await this.fetchHistory()
           await this.fetchChatStats()
           this.backendError = false
           this.chatError = ''
         } else {
-          log_error(null, new Error(data.error || 'Failed to send message'), 'send message')
-          this.chatError = data.error || 'Failed to send message'
+          const err = (data && (data.error || data.detail)) || 'Failed to send message'
+          log_error(null, new Error(err), 'send message')
+          this.chatError = err
         }
       } catch (e) {
         log_error(null, e, 'send message')
@@ -258,20 +266,18 @@ export const useChatStore = defineStore('chat', {
           body: JSON.stringify({ post_id: postId, message }),
           credentials: 'include'
         })
-        if (res.status === 500 || res.status === 502) {
-          log_error(null, new Error(`Server error: ${res.status}`), 'edit post')
-          this.backendError = true
-          return
-        }
-        const data = await res.json()
-        if (res.ok && !data.error) {
+        const { failed, body } = await handleChatServerFailure(res, this, 'edit post')
+        if (failed) return
+        const data = body.json
+        if (res.ok && data && !data.error) {
           await this.fetchHistory()
           await this.fetchChatStats()
           this.backendError = false
           this.chatError = ''
         } else {
-          log_error(null, new Error(data.error || 'Failed to edit post'), 'edit post')
-          this.chatError = data.error || 'Failed to edit post'
+          const err = (data && (data.error || data.detail)) || 'Failed to edit post'
+          log_error(null, new Error(err), 'edit post')
+          this.chatError = err
         }
       } catch (e) {
         log_error(null, e, 'edit post')
@@ -294,13 +300,10 @@ export const useChatStore = defineStore('chat', {
           body: JSON.stringify({ post_id: postId }),
           credentials: 'include'
         })
-        if (res.status === 500 || res.status === 502) {
-          log_error(null, new Error(`Server error: ${res.status}`), 'delete post')
-          this.backendError = true
-          return
-        }
-        const data = await res.json()
-        if (res.ok && !data.error) {
+        const { failed, body } = await handleChatServerFailure(res, this, 'delete post')
+        if (failed) return
+        const data = body.json
+        if (res.ok && data && !data.error) {
           log_msg('CHAT', 'Post deletion requested, fetching updated history')
           const postElement = document.getElementById(`post_${postId}`)
           if (postElement) {
@@ -312,8 +315,9 @@ export const useChatStore = defineStore('chat', {
           this.backendError = false
           this.chatError = ''
         } else {
-          log_error(null, new Error(data.error || 'Failed to delete post'), 'delete post')
-          this.chatError = data.error || 'Failed to delete post'
+          const err = (data && (data.error || data.detail)) || 'Failed to delete post'
+          log_error(null, new Error(err), 'delete post')
+          this.chatError = err
           this.awaited_to_del = this.awaited_to_del.filter(id => id !== postId)
           log_msg('CHAT', 'Removed post_id from awaited_to_del due to error:', postId, 'Current awaited_to_del:', this.awaited_to_del)
         }
@@ -333,13 +337,10 @@ export const useChatStore = defineStore('chat', {
           body: JSON.stringify({ description, parent_msg_id: this.newChatParentMessageId }),
           credentials: 'include'
         })
-        if (res.status === 500 || res.status === 502) {
-          log_error(null, new Error(`Server error: ${res.status}`), 'create chat')
-          this.backendError = true
-          return
-        }
-        const data = await res.json()
-        if (res.ok && !data.error) {
+        const { failed, body } = await handleChatServerFailure(res, this, 'create chat')
+        if (failed) return
+        const data = body.json
+        if (res.ok && data && !data.error) {
           this.newChatDescription = ''
           this.newChatParentMessageId = null
           await this.fetchChats()
@@ -347,8 +348,9 @@ export const useChatStore = defineStore('chat', {
           this.backendError = false
           this.chatError = ''
         } else {
-          log_error(null, new Error(data.error || 'Failed to create chat'), 'create chat')
-          this.chatError = data.error || 'Failed to create chat'
+          const err = (data && (data.error || data.detail)) || 'Failed to create chat'
+          log_error(null, new Error(err), 'create chat')
+          this.chatError = err
         }
       } catch (e) {
         log_error(null, e, 'create chat')
@@ -450,11 +452,16 @@ export const useChatStore = defineStore('chat', {
           method: 'GET',
           credentials: 'include'
         })
+        const body = await readFetchJsonOrText(res)
+        if (isServerOrGatewayFailure(res)) {
+          log_error(null, new Error(formatHttpFailureMessage(res, body)), 'fetch parent message')
+          return null
+        }
         if (res.status === 404 || !res.ok) {
           log_msg('CHAT', 'Parent message not found for post_id:', parent_msg_id)
           return null
         }
-        const data = await res.json()
+        const data = body.json
         log_msg('CHAT', 'Fetched parent message:', JSON.stringify(data, null, 2))
         return data
       } catch (e) {

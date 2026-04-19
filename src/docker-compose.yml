@@ -83,7 +83,12 @@ services:
       - CORE_NIGHTLY_RESTART_CRON=0 3 * * *
       - CORE_NIGHTLY_RESTART_TZ=Europe/Moscow
       - CORE_MAINT_ENABLED=1
-      - CORE_MAINT_MUTATE=1      
+      - CORE_MAINT_MUTATE=1
+      # Пул maint-воркеров (подпроцессы + maint_pool_jobs). По умолчанию 1 = прежнее поведение.
+      # - CORE_MAINT_POOL_WORKERS=3
+      # - CORE_MAINT_POOL_LEASE_SEC=600
+      # - CORE_MAINT_POOL_PROGRESS_SEC=8
+      # - CORE_MAINT_POOL_IDLE_SLEEP_SEC=4   # воркер без job в очереди (без find/scan по проектам)
       # Phase-2 cache optimization toggles (safe rollout):
       # - PROBE: validates prefix+delta candidate against baseline hash.
       # - REUSE: allows CPU-saving fast path when candidate is valid.
@@ -91,16 +96,18 @@ services:
       - CQDS_CONTEXT_PREFIX_REUSE=1
       # Phase-3 provider-aware optimization (OpenRouter/Anthropic prompt caching).
       - CQDS_PROVIDER_PREFIX_CACHE=1
+      - CORE_MAINT_POOL_WORKERS=3
     # ENTRYPOINT 
     command: ["/app/agent/server.py"]
     # unless-stopped: плановый SIGTERM от CoreScheduler (CORE_NIGHTLY_RESTART) снова поднимает контейнер.
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/docs"]
-      interval: 30s
+      interval: 15s
       timeout: 10s
-      retries: 3
-      start_period: 10s
+      retries: 5
+      # Пока идёт синхронный server_init() до bind :8080, wget падает — не помечать unhealthy слишком рано.
+      start_period: 120s
     logging:
       options:
         max-size: "1m"
@@ -155,8 +162,10 @@ services:
         aliases:
           - nginx-router
     depends_on:
-      - colloquium-core
-      - frontend
+      colloquium-core:
+        condition: service_healthy
+      frontend:
+        condition: service_started
 
 networks:
   devspace-net:

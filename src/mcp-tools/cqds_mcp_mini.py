@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import shutil
 import sys
@@ -23,6 +24,18 @@ for _p in (_MCP_TOOLS_DIR, _RUNTIME_DIR):
     _s = str(_p)
     if _s not in sys.path:
         sys.path.insert(0, _s)
+
+# Guard: warn if this running MCP process is stale vs filesystem changes
+# in any imported `.py` under `mcp-tools/`.
+from lib.version_guard import VersionGuard
+
+_MCP_OBSOLETE_RESTART_WARN = "WARN: obsolete MCP server was used, restart for check new version."
+_VERSION_GUARD = VersionGuard(
+    base_dir=_MCP_TOOLS_DIR,
+    message=_MCP_OBSOLETE_RESTART_WARN,
+    track_new_modules=True,
+    check_interval_sec=1.0,
+)
 
 from mcp.server import Server  # type: ignore[import]
 from mcp.server.stdio import stdio_server  # type: ignore[import]
@@ -62,6 +75,43 @@ CTX_MODULES = (
     cq_runtime_docker_ctl,
 )
 ALL_MODULES = HELP_MODULES + CTX_MODULES
+
+
+def _attach_staleness_warning(result: CallToolResult) -> CallToolResult:
+    warn = _VERSION_GUARD.get_warning()
+    if not warn:
+        return result
+    try:
+        content = getattr(result, "content", None)
+        if isinstance(content, list) and content:
+            first = content[0]
+            txt = getattr(first, "text", None)
+            if isinstance(txt, str):
+                stripped = txt.strip()
+                parsed: Any = None
+                if stripped.startswith("{") or stripped.startswith("["):
+                    try:
+                        parsed = json.loads(txt)
+                    except Exception:
+                        parsed = None
+                if isinstance(parsed, dict):
+                    existing = parsed.get("warnings")
+                    if not isinstance(existing, list):
+                        existing = []
+                    if warn not in existing:
+                        existing.append(warn)
+                    parsed["warnings"] = existing
+                    new_txt = json.dumps(parsed, ensure_ascii=False, indent=2)
+                else:
+                    new_txt = warn + "\n" + txt
+                return CallToolResult(
+                    isError=bool(getattr(result, "isError", False)),
+                    # Recreate the same MCP content type without importing it explicitly.
+                    content=[type(first)(type="text", text=new_txt)],
+                )
+    except Exception:
+        pass
+    return result
 
 
 def _http_status_error_payload(exc: BaseException) -> str | None:
@@ -106,7 +156,16 @@ async def run_server(client: ColloquiumClient) -> None:
                 }
             )
             try:
-                payload = await client.get_code_index(project_id)
+                try:
+                    wcap = float(os.environ.get("CQDS_MCP_INDEX_WORKER_HTTP_MAX_SEC", "120"))
+                except ValueError:
+                    wcap = 120.0
+                wcap = max(30.0, wcap)
+                payload = await client.get_code_index(
+                    project_id,
+                    timeout=min(300, int(wcap)),
+                    client_http_max_sec=wcap,
+                )
                 entities_count, files_count = _index_counts(payload)
                 job.update(
                     {
@@ -175,25 +234,27 @@ async def run_server(client: ColloquiumClient) -> None:
         LOGGER.info("RUNTIME TOOL call start name=%s args=[%s]", name, _summarize_arguments(arguments))
         try:
             if cq_tool_is_hidden(name):
-                return _text(
-                    f"Tool '{name}' is excluded for this configuration (CQ_HIDE_TOOLS)."
+                return _attach_staleness_warning(
+                    _text(
+                        f"Tool '{name}' is excluded for this configuration (CQ_HIDE_TOOLS)."
+                    )
                 )
             for mod in HELP_MODULES:
-                delegated = await mod.handle(name, arguments)
+                delegated = await mod.handle(name, arguments, run_ctx)
                 if delegated is not None:
-                    return delegated
+                    return _attach_staleness_warning(delegated)
             for mod in CTX_MODULES:
                 delegated = await mod.handle(name, arguments, run_ctx)
                 if delegated is not None:
-                    return delegated
-            return _text(f"Unknown tool: {name}")
+                    return _attach_staleness_warning(delegated)
+            return _attach_staleness_warning(_text(f"Unknown tool: {name}"))
         except Exception as exc:
             http_msg = _http_status_error_payload(exc)
             if http_msg is not None:
                 LOGGER.exception("RUNTIME TOOL http error name=%s", name)
-                return _text(http_msg)
+                return _attach_staleness_warning(_text(http_msg))
             LOGGER.exception("RUNTIME TOOL call error name=%s", name)
-            return _text(f"Error: {exc}")
+            return _attach_staleness_warning(_text(f"Error: {exc}"))
         finally:
             CURRENT_TOOL.reset(token)
 

@@ -1,3 +1,8 @@
+"""Плоские legacy-инструменты MCP (cqds_mcp_full).
+
+Не развиваем: новые сценарии — только cqds_mcp_mini (cq_*_ctl, cq_help).
+Глобальный статус ядра: cq_help с tool_ref=cq_help#core_status.
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -21,11 +26,20 @@ from cqds_result_pages import (
 )
 from cqds_run_ctx import RunContext
 
+_LEGACY_TOOL_SUFFIX = (
+    " [DEPRECATED — плоский tool заморожен; cqds_mcp_mini: cq_project_ctl / cq_files_ctl / …; "
+    "ядро: cq_help#core_status]"
+)
+
+
+def _dep(description: str) -> str:
+    return description + _LEGACY_TOOL_SUFFIX
+
 
 TOOLS: list[Tool] = [
     Tool(
         name="cq_fetch_result",
-        description=(
+        description=_dep(
             "Три режима (ровно один на вызов): "
             "(1) Пейджинг MCP — paging.handle из cq_start_grep; page_index 0 — первая страница из кэша. "
             "(2) Следующий stateless-чанк — chunk_continuation из cq_start_grep/cq_fetch_result (пока scan_complete=false). "
@@ -68,7 +82,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="cq_list_projects",
-        description=(
+        description=_dep(
             "List all projects registered in Colloquium-DevSpace with id and metadata. "
             "Typical first step before cq_select_project, cq_exec, cq_start_grep, or cq_list_files."
         ),
@@ -76,7 +90,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="cq_select_project",
-        description=(
+        description=_dep(
             "Set the active project on the Colloquium server. "
             "Must be called after a container restart before using shell_code, "
             "code_file, or code_patch. Use cq_list_projects to get project IDs."
@@ -94,7 +108,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="cq_query_db",
-        description=(
+        description=_dep(
             "Execute SQL query through Colloquium backend DB layer and return rows as JSON. "
             "By default only read-only SQL is allowed (SELECT/EXPLAIN/WITH). "
             "Mutating SQL can be enabled only with allow_write=true and only for local/private endpoints."
@@ -126,7 +140,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="cq_set_sync_mode",
-        description=(
+        description=_dep(
             "Enable or disable synchronous mode for cq_send_message. "
             "When enabled (timeout > 0), cq_send_message automatically waits for the AI reply "
             "up to 'timeout' seconds — eliminating the need for a separate cq_wait_reply call. "
@@ -146,7 +160,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="cq_project_status",
-        description=(
+        description=_dep(
             "Get health status and diagnostics for a project.\n"
             "Returns: status (ok/info/warning/error), problems[] with severity codes,\n"
             "file link counts (total/active), backup/undo stack info (count, size_bytes, oldest_ts, newest_ts),\n"
@@ -164,6 +178,16 @@ TOOLS: list[Tool] = [
             },
             "required": ["project_id"],
         },
+    ),
+    Tool(
+        name="cq_core_status",
+        description=_dep(
+            "Глобальный статус ядра Colloquium (не привязан к project_id): GET /api/core/status — "
+            "uptime после server_init, дочерний core_maint_loop, снимок пула воркеров (если multi-worker), "
+            "агрегаты maint_pool_jobs, число активных project scan, ночной restart из scheduled_jobs. "
+            "Замена: cq_help с tool_ref=cq_help#core_status (mini)."
+        ),
+        inputSchema={"type": "object", "properties": {}, "required": []},
     ),
 ]
 
@@ -291,5 +315,9 @@ async def handle(name: str, arguments: dict[str, Any], ctx: RunContext) -> CallT
         project_id = int(arguments["project_id"])
         status = await client.get_project_status(project_id)
         return _json_text(status)
+
+    if name == "cq_core_status":
+        payload = await client.get_core_status()
+        return _json_text(payload)
 
     return None

@@ -23,6 +23,7 @@ from routes.chat_routes import router as chat_router
 from routes.file_routes import router as file_router
 from routes.project_routes import router as project_router
 from routes.config_routes import router as config_router
+from routes.core_routes import router as core_router
 from post_processor import PostProcessor
 from managers.db import DataTable
 from managers.users import UserManager
@@ -43,6 +44,23 @@ app = FastAPI()
 log = globals.get_logger("core")
 _BOOT_T0 = time.perf_counter()
 _maint_child_proc: subprocess.Popen | None = None
+
+
+def get_maint_child_state() -> dict:
+    """PID дочернего core_maint_loop.py (если есть) и признак, что процесс ещё жив."""
+    global _maint_child_proc
+    if _maint_child_proc is None:
+        return {"pid": None, "alive": False}
+    try:
+        pid = int(_maint_child_proc.pid)
+    except Exception:
+        pid = None
+    alive = False
+    try:
+        alive = _maint_child_proc.poll() is None
+    except Exception:
+        alive = False
+    return {"pid": pid, "alive": bool(alive)}
 
 
 def _boot_ms() -> float:
@@ -191,7 +209,7 @@ def server_init():
         except Exception as _e:
             log.warn("Не удалось авто-загрузить проект: %s", str(_e))
         _t_phase = time.perf_counter()
-        globals.file_manager = FileManager()
+        globals.file_manager = FileManager(notify_heavy_ops=True)
         _log_boot_phase("file_manager", _t_phase)
         # Сканирование и проверка ссылок — только в фоне после поднятия uvicorn (см. _schedule_startup_file_maintenance).
         # Синхронный полный scan здесь блокировал bind :8080 и давал nginx 502 на /api/* при долгом скане.
@@ -230,10 +248,14 @@ def server_init():
         _t_phase = time.perf_counter()
         app.include_router(config_router)
         _log_boot_phase("router_config", _t_phase)
+        _t_phase = time.perf_counter()
+        app.include_router(core_router)
+        _log_boot_phase("router_core_status", _t_phase)
 
         _schedule_startup_file_maintenance()
         _schedule_core_scheduler()
         _schedule_maint_child()
+        globals.CORE_SERVER_STARTED_AT = time.time()
         _log_boot_phase("startup_hooks_scheduled", _t_server_init)
 
     except Exception as e:

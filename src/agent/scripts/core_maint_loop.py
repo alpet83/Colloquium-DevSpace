@@ -1,23 +1,34 @@
 #!/usr/bin/env python3
 """Semi-autonomous maintenance loop for active projects.
 
-Single process cycle:
+Single process cycle (или пул при CORE_MAINT_POOL_WORKERS>1):
 - choose active projects (sessions.active_project + recent context activity),
 - run find snapshot,
 - compare with attached_files links,
 - optionally mutate DB (degrade/recover/add links; purge @-links when missing_ttl exhausted),
 - optionally trigger lazy project scan with cooldown.
+
+Пул: оркестратор ставит строки в maint_pool_jobs (не более одной queued/running на project_id);
+подпроцессы делают claim + run_tick_for_project; прогресс — строки ``MAINT_POOL_PROGRESS`` в stdout воркера.
+Ленивый scan/find выполняет только воркер с взятым job; без задачи воркер только sleep (``CORE_MAINT_POOL_IDLE_SLEEP_SEC``).
+Логи: общий каталог ``/app/logs/core_maint/``; оркестратор — префикс ``core_maint``, воркер слота N — ``core_maint_wN`` (без pid в имени).
 """
 from __future__ import annotations
 
 import argparse
+import atexit
 import datetime as dt
+import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any, Callable
+
+from lib import maint_pool as _maint_pool
 
 _THIS = Path(__file__).resolve()
 _AGENT_ROOT = _THIS.parents[1]
@@ -25,13 +36,52 @@ if str(_AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(_AGENT_ROOT))
 
 import globals
+from lib.basic_logger import BasicLogger
 from lib.file_link_prefix import sql_link_prefixed_params, strip_storage_prefix
 from managers.db import Database
 from managers.files import FileManager
 from managers.project import ProjectManager
 from managers.runtime_config import get_bool, get_float, get_int
 
-log = globals.get_logger("core_maint")
+
+def _build_core_maint_log() -> BasicLogger:
+    """Один каталог core_maint; воркеры отличаются только префиксом файла (core_maint_w<slot>)."""
+    if "CORE_MAINT_POOL_WORKER_SLOT" in os.environ:
+        slot = (os.environ.get("CORE_MAINT_POOL_WORKER_SLOT") or "0").strip().replace("/", "_").replace("\\", "_")[:16]
+        return BasicLogger("core_maint", f"core_maint_w{slot}", sys.stdout)
+    return globals.get_logger("core_maint")
+
+
+log = _build_core_maint_log()
+
+_pool_worker_procs: list[subprocess.Popen[Any]] = []
+
+
+def _pool_workers() -> int:
+    """N>1: оркестратор ставит задачи в maint_pool_jobs, подпроцессы-воркеры их исполняют."""
+    return get_int("CORE_MAINT_POOL_WORKERS", 1, 1, 32)
+
+
+def _pool_idle_sleep_sec() -> float:
+    """Пауза воркера без задачи (passive): find/scan по проектам здесь не выполняются."""
+    return get_float("CORE_MAINT_POOL_IDLE_SLEEP_SEC", 4.0, 0.25, 120.0)
+
+
+def _is_maint_pool_worker() -> bool:
+    """Подпроцесс-пул: в env задан CORE_MAINT_POOL_WORKER_SLOT (0..N-1)."""
+    return "CORE_MAINT_POOL_WORKER_SLOT" in os.environ
+
+
+def _maint_pool_worker_slot() -> int:
+    try:
+        return max(0, int(os.environ.get("CORE_MAINT_POOL_WORKER_SLOT", "0")))
+    except ValueError:
+        return 0
+
+
+def _pool_orchestrator(*, tick_once: bool = False) -> bool:
+    return _pool_workers() > 1 and not _is_maint_pool_worker() and not tick_once
+
 
 # После self-test: фактический режим (inotify может быть понижен до active).
 _effective_maint_mode: str | None = None
@@ -765,106 +815,366 @@ def _lazy_scan_if_due(project_id: int, last_scan: dict[int, float], cooldown_sec
     return True
 
 
-def run_tick(last_scan: dict[int, float], *, once: bool = False) -> None:
-    db = Database.get_database()
+def _lazy_scan_if_due_pool(
+    db: Database,
+    project_id: int,
+    *,
+    budget_sec: float,
+    cooldown_sec: float,
+) -> bool:
+    """Ленивый scan с cooldown в maint_scan_cooldown (для пула воркеров без общего last_scan)."""
+    now = time.monotonic()
+    row = db.fetch_one(
+        "SELECT last_mono FROM maint_scan_cooldown WHERE project_id = :pid",
+        {"pid": int(project_id)},
+    )
+    last = float(row[0]) if row and row[0] is not None else 0.0
+    if (now - last) < max(1.0, cooldown_sec):
+        return False
+    pm = ProjectManager.get(int(project_id))
+    if pm is None or pm.project_name is None:
+        return False
+    started = time.monotonic()
+    pm.scan_project_files()
+    elapsed = time.monotonic() - started
+    if elapsed >= budget_sec:
+        log.warn(
+            "CORE_MAINT scan exceeded budget project_id=%d elapsed=%.2fs budget=%.2fs",
+            int(project_id),
+            elapsed,
+            budget_sec,
+        )
+    db.execute(
+        """
+        INSERT INTO maint_scan_cooldown (project_id, last_mono)
+        VALUES (:pid, :m)
+        ON CONFLICT(project_id) DO UPDATE SET last_mono = excluded.last_mono
+        """,
+        {"pid": int(project_id), "m": now},
+    )
+    return True
+
+
+def _maybe_pool_progress(
+    cb: Callable[..., None] | None,
+    stage: str,
+    *,
+    force: bool = False,
+    **extra: Any,
+) -> None:
+    if cb is None:
+        return
+    cb(stage, force=force, **extra)
+
+
+def run_tick_for_project(
+    db: Database,
+    project_id: int,
+    project_name: str,
+    score: float,
+    *,
+    last_scan: dict[int, float] | None,
+    use_db_cooldown: bool,
+    progress_cb: Callable[..., None] | None,
+    once: bool = False,
+) -> None:
     fm = FileManager()
     mutate = _mutate_enabled()
     scan_on = _scan_enabled()
     budget_sec = _proj_budget_sec()
     timeout_sec = _find_timeout_sec()
 
-    selected = _select_active_projects(db, _active_hours(), _max_projects())
-    if not selected:
-        log.debug("CORE_MAINT no active projects")
-        return
+    t0 = time.monotonic()
+    _maybe_pool_progress(progress_cb, "start", force=True, project_name=project_name)
+    project_root = _project_dir(project_name)
+    fs_set: set[str] = set()
+    found_ok = False
+    try:
+        _maybe_pool_progress(progress_cb, "find_begin", force=True, root=str(project_root))
+        fs_set, found_ok = _find_files_snapshot(project_root, timeout_sec)
+        _maybe_pool_progress(
+            progress_cb,
+            "find_done",
+            force=True,
+            find_count=len(fs_set),
+            find_ok=bool(found_ok),
+        )
+    except Exception as e:
+        log.warn("CORE_MAINT find failed project_id=%d name=%s: %s", project_id, project_name, str(e))
+        _maybe_pool_progress(progress_cb, "find_error", force=True, error=str(e)[:300])
+        raise
 
-    for project_id, project_name, score in selected:
-        t0 = time.monotonic()
-        project_root = _project_dir(project_name)
-        fs_set: set[str] = set()
-        found_ok = False
-        try:
-            fs_set, found_ok = _find_files_snapshot(project_root, timeout_sec)
-        except Exception as e:
-            log.warn("CORE_MAINT find failed project_id=%d name=%s: %s", project_id, project_name, str(e))
-            continue
+    db_links = _fetch_db_links(db, project_id)
+    db_set = set(db_links.keys())
 
-        db_links = _fetch_db_links(db, project_id)
-        db_set = set(db_links.keys())
+    db_only = sorted(db_set - fs_set)
+    fs_only = sorted(fs_set - db_set)
+    both = sorted(fs_set & db_set)
+    _maybe_pool_progress(
+        progress_cb,
+        "reconcile_begin",
+        force=True,
+        db_only=len(db_only),
+        fs_only=len(fs_only),
+        both=len(both),
+    )
 
-        db_only = sorted(db_set - fs_set)
-        fs_only = sorted(fs_set - db_set)
-        both = sorted(fs_set & db_set)
-
-        degraded = 0
-        purged = 0
-        recovered = 0
-        added = 0
-        do_purge = _purge_stale_links_enabled()
-        if mutate:
-            for rel in db_only:
-                fid, ttl_prev = db_links[rel]
-                if _degrade_or_purge_missing(
-                    db, fm, fid, ttl_prev, project_id=project_id, rel=rel, purge=do_purge
-                ) == "purged":
-                    purged += 1
-                else:
-                    degraded += 1
-            for rel in both:
-                fid, ttl_prev = db_links[rel]
-                if ttl_prev < fm.missing_ttl_max:
-                    _recover_present(db, fm, fid, ttl_prev)
-                    recovered += 1
-            for rel in fs_only:
-                try:
-                    fp = project_root / rel
-                    ts = int(fp.stat().st_mtime) if fp.exists() else _now_ts()
-                    fm.add_file(rel, None, timestamp=ts, project_id=project_id)
-                    added += 1
-                except Exception as e:
-                    log.warn(
-                        "CORE_MAINT add link failed project_id=%d file=%s: %s",
-                        project_id,
-                        rel,
-                        str(e),
-                    )
-
-        scanned = False
-        if scan_on and (db_only or fs_only):
+    degraded = 0
+    purged = 0
+    recovered = 0
+    added = 0
+    do_purge = _purge_stale_links_enabled()
+    step = 0
+    if mutate:
+        for rel in db_only:
+            step += 1
+            if progress_cb and step % 400 == 0:
+                _maybe_pool_progress(progress_cb, "reconcile_db_only", rel=rel, step=step, total=len(db_only))
+            fid, ttl_prev = db_links[rel]
+            if _degrade_or_purge_missing(
+                db, fm, fid, ttl_prev, project_id=project_id, rel=rel, purge=do_purge
+            ) == "purged":
+                purged += 1
+            else:
+                degraded += 1
+        for rel in both:
+            step += 1
+            if progress_cb and step % 400 == 0:
+                _maybe_pool_progress(progress_cb, "reconcile_both", step=step)
+            fid, ttl_prev = db_links[rel]
+            if ttl_prev < fm.missing_ttl_max:
+                _recover_present(db, fm, fid, ttl_prev)
+                recovered += 1
+        for rel in fs_only:
+            step += 1
+            if progress_cb and step % 400 == 0:
+                _maybe_pool_progress(progress_cb, "reconcile_fs_only", step=step)
             try:
+                fp = project_root / rel
+                ts = int(fp.stat().st_mtime) if fp.exists() else _now_ts()
+                fm.add_file(rel, None, timestamp=ts, project_id=project_id)
+                added += 1
+            except Exception as e:
+                log.warn(
+                    "CORE_MAINT add link failed project_id=%d file=%s: %s",
+                    project_id,
+                    rel,
+                    str(e),
+                )
+
+    scanned = False
+    if scan_on and (db_only or fs_only):
+        try:
+            if use_db_cooldown:
+                _maybe_pool_progress(progress_cb, "lazy_scan_maybe", force=True)
+                scanned = _lazy_scan_if_due_pool(
+                    db,
+                    project_id,
+                    budget_sec=budget_sec,
+                    cooldown_sec=_scan_cooldown_sec(),
+                )
+            else:
+                assert last_scan is not None
                 scanned = _lazy_scan_if_due(
                     project_id=project_id,
                     last_scan=last_scan,
                     cooldown_sec=_scan_cooldown_sec(),
                     budget_sec=budget_sec,
                 )
-            except Exception as e:
-                log.warn("CORE_MAINT lazy scan failed project_id=%d: %s", project_id, str(e))
+        except Exception as e:
+            log.warn("CORE_MAINT lazy scan failed project_id=%d: %s", project_id, str(e))
+            _maybe_pool_progress(progress_cb, "lazy_scan_error", force=True, error=str(e)[:300])
 
-        elapsed_ms = int((time.monotonic() - t0) * 1000.0)
-        mode = "mutate" if mutate else "dry_run"
-        log.info(
-            "CORE_MAINT project_id=%d name=%s mode=%s score=%.1f selected=1 find_ok=%s find_count=%d db_count=%d "
-            "db_only=%d fs_only=%d both=%d degraded=%d purged=%d recovered=%d added=%d scanned=%s elapsed_ms=%d",
+    elapsed_ms = int((time.monotonic() - t0) * 1000.0)
+    mode = "mutate" if mutate else "dry_run"
+    log.info(
+        "CORE_MAINT project_id=%d name=%s mode=%s score=%.1f selected=1 find_ok=%s find_count=%d db_count=%d "
+        "db_only=%d fs_only=%d both=%d degraded=%d purged=%d recovered=%d added=%d scanned=%s elapsed_ms=%d",
+        project_id,
+        project_name,
+        mode,
+        score,
+        "1" if found_ok else "0",
+        len(fs_set),
+        len(db_set),
+        len(db_only),
+        len(fs_only),
+        len(both),
+        degraded,
+        purged,
+        recovered,
+        added,
+        "1" if scanned else "0",
+        elapsed_ms,
+    )
+    _maybe_pool_progress(
+        progress_cb,
+        "done",
+        force=True,
+        elapsed_ms=elapsed_ms,
+        scanned=bool(scanned),
+    )
+    if once and elapsed_ms > int(max(1.0, budget_sec) * 1000.0):
+        log.warn("CORE_MAINT project over budget project_id=%d elapsed_ms=%d", project_id, elapsed_ms)
+
+
+def run_tick(last_scan: dict[int, float], *, once: bool = False) -> None:
+    db = Database.get_database()
+    selected = _select_active_projects(db, _active_hours(), _max_projects())
+    if not selected:
+        log.debug("CORE_MAINT no active projects")
+        return
+
+    if _pool_orchestrator(tick_once=once):
+        _maint_pool.ensure_maint_pool_tables(db.engine)
+        n = _maint_pool.enqueue_reconcile_tick_jobs(db.engine, selected)
+        if n:
+            log.info("CORE_MAINT pool enqueue new_jobs=%d projects=%d", n, len(selected))
+        return
+
+    for project_id, project_name, score in selected:
+        run_tick_for_project(
+            db,
             project_id,
             project_name,
-            mode,
             score,
-            "1" if found_ok else "0",
-            len(fs_set),
-            len(db_set),
-            len(db_only),
-            len(fs_only),
-            len(both),
-            degraded,
-            purged,
-            recovered,
-            added,
-            "1" if scanned else "0",
-            elapsed_ms,
+            last_scan=last_scan,
+            use_db_cooldown=False,
+            progress_cb=None,
+            once=once,
         )
-        if once and elapsed_ms > int(max(1.0, budget_sec) * 1000.0):
-            log.warn("CORE_MAINT project over budget project_id=%d elapsed_ms=%d", project_id, elapsed_ms)
+
+
+def _shutdown_pool_workers() -> None:
+    global _pool_worker_procs
+    for p in _pool_worker_procs:
+        try:
+            if p.poll() is None:
+                p.terminate()
+        except Exception:
+            pass
+    for p in _pool_worker_procs:
+        try:
+            p.wait(timeout=4)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+    _pool_worker_procs.clear()
+
+
+def _sync_maint_pool_status_file() -> None:
+    """Оркестратор пула: PID-ы живых воркеров для GET /api/core/status."""
+    if not _pool_orchestrator(tick_once=False):
+        return
+    global _pool_worker_procs
+    from pathlib import Path
+
+    alive = [int(p.pid) for p in _pool_worker_procs if p.poll() is None]
+    body = {
+        "configured_slots": int(_pool_workers()),
+        "worker_processes_alive": len(alive),
+        "worker_pids": alive,
+        "orchestrator_pid": int(os.getpid()),
+        "updated_at": int(time.time()),
+    }
+    path = Path(_maint_pool.MAINT_POOL_STATUS_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _spawn_pool_workers(n: int) -> None:
+    global _pool_worker_procs
+    script = str(_THIS)
+    exe = sys.executable
+    for i in range(max(1, int(n))):
+        env = os.environ.copy()
+        env["CORE_MAINT_POOL_WORKER_SLOT"] = str(i)
+        try:
+            p = subprocess.Popen(
+                [exe, script],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=None,
+                stderr=None,
+            )
+            _pool_worker_procs.append(p)
+            log.info("CORE_MAINT pool worker slot=%d pid=%d", i, p.pid)
+        except Exception as e:
+            log.warn("CORE_MAINT pool worker spawn failed slot=%d: %s", i, str(e))
+
+
+def maint_pool_worker_main() -> int:
+    """Подпроцесс: claim из maint_pool_jobs → run_tick_for_project (DB cooldown для lazy scan)."""
+    slot = _maint_pool_worker_slot()
+    db = Database.get_database()
+    _maint_pool.ensure_maint_pool_tables(db.engine)
+    wid = f"w{slot}-{_maint_pool.default_worker_id()}"
+    lease = _maint_pool.pool_lease_sec()
+    log.info("CORE_MAINT pool worker loop slot=%d id=%s", slot, wid)
+    while True:
+        try:
+            if not _maint_enabled():
+                time.sleep(max(2.0, _pool_idle_sleep_sec()))
+                continue
+            job = _maint_pool.claim_next_job(db.engine, wid, lease)
+            if not job:
+                time.sleep(_pool_idle_sleep_sec())
+                continue
+            jid = int(job["job_id"])
+            pid = int(job["project_id"])
+            row = db.fetch_one("SELECT project_name FROM projects WHERE id = :pid", {"pid": pid})
+            if not row or not row[0]:
+                _maint_pool.fail_job(db.engine, jid, "project not found")
+                continue
+            pname = str(row[0])
+            score = 0.0
+            kind_raw = str(job.get("kind") or "reconcile_tick").strip().lower()
+            last_emit: list[float] = [0.0]
+            iv = _maint_pool.pool_progress_interval_sec()
+
+            def _cb(stage: str, *, force: bool = False, **extra: Any) -> None:
+                now_m = time.monotonic()
+                if not force and (now_m - last_emit[0]) < iv:
+                    return
+                last_emit[0] = now_m
+                _maint_pool.emit_progress(jid, pid, stage, worker_id=wid, extra=extra or None)
+                _maint_pool.touch_job_lease(db.engine, jid, lease)
+                _maint_pool.update_job_progress_db(db.engine, jid, stage, extra)
+
+            try:
+                if kind_raw == "code_index":
+                    from lib.maint_code_index_job import execute_code_index_maint_job
+
+                    summary = execute_code_index_maint_job(pid, progress_cb=_cb)
+                    log.info(
+                        "CORE_MAINT pool code_index done job_id=%d project_id=%d entities=%s cache=%s",
+                        jid,
+                        pid,
+                        summary.get("entities"),
+                        summary.get("cache_path"),
+                    )
+                else:
+                    run_tick_for_project(
+                        db,
+                        pid,
+                        pname,
+                        score,
+                        last_scan=None,
+                        use_db_cooldown=True,
+                        progress_cb=_cb,
+                        once=False,
+                    )
+                _maint_pool.complete_job(db.engine, jid)
+            except Exception as e:
+                log.warn("CORE_MAINT pool job failed job_id=%d project_id=%d kind=%s: %s", jid, pid, kind_raw, str(e))
+                _maint_pool.fail_job(db.engine, jid, str(e))
+        except Exception as e:
+            log.excpt("CORE_MAINT pool worker loop error", e=e)
+            time.sleep(1.0)
 
 
 def run_poll_failed_subtrees(last_scan: dict[int, float]) -> None:
@@ -992,6 +1302,10 @@ def main() -> int:
     ap.add_argument("--once", action="store_true", help="Run one tick and exit")
     args = ap.parse_args()
 
+    if _is_maint_pool_worker():
+        maint_pool_worker_main()
+        return 0
+
     db = Database.get_database()
     eff_loop = "active"
     if _maint_enabled():
@@ -1014,6 +1328,20 @@ def main() -> int:
         "1" if _mcp_heartbeat_tune_enabled() else "0",
         _inotify_timeout_sec() if _maint_enabled() and eff_loop == "inotify" else 0.0,
     )
+    if _maint_enabled() and _pool_orchestrator(tick_once=args.once) and not _is_maint_pool_worker():
+        _maint_pool.ensure_maint_pool_tables(db.engine)
+        nw = _pool_workers()
+        _spawn_pool_workers(nw)
+        atexit.register(_shutdown_pool_workers)
+
+        def _sig_pool(_signum: int, _frame: Any) -> None:
+            _shutdown_pool_workers()
+            sys.exit(0)
+
+        signal.signal(signal.SIGTERM, _sig_pool)
+        signal.signal(signal.SIGINT, _sig_pool)
+        log.info("CORE_MAINT pool orchestrator spawned_workers=%d (stdout MAINT_POOL_PROGRESS from workers)", nw)
+        _sync_maint_pool_status_file()
     last_scan: dict[int, float] = {}
     last_force_active = time.monotonic()
     last_failed_poll = time.monotonic()
@@ -1028,6 +1356,7 @@ def main() -> int:
 
     while True:
         try:
+            _sync_maint_pool_status_file()
             if _maint_enabled():
                 mode = eff_loop
                 if mode == "inotify":

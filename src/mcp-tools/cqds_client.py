@@ -398,13 +398,52 @@ class ColloquiumClient:
         resp.raise_for_status()
         return resp.json()
 
-    async def get_code_index(self, project_id: int, timeout: int = 300) -> dict:
-        """Build and return the rich entity index for a project on demand."""
+    async def get_core_status(self) -> dict:
+        """GET /api/core/status — uptime ядра, maint child, пул воркеров, maint_pool_jobs, фоновые сканы."""
         await self._ensure_login()
-        http_timeout = httpx.Timeout(float(max(timeout, 30) + 30))
+        resp = await self._client.get("/api/core/status")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def maint_enqueue(self, project_id: int, kind: str = "code_index") -> dict:
+        """POST /api/project/maint_enqueue — очередь maint-пула (code_index без долгого HTTP из MCP)."""
+        await self._ensure_login()
+        k = str(kind or "code_index").strip().lower()
+        resp = await self._client.post(
+            "/api/project/maint_enqueue",
+            json={"project_id": int(project_id), "kind": k},
+            timeout=httpx.Timeout(45.0),
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_code_index(
+        self,
+        project_id: int,
+        timeout: int = 300,
+        *,
+        client_http_max_sec: float | None = None,
+        cache_only: bool = False,
+    ) -> dict:
+        """GET /api/project/code_index (синхронный тяжёлый путь).
+
+        ``timeout`` — query-параметр для ядра (подсказка). ``client_http_max_sec`` — верхняя граница
+        ожидания HTTP в MCP; если задана, не даём зависнуть на долгие минуты (норма: не держать MCP→ядро).
+        ``cache_only`` — try-retrieve без пересборки (см. описание эндпоинта в ядре).
+        """
+        await self._ensure_login()
+        if client_http_max_sec is None:
+            read_timeout = float(max(int(timeout), 30) + 30)
+        else:
+            read_timeout = max(5.0, float(client_http_max_sec))
+        connect_cap = min(20.0, read_timeout)
+        http_timeout = httpx.Timeout(read_timeout, connect=connect_cap)
+        params: dict = {"project_id": project_id, "timeout": timeout}
+        if cache_only:
+            params["cache_only"] = True
         resp = await self._client.get(
             "/api/project/code_index",
-            params={"project_id": project_id, "timeout": timeout},
+            params=params,
             timeout=http_timeout,
         )
         resp.raise_for_status()

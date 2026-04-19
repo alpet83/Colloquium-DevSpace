@@ -1,0 +1,3 @@
+# Локальные тесты агента (не в образе ядра по умолчанию).
+# pip install -r requirements-dev.txt
+pytest>=8

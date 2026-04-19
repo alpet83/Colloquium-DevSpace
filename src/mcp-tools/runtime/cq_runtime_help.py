@@ -5,6 +5,7 @@ from typing import Any
 from mcp.types import CallToolResult, Tool  # type: ignore[import]
 
 from cqds_helpers import _json_text
+from cqds_run_ctx import RunContext
 
 from runtime_help_data import (
     COLLOQUIUM_CTLS,
@@ -25,6 +26,7 @@ TOOLS: list[Tool] = [
         name="cq_help",
         description=(
             "Manuals (tool_ref). Catalog: omit tool_ref. "
+            "Live core status: tool_ref=cq_help#core_status (GET /api/core/status). "
             "Unified Colloquium: cq_chat_ctl, cq_project_ctl, cq_files_ctl, cq_exec_ctl (+ #action). "
             "Host: cq_process_ctl, cq_docker_ctl. Prefer requests[] batch on *_ctl when 2+ steps."
         ),
@@ -34,7 +36,7 @@ TOOLS: list[Tool] = [
                 "tool_ref": {
                     "type": "string",
                     "description": (
-                        "e.g. cq_process_ctl, cq_docker_ctl#compose, cq_help. "
+                        "e.g. cq_process_ctl, cq_docker_ctl#compose, cq_help, cq_help#core_status. "
                         "Omit or empty string → catalog."
                     ),
                     "default": "",
@@ -145,7 +147,10 @@ def _build_payload(tool_ref_raw: str | None, include_examples: bool) -> dict[str
                 "error": "unknown_fragment",
                 "tool_ref": base,
                 "fragment": frag,
-                "hint": "cq_help has no sub-topics; use tool_ref=cq_help only.",
+                "hint": (
+                    "Use cq_help#core_status for live GET /api/core/status (handled before static manuals). "
+                    "Otherwise omit #fragment (tool_ref=cq_help only)."
+                ),
             }
         return {"kind": "manual", "tool_ref": "cq_help", "content": CQ_HELP_SELF}
 
@@ -235,11 +240,50 @@ def _build_payload(tool_ref_raw: str | None, include_examples: bool) -> dict[str
     }
 
 
-async def handle(name: str, arguments: dict[str, Any]) -> CallToolResult | None:
+async def handle(
+    name: str, arguments: dict[str, Any], ctx: RunContext | None = None
+) -> CallToolResult | None:
     if name != "cq_help":
         return None
 
+    # Некоторые MCP-клиенты при пустой схеме шлют arguments=null вместо {}.
+    if not isinstance(arguments, dict):
+        arguments = {}
+
     include_examples = bool(arguments.get("include_examples", True))
     tool_ref = arguments.get("tool_ref", "")
-    payload = _build_payload(tool_ref if tool_ref is not None else "", include_examples)
+    raw = tool_ref if tool_ref is not None else ""
+    base, frag = _parse_tool_ref(raw)
+    if base == "cq_help" and frag == "core_status":
+        if ctx is None:
+            return _json_text(
+                {
+                    "ok": False,
+                    "kind": "core_status",
+                    "error": "no_run_context",
+                    "message": "cq_help#core_status needs Colloquium client (cqds_mcp_mini).",
+                }
+            )
+        try:
+            core = await ctx.client.get_core_status()
+        except Exception as exc:  # noqa: BLE001
+            return _json_text(
+                {
+                    "ok": False,
+                    "kind": "core_status",
+                    "tool_ref": "cq_help#core_status",
+                    "error": str(exc),
+                }
+            )
+        return _json_text(
+            {
+                "ok": True,
+                "kind": "core_status",
+                "tool_ref": "cq_help#core_status",
+                "core": core,
+                "hint": "Same payload as GET /api/core/status; manuals remain under tool_ref=cq_help.",
+            }
+        )
+
+    payload = _build_payload(raw, include_examples)
     return _json_text(payload)

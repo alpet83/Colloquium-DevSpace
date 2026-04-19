@@ -21,6 +21,9 @@ from lib.text_bytes import (
 
 log = globals.get_logger("fileman")
 
+# Минимум строк выборки, после которого при verify_links логируем #PERF (только если notify_heavy_ops).
+_PERF_VERIFY_LINKS_ROW_WARN = 80
+
 
 def _mark_project_scan_stale(project_id: int, reason: str):
     try:
@@ -92,6 +95,10 @@ def _prefix_sql(path_prefix: str) -> tuple[str, dict]:
 
 
 class FileManager:
+    """Хранилище ссылок на файлы проектов. Параметр ``notify_heavy_ops`` задаёт хост-приложение:
+    при ``True`` (типично HTTP-ядро) при тяжёлых операциях (крупный ``file_index`` с ``verify_links``, далее — прочие
+    долгие запросы к БД из этого менеджера) пишутся предупреждения ``#PERF``; в фоновых воркерах оставляют ``False``."""
+
     def resolve_disk_path(self, file_name: str, project_id) -> Path:
         """Абсолютный путь к файлу в дереве проекта (как для get_file)."""
         return _qfn(file_name, project_id)
@@ -102,7 +109,8 @@ class FileManager:
 
         return file_type_detector.is_acceptable_file(file_path)
 
-    def __init__(self):
+    def __init__(self, *, notify_heavy_ops: bool = False):
+        self.notify_heavy_ops = bool(notify_heavy_ops)
         self.db = Database.get_database()
         _ttl0 = get_int("FILE_LINK_TTL_MAX", 3, 1, 10_000)
         self.files_table = DataTable(
@@ -863,6 +871,7 @@ class FileManager:
         - max_segments: абсолютная глубина пути (сегменты от корня репо); path_seg_count <= bound.
         - min_segments: path_seg_count > bound; для «глубоких» имён в ленивом дереве.
         - name_only: только file_name и project_id (без id/ts); для глубокого среза дерева.
+        - При ``verify_links`` и ``self.notify_heavy_ops`` и большом числе строк — предупреждение ``#PERF`` в лог.
         """
         if name_only and include_size:
             include_size = False
@@ -905,6 +914,13 @@ class FileManager:
                 clean_name = strip_storage_prefix(str(file_name))
                 result.append({'id': None, 'file_name': clean_name, 'ts': 0, 'project_id': proj_id})
             return result
+        if verify_links and self.notify_heavy_ops and len(rows) >= _PERF_VERIFY_LINKS_ROW_WARN:
+            log.warn(
+                "#PERF file_index(verify_links=ON): ожидается блокирующая проверка @-ссылок на диске/в БД "
+                "(notify_heavy_ops=True); project_id=%s rows=%d — см. verify_links в managers/files.py",
+                str(project_id),
+                len(rows),
+            )
         for row in rows:
             file_id, file_name, ts, proj_id = row
             clean_name = strip_storage_prefix(file_name)
@@ -922,6 +938,18 @@ class FileManager:
                     pass
             result.append(entry)
         return result
+
+    def active_files_latest_ts(self, project_id: int) -> int | None:
+        """Max ``ts`` among active (non-degraded TTL) links for a project — cheap vs full ``file_index``."""
+        ttl_max = self.missing_ttl_max
+        row = self.db.fetch_one(
+            "SELECT MAX(ts) FROM attached_files WHERE project_id = :project_id "
+            "AND COALESCE(missing_ttl, :ttl_max) >= :ttl_max",
+            {"project_id": project_id, "ttl_max": ttl_max},
+        )
+        if not row or row[0] is None:
+            return None
+        return int(row[0])
 
     def ttl_status(self, project_id: int = None, sample_limit: int = 10) -> dict:
         ttl_max = self.missing_ttl_max

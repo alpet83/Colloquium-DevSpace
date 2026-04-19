@@ -1,4 +1,7 @@
 # cqds_mcp_full.py — thin MCP entrypoint for Colloquium-DevSpace
+#
+# DEPRECATED as primary entrypoint: большой список плоских cq_* tools заморожен.
+# Предпочтительно cqds_mcp_mini (cq_*_ctl, cq_help; ядро: cq_help#core_status).
 
 from __future__ import annotations
 
@@ -79,7 +82,16 @@ async def run_server(client: ColloquiumClient) -> None:
                 }
             )
             try:
-                payload = await client.get_code_index(project_id)
+                try:
+                    wcap = float(os.environ.get("CQDS_MCP_INDEX_WORKER_HTTP_MAX_SEC", "120"))
+                except ValueError:
+                    wcap = 120.0
+                wcap = max(30.0, wcap)
+                payload = await client.get_code_index(
+                    project_id,
+                    timeout=min(300, int(wcap)),
+                    client_http_max_sec=wcap,
+                )
                 entities_count, files_count = _index_counts(payload)
                 job.update(
                     {

@@ -119,12 +119,14 @@ CQ_HELP_SELF = {
     "tool_ref": "cq_help",
     "summary": (
         "Manuals for cqds_runtime. Prefer batch (requests[]) on any *_ctl tool when doing 2+ steps. "
-        "Colloquium: cq_chat_ctl, cq_project_ctl, cq_files_ctl, cq_exec_ctl; host: cq_process_ctl, cq_docker_ctl."
+        "Colloquium: cq_chat_ctl, cq_project_ctl, cq_files_ctl, cq_exec_ctl; host: cq_process_ctl, cq_docker_ctl. "
+        "Глобальный статус ядра (uptime, maint pool, active_jobs из maint_pool_jobs, фон): tool_ref=cq_help#core_status → GET /api/core/status."
     ),
     "parameters": {
         "tool_ref": (
             "Optional. Examples: empty → catalog; 'cq_process_ctl' → overview; "
-            "'cq_process_ctl#spawn' → one action; 'cq_help' → this contract."
+            "'cq_process_ctl#spawn' → one action; 'cq_help' → this contract; "
+            "'cq_help#core_status' → live JSON ядра (не справочная страница)."
         ),
         "include_examples": "boolean, default true (omit examples when false to save tokens)",
     },
@@ -300,7 +302,14 @@ FILES_CTL_ACTIONS = {
     "undo_file": {"summary": "Post <undo> via chat.", "payload": "chat_id, file_id, time_back?"},
     "list_files": {"summary": "File index; filters modified_since, file_ids; as_tree option.", "payload": "project_id, …"},
     "get_index": {"summary": "Entity index (chat or cached project).", "payload": "chat_id | project_id"},
-    "rebuild_index": {"summary": "Build sandwiches index; background=true queues worker.", "payload": "project_id, background?, timeout?"},
+    "index_job_status": {
+        "summary": "Опрос только локальной очереди MCP (если ребилд шёл через fallback без maint-пула). При CQDS_MCP_INDEX_BACKGROUND_VIA_MAINT=1 по умолчанию — опрос cq_help#core_status (maint_pool.active_jobs).",
+        "payload": "project_id? (omit → все известные project_id в index_jobs)",
+    },
+    "rebuild_index": {
+        "summary": "Фон: maint_enqueue + опрос cq_help#core_status. Реализована оптимизация инкрементального ребилда: при изменении одного файла типичное ожидание меньше full-рескана (ориентир ~20-40s на текущем наборе, зависит от I/O томов Docker Desktop). Для модели в синхронном сценарии: poll cache_only с интервалом 15-20s; пока rebuilt_now=1 — выполнять побочные задачи (например, подготовку отчёта оркестратору), после исчезновения rebuilt_now использовать payload как актуализированный индекс. Синхронный режим: HTTP к code_index ограничен CQDS_MCP_SYNC_CODE_INDEX_MAX_SEC (по умолчанию 30с), при обрыве — код sync_code_index_client_timeout. Fallback-воркер MCP: CQDS_MCP_INDEX_WORKER_HTTP_MAX_SEC (по умолчанию 120с). cache_only: GET ?cache_only=true — кеш + опционально rebuilt_now.",
+        "payload": "project_id, background?, cache_only?, timeout?",
+    },
     "get_code_index": {"summary": "Deprecated alias of rebuild_index.", "payload": "same as rebuild_index"},
     "grep_entity": {"summary": "Search entity CSV rows in index.", "payload": "project_id, patterns/pattern, match_field?, …"},
     "read_file": {"summary": "Read by DB file_id.", "payload": "file_id"},
@@ -351,6 +360,7 @@ HELP_CATALOG = [
         "tool_ref": "cq_help",
         "one_line": CQ_HELP_SELF["summary"],
         "detail": "cq_help",
+        "fragments": ["cq_help#core_status"],
     },
     {
         "tool_ref": "cq_process_ctl",

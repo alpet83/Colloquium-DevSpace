@@ -2,7 +2,7 @@
 <template>
   <div class="app-container">
     <div v-if="authStore.backendError" class="error-overlay">
-      <p>Бэкэнд неисправен. Произошла ошибка сервера. Пожалуйста, попробуйте позже.</p>
+      <p>{{ authStore.backendErrorDetail || 'Бэкэнд неисправен. Произошла ошибка сервера. Пожалуйста, попробуйте позже.' }}</p>
     </div>
     <div v-if="!authStore.isLoggedIn" class="login-form">
       <Login />

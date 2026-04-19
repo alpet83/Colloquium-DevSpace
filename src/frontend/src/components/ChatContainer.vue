@@ -39,8 +39,8 @@
       <div class="file-preview"><code id="file-preview-code" class="framed-code" @click="handleCodeSelection">{{ filePreviewContent }}</code></div>
       <button @click="doModal('filePreviewModal', false)">Закрыть</button><span id="file-preview-info">Showing preview </span>
     </dialog>
-    <p v-if="chatStore.chatError || fileStore.chatError || authStore.backendError" class="error">
-      {{ chatStore.chatError || fileStore.chatError || authStore.backendError }}
+    <p v-if="chatStore.chatError || fileStore.chatError || authStore.backendErrorDetail" class="error">
+      {{ chatStore.chatError || fileStore.chatError || authStore.backendErrorDetail }}
     </p>
     <div v-if="activeTab === 'chat'" class="messages" ref="messagesContainer" @click="handleMessageClick">
       <div v-for="(msg, index) in formattedMessages" :key="msg.id"

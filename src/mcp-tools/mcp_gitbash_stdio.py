@@ -36,6 +36,23 @@ from mcp.types import CallToolResult, TextContent, Tool  # type: ignore[import]
 
 server = Server("cqds-gitbash")
 
+#
+# Debug/build guard: detect stale MCP server when any imported module under `mcp-tools/`
+# gets modified on disk after this process started.
+from lib.version_guard import VersionGuard
+
+_MCP_OBSOLETE_RESTART_WARN = "WARN: obsolete MCP server was used, restart for check new version."
+_VERSION_GUARD = VersionGuard(
+    base_dir=Path(__file__).resolve().parent,
+    message=_MCP_OBSOLETE_RESTART_WARN,
+    track_new_modules=True,
+    check_interval_sec=1.0,
+)
+
+
+def _staleness_warning() -> str | None:
+    return _VERSION_GUARD.get_warning()
+
 
 def _bash_under_git_root(install_path: str) -> str | None:
     root = Path(install_path.strip().strip('"'))
@@ -262,12 +279,7 @@ def _report_public_repo(runtime_repo_path: str) -> str | None:
     return None
 
 
-_COMMIT_PREPARE_LOCATIONS: list[str] = [
-    "scripts/commit_prepare.py",
-    "project/scripts/commit_prepare.py",
-    "projects/scripts/commit_prepare.py",
-    "commit_prepare.py",
-]
+_PROJECT_COMMIT_PREPARE_PRIMARY = "scripts/commit_prepare.py"
 _LAST_DRY_RUN_TS_BY_REPO: dict[str, float] = {}
 _LAST_DRY_RUN_TOKEN_BY_REPO: dict[str, str] = {}
 # Runtime repo key -> bound public repo key, learned from commit_prepare report.
@@ -308,44 +320,45 @@ def _drop_binding_for_public_repo(pub_key: str) -> None:
         _LAST_DRY_RUN_TOKEN_BY_REPO.pop(rk, None)
 
 
-def _find_commit_prepare(repo_path: str) -> str | None:
-    for rel in _COMMIT_PREPARE_LOCATIONS:
-        candidate = Path(repo_path) / rel
-        if candidate.is_file():
-            return str(candidate.resolve())
+def _global_commit_prepare() -> str | None:
+    # Canonical shared script in CQDS repo root (one implementation for all projects).
+    candidate = Path(__file__).resolve().parent.parent / "commit_prepare.py"
+    if candidate.is_file():
+        return str(candidate.resolve())
     return None
 
 
-async def _find_commit_prepare_via_bash_find(
-    repo_path: str, bash_path: str
-) -> str | None:
-    # Fallback scan for projects that keep commit_prepare.py in non-standard layout.
-    command = (
-        f"cd {shlex.quote(repo_path)} && "
-        "find . -maxdepth 6 -type f -name commit_prepare.py "
-        "! -path '*/.git/*' ! -path '*/node_modules/*' | head -n 1"
+def _find_project_commit_prepare(repo_path: str) -> str | None:
+    primary = (Path(repo_path) / _PROJECT_COMMIT_PREPARE_PRIMARY).resolve()
+    if primary.is_file():
+        return str(primary)
+    return None
+
+
+def _find_commit_prepare_config(repo_path: str) -> str | None:
+    """
+    Expanded config lookup for shared commit_prepare.py.
+    Priority:
+    1) <repo>/.git/commit_prepare.toml
+    2) <repo>/scripts/commit_prepare.toml
+    3) <repo>/commit_prepare.toml
+    4) <global_script_dir>/commit_prepare.toml
+    """
+    repo = Path(repo_path).resolve()
+    local_candidates = (
+        repo / ".git" / "commit_prepare.toml",
+        repo / "scripts" / "commit_prepare.toml",
+        repo / "commit_prepare.toml",
     )
-    proc = await asyncio.create_subprocess_exec(
-        bash_path,
-        "-lc",
-        command,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=repo_path,
-        env=os.environ.copy(),
-    )
-    stdout_b, _ = await proc.communicate()
-    if proc.returncode != 0:
-        return None
-    hit = (stdout_b or b"").decode("utf-8", errors="replace").strip()
-    if not hit:
-        return None
-    if hit.startswith("./"):
-        hit = hit[2:]
-    candidate = (Path(repo_path) / hit).resolve()
-    if candidate.is_file():
-        return str(candidate)
+    for cand in local_candidates:
+        if cand.is_file():
+            return str(cand.resolve())
+
+    global_script = _global_commit_prepare()
+    if global_script:
+        gc = Path(global_script).resolve().parent / "commit_prepare.toml"
+        if gc.is_file():
+            return str(gc.resolve())
     return None
 
 
@@ -657,6 +670,21 @@ TOOLS: list[Tool] = [
 ]
 
 
+def _resolve_public_mirror_safe_commit_token() -> str:
+    """Token for public-mirror `git commit` (must match pre-commit hook).
+
+    Prefer ``CQDS_SAFE_COMMIT_TOKEN_PREFIX`` in the MCP server env: effective token is
+    PREFIX + UTC date ``YYYY-MM-DD``. ``git_bash_exec`` inherits only the prefix, so naive
+    direct commits from agents miss the hook secret. If prefix is unset, fall back to
+    legacy ``CQDS_SAFE_COMMIT_TOKEN`` (full value in env — inheritable, not recommended).
+    """
+    prefix = (os.environ.get("CQDS_SAFE_COMMIT_TOKEN_PREFIX") or "").strip()
+    if prefix:
+        salt = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+        return prefix + salt
+    return (os.environ.get("CQDS_SAFE_COMMIT_TOKEN") or "").strip()
+
+
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return TOOLS
@@ -737,9 +765,11 @@ async def _handle_git_safe_commit(arguments: dict[str, Any]) -> CallToolResult:
 
     bash_path = _resolve_bash()
 
-    prepare_script = _find_commit_prepare(repo_path)
+    prepare_script = _find_project_commit_prepare(repo_path)
+    used_global_prepare = False
     if prepare_script is None and mode in ("dry_run", "apply"):
-        prepare_script = await _find_commit_prepare_via_bash_find(repo_path, bash_path)
+        prepare_script = _global_commit_prepare()
+        used_global_prepare = bool(prepare_script)
     if prepare_script is None and mode in ("dry_run", "apply"):
         return CallToolResult(
             isError=True,
@@ -747,7 +777,8 @@ async def _handle_git_safe_commit(arguments: dict[str, Any]) -> CallToolResult:
                 TextContent(
                     type="text",
                     text=warning
-                    + f"\nERROR: commit_prepare.py not found under {repo_path!r}. Looked in: {_COMMIT_PREPARE_LOCATIONS}",
+                    + f"\nERROR: commit_prepare.py not found under {repo_path!r}. Expected: {_PROJECT_COMMIT_PREPARE_PRIMARY}"
+                    + "\nFallback global commit_prepare.py is also missing.",
                 )
             ],
         )
@@ -1068,9 +1099,32 @@ async def _handle_git_safe_commit(arguments: dict[str, Any]) -> CallToolResult:
         flags = "--apply" if mode == "apply" else ""
         if extra_args:
             flags = (flags + " " + extra_args).strip()
+        if "--config" not in f" {flags} ":
+            cfg = _find_commit_prepare_config(repo_path)
+            if cfg:
+                flags = (flags + " " + f"--config {shlex.quote(cfg)}").strip()
         python_exe = shlex.quote(sys.executable)
         script = shlex.quote(prepare_script)
         command = f"cd {shlex.quote(repo_path)} && {python_exe} {script} {flags}"
+
+    proc_env = os.environ.copy()
+    if mode == "commit" and public_repo:
+        token = _resolve_public_mirror_safe_commit_token()
+        if not token:
+            return CallToolResult(
+                isError=True,
+                content=[
+                    TextContent(
+                        type="text",
+                        text=warning
+                        + "\nERROR: public mirror commit token is not configured in MCP server environment.\n"
+                        + "Set CQDS_SAFE_COMMIT_TOKEN_PREFIX in gitbash MCP env (hook expects PREFIX + UTC YYYY-MM-DD).\n"
+                        + "Legacy: CQDS_SAFE_COMMIT_TOKEN as full value (inheritable via git_bash_exec — avoid).\n"
+                        + "Restart the MCP server after changing config.",
+                    )
+                ],
+            )
+        proc_env["CQDS_SAFE_COMMIT_TOKEN"] = token
 
     proc = await asyncio.create_subprocess_exec(
         bash_path,
@@ -1080,7 +1134,7 @@ async def _handle_git_safe_commit(arguments: dict[str, Any]) -> CallToolResult:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=repo_path,
-        env=os.environ.copy(),
+        env=proc_env,
     )
 
     timeout_event = asyncio.Event()
@@ -1112,6 +1166,9 @@ async def _handle_git_safe_commit(arguments: dict[str, Any]) -> CallToolResult:
         "stderr": (stderr_b or b"").decode("utf-8", errors="replace"),
         "confirmation": confirmation_info,
     }
+    if mode in ("dry_run", "apply"):
+        result["prepare_script"] = prepare_script
+        result["prepare_source"] = "global_fallback" if used_global_prepare else "project"
     if mode == "commit":
         result["commit_scope"] = commit_scope
         if commit_warnings:
@@ -1150,6 +1207,13 @@ async def _handle_git_safe_commit(arguments: dict[str, Any]) -> CallToolResult:
                 is_clean = await _git_is_clean(str(Path(bound_pub).resolve()), bash_path)
                 if is_clean:
                     _drop_binding_for_public_repo(bound_pub)
+    stale_warn = _staleness_warning()
+    if stale_warn:
+        if isinstance(result.get("warnings"), list):
+            if stale_warn not in result["warnings"]:
+                result["warnings"].append(stale_warn)
+        else:
+            result["warnings"] = [stale_warn]
     text = warning + "\n" + json.dumps(result, ensure_ascii=False, indent=2)
     return CallToolResult(
         isError=exit_code != 0,
@@ -1825,6 +1889,9 @@ async def _handle_git_list_runtime_deploys(arguments: dict[str, Any]) -> CallToo
         "runtime_deploys": sorted(found),
         "count": len(found),
     }
+    stale_warn = _staleness_warning()
+    if stale_warn:
+        result["warnings"] = [stale_warn]
     return CallToolResult(
         isError=False,
         content=[TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))],
@@ -1916,13 +1983,28 @@ async def _handle_git_repo_status(arguments: dict[str, Any]) -> CallToolResult:
     )
     stdout_b, stderr_b = await proc.communicate()
     exit_code = proc.returncode if proc.returncode is not None else -1
-    decoded = (stdout_b or b"").decode("utf-8", errors="replace")
-    nonempty_lines = [ln.strip() for ln in decoded.splitlines() if ln.strip()]
-    # When show_branch=true, git status includes a leading "## <branch...>" line
-    # even if there are no other changes. Treat it as header-only.
-    if show_branch and nonempty_lines and nonempty_lines[0].startswith("##"):
-        nonempty_lines = nonempty_lines[1:]
-    clean_status = exit_code == 0 and not bool(nonempty_lines)
+    clean_status = False
+    if exit_code == 0:
+        # Determine "clean" via porcelain only, independent of -b/branch header output.
+        porcelain_cmd = (
+            f"cd {shlex.quote(repo_path)} && "
+            f"git status --porcelain --untracked-files={untracked}"
+        )
+        if ignored:
+            porcelain_cmd += " --ignored"
+        pproc = await asyncio.create_subprocess_exec(
+            bash_path,
+            "-lc",
+            porcelain_cmd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=repo_path,
+            env=os.environ.copy(),
+        )
+        pstdout_b, _ = await pproc.communicate()
+        pdecoded = (pstdout_b or b"").decode("utf-8", errors="replace").strip()
+        clean_status = not bool(pdecoded)
     repo_k = _repo_key(repo_path)
     if clean_status:
         if repo_k in _PUB_REPOS:
@@ -1943,6 +2025,13 @@ async def _handle_git_repo_status(arguments: dict[str, Any]) -> CallToolResult:
         "argv": argv,
         "clean": clean_status,
     }
+    stale_warn = _staleness_warning()
+    if stale_warn:
+        if isinstance(result.get("warnings"), list):
+            if stale_warn not in result["warnings"]:
+                result["warnings"].append(stale_warn)
+        else:
+            result["warnings"] = [stale_warn]
     return CallToolResult(
         isError=exit_code != 0,
         content=[TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))],
@@ -2036,6 +2125,13 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
         "timed_out": timed_out,
         "bash_path": bash_path,
     }
+    stale_warn = _staleness_warning()
+    if stale_warn:
+        if isinstance(out.get("warnings"), list):
+            if stale_warn not in out["warnings"]:
+                out["warnings"].append(stale_warn)
+        else:
+            out["warnings"] = [stale_warn]
     text = json.dumps(out, ensure_ascii=False, indent=2)
     return CallToolResult(content=[TextContent(type="text", text=text)])
 

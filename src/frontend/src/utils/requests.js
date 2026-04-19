@@ -1,5 +1,6 @@
 // /frontend/rtm/src/utils/requests.js, created 2025-07-26 18:00 EEST
 import { log_msg, log_error } from './debugging'
+import { readFetchJsonOrText, formatHttpFailureMessage, isServerOrGatewayFailure } from './apiErrors'
 
 export function makeRequest(store, endpoint, options = {}, requestKey, minDelay) {
   const now = Date.now();
@@ -30,21 +31,25 @@ export function makeRequest(store, endpoint, options = {}, requestKey, minDelay)
         signal: controller.signal
       });
       clearTimeout(timeoutId);
-      if (res.status === 500 || res.status === 502) {
-        log_error(null, new Error(`Server error: ${res.status}`), `fetch ${endpoint}`);
+      const body = await readFetchJsonOrText(res);
+      if (isServerOrGatewayFailure(res)) {
+        const msg = formatHttpFailureMessage(res, body);
+        log_error(null, new Error(msg), `fetch ${endpoint}`);
         store.backendError = true;
-        reject(new Error(`Server error: ${res.status}`));
+        store.chatError = msg;
+        reject(new Error(msg));
         return;
       }
-      const data = await res.json();
-      if (res.ok && !data.error) {
+      const data = body.json;
+      if (res.ok && data && !data.error) {
         store.backendError = false;
         store.chatError = '';
         resolve(data);
       } else {
-        log_error(null, new Error(data.error || `Failed to fetch ${endpoint}`), `fetch ${endpoint}`);
-        store.chatError = data.error || `Failed to fetch ${endpoint}`;
-        reject(new Error(data.error || `Failed to fetch ${endpoint}`));
+        const errText = (data && (data.error || data.detail)) || `Failed to fetch ${endpoint}`;
+        log_error(null, new Error(errText), `fetch ${endpoint}`);
+        store.chatError = errText;
+        reject(new Error(errText));
       }
     } catch (e) {
       clearTimeout(timeoutId);

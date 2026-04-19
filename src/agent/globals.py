@@ -26,6 +26,9 @@ project_scan_state = {}
 project_index_epoch = {}
 """ project_index_epoch (dict[int, int]) — монотонно растёт после каждого mark_scan_fresh (рескан файлов) """
 
+CORE_SERVER_STARTED_AT = None
+"""Unix time.time() в момент завершения server_init() (для GET /api/core/status через nginx → /core/status)."""
+
 
 def get_project_index_epoch(project_id: int) -> int:
     try:

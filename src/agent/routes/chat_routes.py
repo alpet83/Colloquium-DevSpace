@@ -120,7 +120,7 @@ async def list_chats(request: Request):
     log.debug(g.with_session_tag(request, "Запрос GET /chat/list, IP=%s, Cookies=~%s"), request.client.host, str(request.cookies))
     try:
         user_id = check_session(request)
-        chats = g.chat_manager.list_chats(user_id)
+        chats = await asyncio.to_thread(g.chat_manager.list_chats, user_id)
         log.debug(g.with_session_tag(request, "Возвращено %d чатов для user_id=%d"), len(chats), user_id)
         return chats
     except Exception as e:
