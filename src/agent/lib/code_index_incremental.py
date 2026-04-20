@@ -21,7 +21,12 @@ def env_incremental_enabled() -> bool:
     return v not in ("0", "false", "no", "off")
 
 
-def env_max_incremental_revisions() -> int:
+def env_max_inc_revs() -> int:
+    """Макс. число инкрементальных ребилдов подряд до принудительного full.
+
+    Читает ``CORE_INDEX_INCREMENTAL_MAX_REVISION`` (целое, по умолчанию 50);
+    значения < 1 приводятся к 1. При невалидной строке — 50.
+    """
     try:
         return max(1, int(os.environ.get("CORE_INDEX_INCREMENTAL_MAX_REVISION", "50")))
     except ValueError:
@@ -31,6 +36,12 @@ def env_max_incremental_revisions() -> int:
 def env_dirty_use_size() -> bool:
     v = (os.environ.get("CORE_INDEX_DIRTY_USE_SIZE") or "0").strip().lower()
     return v in ("1", "true", "yes", "on")
+
+
+def env_incremental_mode() -> str:
+    """Режим инкрементального ребилда: ``fast`` (по умолчанию) или ``refresh``."""
+    v = (os.environ.get("CORE_INDEX_INCREMENTAL_MODE") or "fast").strip().lower()
+    return "refresh" if v == "refresh" else "fast"
 
 
 def _file_id_entity_line(line: str) -> int | None:
@@ -180,6 +191,18 @@ def _filter_file_lines(lines: list[Any], drop_ids: set[int]) -> list[str]:
     return out
 
 
+def _as_int_set(value: Any) -> set[int]:
+    out: set[int] = set()
+    if not isinstance(value, list):
+        return out
+    for v in value:
+        try:
+            out.add(int(v))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def merge_index(
     previous: dict[str, Any],
     partial: dict[str, Any] | None,
@@ -198,6 +221,8 @@ def merge_index(
     merged = copy.deepcopy(previous)
     merged["entities"] = _filter_entity_lines(previous.get("entities") or [], drop)
     merged["files"] = _filter_file_lines(previous.get("files") or [], drop)
+    prev_code_ids = _as_int_set(previous.get("code_base_files"))
+    merged_code_ids = {fid for fid in prev_code_ids if fid not in drop}
 
     if partial:
         pe = partial.get("entities")
@@ -210,11 +235,13 @@ def merge_index(
             merged["packer_version"] = partial["packer_version"]
         if partial.get("templates") and isinstance(partial["templates"], dict):
             merged["templates"] = copy.deepcopy(partial["templates"])
+        merged_code_ids.update(_as_int_set(partial.get("code_base_files")))
 
     merged["context_date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     merged["rebuild_revision"] = int(new_revision)
     merged["last_build_kind"] = "incremental"
     merged["file_fingerprints"] = build_fingerprints(file_entries)
+    merged["code_base_files"] = sorted(merged_code_ids)
     merged["packer_version"] = INDEX_PACKER_VERSION
     if duration_sec is not None:
         stamp_rebuild_duration(merged, duration_sec)

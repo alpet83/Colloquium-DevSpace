@@ -1,11 +1,11 @@
 # /agent/managers/project.py, updated 2025-07-26 17:00 EEST
 import os
-import re
 import time
 from pathlib import Path
 from .db import Database, DataTable
 from .runtime_config import get_float
 from lib.file_link_prefix import strip_storage_prefix
+from lib.project_scan_filter import ProjectScanFilter
 from lib.sandwich_pack import SandwichPack
 from lib.basic_logger import BasicLogger
 import globals
@@ -313,12 +313,9 @@ class ProjectManager:
                 return []
             log.debug("Сканирование файлов проекта в %s", project_dir)
             files = []
-            ignore_file = project_dir / '.scan_ignore.txt'
-            ignore_patterns = []
-            if ignore_file.exists():
-                with ignore_file.open('r') as f:
-                    ignore_patterns = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-                log.debug("Загружены %d паттернов из .scan_ignore.txt для %s", len(ignore_patterns), project_name)
+            scan_filter = ProjectScanFilter(project_dir, logger=log)
+            if scan_filter.pattern_count:
+                log.debug("Загружены %d паттернов из .scan_ignore.txt для %s", scan_filter.pattern_count, project_name)
 
             budget = _scan_budget_seconds()
             deadline = started + max(0.0, budget - _SCAN_BUDGET_MARGIN_SEC)
@@ -366,16 +363,7 @@ class ProjectManager:
                     log.warn("scan_project_files: пропуск (relative_to) %s: %s", file_path, e)
                     continue
 
-                ignore = False
-                for pattern in ignore_patterns:
-                    try:
-                        if re.search(pattern, relative_path):
-                            ignore = True
-                            break
-                    except re.error as e:
-                        log.error("Некорректный regex паттерн '%s' в .scan_ignore.txt: %s", pattern, str(e))
-                        continue
-                if ignore:
+                if scan_filter.is_excluded(relative_path):
                     ignored_count += 1
                     continue
 

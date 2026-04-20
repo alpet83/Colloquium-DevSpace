@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
 
 _AGENT = Path(__file__).resolve().parents[1]
@@ -137,6 +138,35 @@ def test_merge_removes_and_appends():
     assert "3-4" in ents[0]
 
 
+def test_merge_updates_code_base_files():
+    prev = {
+        "packer_version": INDEX_PACKER_VERSION,
+        "entities": ["pub,function,,a,1,1-2,1", "pub,function,,b,2,1-2,1"],
+        "files": ["1,a.py,x,1,t1", "2,b.py,x,1,t2"],
+        "code_base_files": [1, 2],
+        "templates": {"entities": "x"},
+        "rebuild_revision": 0,
+        "file_fingerprints": {"1": {"ts": 1}, "2": {"ts": 1}},
+    }
+    partial = {
+        "entities": ["pub,function,,a,1,3-4,1", "pub,function,,c,3,1-3,1"],
+        "files": ["1,a.py,y,2,t3", "3,c.py,z,1,t3"],
+        "code_base_files": [1, 3],
+        "packer_version": INDEX_PACKER_VERSION,
+        "templates": {"entities": "x"},
+    }
+    entries = [{"id": 1, "ts": 2}, {"id": 3, "ts": 1}]
+    out = merge_index(
+        prev,
+        partial,
+        dirty_ids={1, 3},
+        removed_ids={2},
+        file_entries=entries,
+        new_revision=1,
+    )
+    assert out["code_base_files"] == [1, 3]
+
+
 def test_file_id_parsers():
     assert _file_id_entity_line("pub,fn,,n,42,10-11,3") == 42
     assert _file_id_file_row("7,path/with,commas/in,name,x,1,2,3,4,5") is not None
@@ -146,3 +176,42 @@ def test_build_fingerprints():
     fp = build_fingerprints([{"id": 3, "ts": 9, "size_bytes": 12}])
     assert fp["3"]["ts"] == 9
     assert fp["3"]["size_bytes"] == 12
+
+
+def test_env_incremental_mode_default_and_refresh(monkeypatch):
+    monkeypatch.delenv("CORE_INDEX_INCREMENTAL_MODE", raising=False)
+    assert _cii.env_incremental_mode() == "fast"
+    monkeypatch.setenv("CORE_INDEX_INCREMENTAL_MODE", "refresh")
+    assert _cii.env_incremental_mode() == "refresh"
+    monkeypatch.setenv("CORE_INDEX_INCREMENTAL_MODE", "FAST")
+    assert _cii.env_incremental_mode() == "fast"
+    monkeypatch.setenv("CORE_INDEX_INCREMENTAL_MODE", "unknown")
+    assert _cii.env_incremental_mode() == "fast"
+
+
+def test_project_routes_imports_incremental_helpers():
+    """Регрессия: вызовы из lib.code_index_incremental должны быть в import-блоке (без полного import routes)."""
+    pr = _AGENT / "routes" / "project_routes.py"
+    text = pr.read_text(encoding="utf-8")
+    m = re.search(
+        r"from lib\.code_index_incremental import \(\s*(.*?)\s*\)",
+        text,
+        re.DOTALL,
+    )
+    assert m is not None, "import block from lib.code_index_incremental not found"
+    block = m.group(1)
+    for name in (
+        "attach_full_metadata",
+        "build_fingerprints",
+        "compute_dirty",
+        "env_dirty_use_size",
+        "env_incremental_enabled",
+        "env_incremental_mode",
+        "env_max_inc_revs",
+        "merge_index",
+        "need_fingerprint_seed",
+        "should_force_full",
+        "stamp_rebuild_duration",
+        "validate_cache",
+    ):
+        assert name in block, f"missing in project_routes import: {name}"

@@ -37,7 +37,9 @@ if str(_AGENT_ROOT) not in sys.path:
 
 import globals
 from lib.basic_logger import BasicLogger
+from lib.file_type_detector import is_acceptable_file
 from lib.file_link_prefix import sql_link_prefixed_params, strip_storage_prefix
+from lib.project_scan_filter import ProjectScanFilter
 from managers.db import Database
 from managers.files import FileManager
 from managers.project import ProjectManager
@@ -270,10 +272,12 @@ def _effective_poll_failed_subtrees_sec() -> float:
     return base
 
 
-def _rel_excluded_from_maint_snapshot(rel: str) -> bool:
+def _rel_excluded_from_maint_snapshot(rel: str, scan_filter: ProjectScanFilter | None = None) -> bool:
     if rel.startswith("backups/"):
         return True
     if rel == MCP_HEARTBEAT_FILENAME or rel.endswith("/" + MCP_HEARTBEAT_FILENAME):
+        return True
+    if scan_filter is not None and scan_filter.is_excluded(rel):
         return True
     return False
 
@@ -321,6 +325,7 @@ def _subprocess_find_run(
 def _find_files_snapshot(project_root: Path, timeout_sec: float) -> tuple[set[str], bool]:
     if not project_root.exists():
         return set(), False
+    scan_filter = ProjectScanFilter(project_root, logger=log)
     cmd = ["find", str(project_root), "-type", "f"]
     proc = _subprocess_find_run(
         cmd,
@@ -337,7 +342,9 @@ def _find_files_snapshot(project_root: Path, timeout_sec: float) -> tuple[set[st
         rel = _normalize_rel(p, project_root)
         if not rel:
             continue
-        if _rel_excluded_from_maint_snapshot(rel):
+        if _rel_excluded_from_maint_snapshot(rel, scan_filter):
+            continue
+        if not is_acceptable_file(p):
             continue
         rows.add(rel)
     return rows, True
@@ -353,6 +360,7 @@ def _find_files_snapshot_under(project_root: Path, subtree: Path, timeout_sec: f
         subtree.resolve().relative_to(project_root.resolve())
     except Exception:
         raise RuntimeError(f"subtree not under project_root: {subtree} vs {project_root}")
+    scan_filter = ProjectScanFilter(project_root, logger=log)
     cmd = ["find", str(subtree), "-type", "f"]
     proc = _subprocess_find_run(
         cmd,
@@ -369,7 +377,9 @@ def _find_files_snapshot_under(project_root: Path, subtree: Path, timeout_sec: f
         rel = _normalize_rel(p, project_root)
         if not rel:
             continue
-        if _rel_excluded_from_maint_snapshot(rel):
+        if _rel_excluded_from_maint_snapshot(rel, scan_filter):
+            continue
+        if not is_acceptable_file(p):
             continue
         rows.add(rel)
     return rows, True

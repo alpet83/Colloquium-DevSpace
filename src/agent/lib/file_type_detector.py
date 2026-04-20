@@ -9,6 +9,25 @@ import shutil
 import subprocess
 from pathlib import Path
 
+# Non-code text groups (single source of truth).
+DOCUMENT_EXTENSIONS: tuple[str, ...] = (
+    ".md",
+    ".conf",
+    ".toml",
+    ".rulz",
+)
+
+TEXT_FILE_EXTENSIONS: tuple[str, ...] = (
+    ".env",
+    ".json",
+    ".xml",
+    ".yml",
+    ".yaml",
+    ".txt",
+)
+
+NON_CODE_TEXT_EXTENSIONS: frozenset[str] = frozenset(DOCUMENT_EXTENSIONS + TEXT_FILE_EXTENSIONS)
+
 # Расширения, всегда считаем двоичными (исполняемые, библиотеки, медиа, движки БД и т.п.)
 BINARY_EXTENSIONS: frozenset[str] = frozenset(
     {

@@ -22,9 +22,12 @@ from lib import maint_pool as maint_pool_lib
 from lib.background_task_registry import get_background_task_registry
 from lib.code_index_incremental import (
     attach_full_metadata,
+    build_fingerprints,
     compute_dirty,
     env_dirty_use_size,
     env_incremental_enabled,
+    env_incremental_mode,
+    env_max_inc_revs,
     merge_index,
     need_fingerprint_seed,
     should_force_full,
@@ -109,7 +112,7 @@ def _write_project_index_cache(project_name: str, index_dict: dict) -> str:
 def _build_project_index_full(project_id: int, project_name: str) -> tuple[dict, int, int, int, str]:
     """Полный scan: все файлы проекта → pack → кеш с file_fingerprints и rebuild_revision=0."""
     t0 = time.monotonic()
-    file_entries = g.file_manager.file_index(project_id)
+    file_entries = g.file_manager.file_index(project_id, code_only=True)
     if not file_entries:
         raise HTTPException(status_code=404, detail=f"No files in project {project_id}")
     file_ids_set = {entry["id"] for entry in file_entries}
@@ -127,6 +130,7 @@ def _build_project_index_full(project_id: int, project_name: str) -> tuple[dict,
     index_dict = attach_full_metadata(
         index_dict, file_entries, duration_sec=time.monotonic() - t0
     )
+    g.file_manager.sync_code_file_flags(project_id, index_dict.get("code_base_files") or [])
     cache_path = _write_project_index_cache(project_name, index_dict)
     return index_dict, len(file_ids_set), len(blocks), entities_count, cache_path
 
@@ -144,7 +148,7 @@ def _build_project_index_sync(project_id: int, project_name: str, *, force_full:
         log.info("project index: no file_fingerprints in cache, full rebuild project_id=%s", project_id)
         return _build_project_index_full(project_id, project_name)
 
-    max_rev = env_max_incremental_revisions()
+    max_rev = env_max_inc_revs()
     if should_force_full(cached, max_rev):
         log.info(
             "project index: rebuild_revision cap (%s), full rebuild project_id=%s",
@@ -154,18 +158,38 @@ def _build_project_index_sync(project_id: int, project_name: str, *, force_full:
         return _build_project_index_full(project_id, project_name)
 
     use_size = env_dirty_use_size()
-    file_entries = g.file_manager.file_index(project_id, include_size=use_size)
+    mode = env_incremental_mode()
+    file_entries = g.file_manager.file_index(project_id, include_size=use_size, code_only=True)
     if not file_entries:
         raise HTTPException(status_code=404, detail=f"No files in project {project_id}")
 
-    dirty, removed = compute_dirty(cached, file_entries, use_size=use_size)
+    all_file_entries = file_entries
+    dirty_cache = cached
+    code_ids = {int(e["id"]) for e in file_entries}
+    if mode == "refresh":
+        # Refresh mode keeps code-only packing, but refreshes fingerprints for all active files after rescan.
+        g.project_manager.scan_project_files(project_id=project_id)
+        all_file_entries = g.file_manager.file_index(project_id, include_size=use_size, code_only=False)
+        prev_all_fp = cached.get("all_file_fingerprints")
+        if isinstance(prev_all_fp, dict):
+            dirty_cache = dict(cached)
+            dirty_cache["file_fingerprints"] = prev_all_fp
+        dirty_all, removed_all = compute_dirty(dirty_cache, all_file_entries, use_size=use_size)
+        dirty = {fid for fid in dirty_all if fid in code_ids}
+        prev_code_ids = {int(x) for x in (cached.get("code_base_files") or []) if str(x).isdigit()}
+        removed = {fid for fid in removed_all if fid in prev_code_ids}
+    else:
+        dirty, removed = compute_dirty(cached, file_entries, use_size=use_size)
     t_step = time.monotonic()
 
     if not dirty and not removed:
         path = str(project_index_cache_path(project_name))
         n_ent = len(cached.get("entities") or [])
         out = copy.deepcopy(cached)
+        if mode == "refresh":
+            out["all_file_fingerprints"] = build_fingerprints(all_file_entries)
         stamp_rebuild_duration(out, time.monotonic() - t_step)
+        _write_project_index_cache(project_name, out)
         return out, len(file_entries), 0, n_ent, path
 
     if dirty:
@@ -198,6 +222,9 @@ def _build_project_index_sync(project_id: int, project_name: str, *, force_full:
             new_revision=new_rev,
             duration_sec=time.monotonic() - t_step,
         )
+        if mode == "refresh":
+            merged["all_file_fingerprints"] = build_fingerprints(all_file_entries)
+        g.file_manager.sync_code_file_flags(project_id, merged.get("code_base_files") or [])
         cache_path = _write_project_index_cache(project_name, merged)
         n_ent = len(merged.get("entities") or [])
         return merged, len(file_entries), len(blocks), n_ent, cache_path
@@ -215,6 +242,9 @@ def _build_project_index_sync(project_id: int, project_name: str, *, force_full:
         new_revision=new_rev,
         duration_sec=time.monotonic() - t_step,
     )
+    if mode == "refresh":
+        merged["all_file_fingerprints"] = build_fingerprints(all_file_entries)
+    g.file_manager.sync_code_file_flags(project_id, merged.get("code_base_files") or [])
     cache_path = _write_project_index_cache(project_name, merged)
     n_ent = len(merged.get("entities") or [])
     return merged, len(file_entries), 0, n_ent, cache_path

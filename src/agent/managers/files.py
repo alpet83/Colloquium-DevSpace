@@ -1,6 +1,7 @@
 # /agent/managers/files.py, updated 2025-07-26 19:45 EEST
 import globals
 import os
+import stat
 import threading
 import time
 import pwd
@@ -18,6 +19,8 @@ from lib.text_bytes import (
     normalize_codec_name,
     normalize_eol_label,
 )
+from lib.file_type_detector import NON_CODE_TEXT_EXTENSIONS
+from lib.file_attr import FA_CODE_FILE, FA_UNIX_MODE_DEFAULT
 
 log = globals.get_logger("fileman")
 
@@ -40,6 +43,11 @@ def _qfn(file_name, project_id: int) -> Path:
         pm = ProjectManager.get(project_id)
     if pm is None:
         pm = ProjectManager()
+    project_name = str(getattr(pm, "project_name", "") or "").strip("/\\")
+    if project_name:
+        pfx = f"{project_name}/"
+        if file_name.startswith(pfx):
+            file_name = file_name[len(pfx):]
     return pm.locate_file(file_name, project_id)
 
 
@@ -126,6 +134,7 @@ class FileManager:
                 "project_id INTEGER",
                 "file_encoding TEXT",
                 "file_eol TEXT",
+                f"file_attr INTEGER DEFAULT {FA_UNIX_MODE_DEFAULT}",
                 "FOREIGN KEY (project_id) REFERENCES projects(id)"
             ]
         )
@@ -142,6 +151,82 @@ class FileManager:
         # Heavy link-validation pass is intentionally deferred to background startup task.
         # Keep constructor fast to avoid delaying API bind on cold boot.
         self._initialize_missing_ttl()
+
+    @staticmethod
+    def _split_file_attr(attr_value: int | None) -> tuple[int, int]:
+        v = int(attr_value or FA_UNIX_MODE_DEFAULT)
+        mode_bits = v & 0xFFFF
+        high_bits = v & ~0xFFFF
+        return mode_bits, high_bits
+
+    def _disk_mode_bits(self, file_name: str, project_id: int | None) -> int:
+        try:
+            st = _qfn(file_name, project_id).stat()
+            return int(stat.S_IMODE(st.st_mode)) & 0xFFFF
+        except Exception:
+            return int(FA_UNIX_MODE_DEFAULT)
+
+    def _is_probable_code_file(self, file_name: str, project_id: int | None) -> bool:
+        # Quick first-pass classifier for new links; exact code-base set comes from SandwichPack.
+        try:
+            fp = _qfn(file_name, project_id)
+            if not fp.exists() or not fp.is_file():
+                return False
+            if not self.is_acceptable_file(fp):
+                return False
+            ext = fp.suffix.lower()
+            if ext in NON_CODE_TEXT_EXTENSIONS:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _compose_initial_file_attr(self, file_name: str, project_id: int | None) -> int:
+        mode_bits = self._disk_mode_bits(file_name, project_id)
+        flags = FA_CODE_FILE if self._is_probable_code_file(file_name, project_id) else 0
+        return int(mode_bits | flags)
+
+    def _refresh_file_attr_mode(self, file_id: int, file_name: str, project_id: int | None) -> None:
+        row = self.db.fetch_one(
+            "SELECT file_attr FROM attached_files WHERE id = :id",
+            {"id": int(file_id)},
+        )
+        current = int(row[0]) if row and row[0] is not None else int(FA_UNIX_MODE_DEFAULT)
+        _old_mode, high_bits = self._split_file_attr(current)
+        new_mode = self._disk_mode_bits(file_name, project_id)
+        merged = int(high_bits | new_mode)
+        if merged != current:
+            self.files_table.update(
+                conditions={"id": int(file_id)},
+                values={"file_attr": merged},
+            )
+
+    def _high_bits_for_file_id(self, file_id: int) -> int:
+        row = self.db.fetch_one(
+            "SELECT file_attr FROM attached_files WHERE id = :id",
+            {"id": int(file_id)},
+        )
+        current = int(row[0]) if row and row[0] is not None else int(FA_UNIX_MODE_DEFAULT)
+        _mode, high_bits = self._split_file_attr(current)
+        return int(high_bits)
+
+    def sync_code_file_flags(self, project_id: int, code_file_ids: list[int] | set[int]) -> None:
+        pid = int(project_id)
+        ids = sorted({int(x) for x in (code_file_ids or []) if int(x) > 0})
+        self.db.execute(
+            "UPDATE attached_files "
+            "SET file_attr = COALESCE(file_attr, :dflt) - (COALESCE(file_attr, :dflt) & :code_bit) "
+            "WHERE project_id = :pid",
+            {"pid": pid, "code_bit": int(FA_CODE_FILE), "dflt": int(FA_UNIX_MODE_DEFAULT)},
+        )
+        if not ids:
+            return
+        safe_ids = ",".join(str(i) for i in ids)
+        self.db.execute(
+            f"UPDATE attached_files SET file_attr = COALESCE(file_attr, :dflt) | :code_bit "
+            f"WHERE project_id = :pid AND id IN ({safe_ids})",
+            {"pid": pid, "code_bit": int(FA_CODE_FILE), "dflt": int(FA_UNIX_MODE_DEFAULT)},
+        )
 
     def ensure_tree_segments(self) -> None:
         """Один раз на процесс: backfill колонки path_seg_count и индекс для срезов file_tree."""
@@ -253,6 +338,12 @@ class FileManager:
                 "SET missing_checked_ts = 0 "
                 "WHERE missing_checked_ts IS NULL OR missing_checked_ts < 0",
                 {},
+            )
+            self.db.execute(
+                "UPDATE attached_files "
+                "SET file_attr = :dflt "
+                "WHERE file_attr IS NULL OR file_attr = 0",
+                {"dflt": int(FA_UNIX_MODE_DEFAULT)},
             )
         except Exception as e:
             log.warn("Не удалось инициализировать TTL для attached_files: %s", str(e))
@@ -422,7 +513,7 @@ class FileManager:
 
         rec = self.files_table.select_row(
             conditions={'id': file_id},
-            columns=['id', 'file_name', 'content', 'ts', 'project_id', 'file_encoding', 'file_eol'],
+            columns=['id', 'file_name', 'content', 'ts', 'project_id', 'file_encoding', 'file_eol', 'file_attr'],
         )
         if rec:
             return rec
@@ -461,6 +552,7 @@ class FileManager:
         file_name = strip_storage_prefix(rec[1])
         project_id = rec[4]
         file_enc_stored, file_eol_stored = rec[5], rec[6]
+        file_attr = int(rec[7]) if rec[7] is not None else int(FA_UNIX_MODE_DEFAULT)
         file_data = {
             "id": rec[0],
             "file_name": file_name,
@@ -469,6 +561,7 @@ class FileManager:
             "project_id": project_id,
             "file_encoding": normalize_codec_name(file_enc_stored),
             "file_eol": normalize_eol_label(file_eol_stored),
+            "file_attr": file_attr,
         }
         content = None
         if file_data['content'] is None:
@@ -531,6 +624,7 @@ class FileManager:
         if file_id is not None:
             # Preserve file_id and re-activate degraded link during scan/update paths.
             self._mark_link_healthy(file_id)
+            self._refresh_file_attr_mode(file_id, file_name, project_id)
             return file_id
         if timestamp is None:
             timestamp = int(time.time())
@@ -551,6 +645,7 @@ class FileManager:
 
     def _add_link(self, file_name: str, project_id: int, timestamp):
         stored = store_storage_path(file_name)
+        attr = self._compose_initial_file_attr(file_name, project_id)
         return self.files_table.insert_into(
             values={
                 'content': None,
@@ -562,6 +657,7 @@ class FileManager:
                 'project_id': project_id,
                 'file_encoding': 'utf-8',
                 'file_eol': 'lf',
+                'file_attr': attr,
             },
             ignore=True
         )
@@ -604,7 +700,8 @@ class FileManager:
                     'ts': timestamp,
                     'missing_ttl': self.missing_ttl_max,
                     'missing_checked_ts': int(time.time()),
-                    'project_id': project_id
+                    'project_id': project_id,
+                    'file_attr': (self._high_bits_for_file_id(file_id) | self._disk_mode_bits(file_name, project_id)),
                 }
             )
         _mark_project_scan_stale(project_id, reason='file_updated')
@@ -660,7 +757,8 @@ class FileManager:
                     'ts': int(time.time()),
                     'missing_ttl': self.missing_ttl_max,
                     'missing_checked_ts': int(time.time()),
-                    'project_id': project_id
+                    'project_id': project_id,
+                    'file_attr': (self._high_bits_for_file_id(file_id) | self._disk_mode_bits(new_name, project_id)),
                 }
             )
         finally:
@@ -856,10 +954,12 @@ class FileManager:
         include_size: bool = False,
         *,
         verify_links: bool = True,
+        code_only: bool = False,
         path_prefix: str | None = None,
         max_segments: int | None = None,
         min_segments: int | None = None,
         name_only: bool = False,
+        include_attr: bool = False,
     ) -> list:
         """Return lightweight file index (no content). Supports combinable filters:
         - project_id: restrict to one project
@@ -867,6 +967,7 @@ class FileManager:
         - file_ids: list of specific IDs to return
         - include_size: if True, stat() each file for size_bytes (slower on Docker FS)
         - verify_links: if True (default), each @-link is checked on disk via _link_health_state (slow at scale).
+        - code_only: if True, include only rows with FA_CODE_FILE in file_attr.
         - path_prefix: optional relative path (no leading slash); restrict to rows under this directory prefix.
         - max_segments: абсолютная глубина пути (сегменты от корня репо); path_seg_count <= bound.
         - min_segments: path_seg_count > bound; для «глубоких» имён в ленивом дереве.
@@ -877,6 +978,7 @@ class FileManager:
             include_size = False
         if name_only:
             verify_links = False
+            include_attr = False
         clauses = ['1=1']
         params = {}
         if project_id is not None:
@@ -888,8 +990,12 @@ class FileManager:
         if file_ids:
             safe_ids = ','.join(str(int(i)) for i in file_ids)  # int cast prevents injection
             clauses.append(f'id IN ({safe_ids})')
-        clauses.append('COALESCE(missing_ttl, :missing_ttl_max) >= :missing_ttl_max')
+        clauses.append('COALESCE(missing_ttl, :missing_ttl_max) > 0')
         params['missing_ttl_max'] = self.missing_ttl_max
+        if code_only:
+            clauses.append('(COALESCE(file_attr, :file_attr_default) & :code_file_bit) != 0')
+            params['file_attr_default'] = int(FA_UNIX_MODE_DEFAULT)
+            params['code_file_bit'] = int(FA_CODE_FILE)
         if path_prefix:
             frag, extra = _prefix_sql(path_prefix)
             if frag:
@@ -901,7 +1007,12 @@ class FileManager:
         if min_segments is not None:
             clauses.append('(path_seg_count IS NOT NULL AND path_seg_count > :_min_seg)')
             params['_min_seg'] = int(min_segments)
-        select_cols = "file_name, project_id" if name_only else "id, file_name, ts, project_id"
+        if name_only:
+            select_cols = "file_name, project_id"
+        elif include_attr:
+            select_cols = "id, file_name, ts, project_id, file_attr"
+        else:
+            select_cols = "id, file_name, ts, project_id"
         query = (
             f"SELECT {select_cols} FROM attached_files "
             f"WHERE {' AND '.join(clauses)} ORDER BY file_name"
@@ -922,13 +1033,19 @@ class FileManager:
                 len(rows),
             )
         for row in rows:
-            file_id, file_name, ts, proj_id = row
+            if include_attr:
+                file_id, file_name, ts, proj_id, file_attr = row
+            else:
+                file_id, file_name, ts, proj_id = row
+                file_attr = None
             clean_name = strip_storage_prefix(file_name)
             if verify_links and has_storage_prefix(file_name):
                 is_valid, _ttl = self._link_health_state(file_id, mutate=True)
                 if not is_valid:
                     continue
             entry = {'id': file_id, 'file_name': clean_name, 'ts': ts, 'project_id': proj_id}
+            if include_attr:
+                entry['file_attr'] = int(file_attr) if file_attr is not None else int(FA_UNIX_MODE_DEFAULT)
             if include_size and has_storage_prefix(file_name):
                 try:
                     fp = _qfn(clean_name, proj_id)
@@ -944,7 +1061,7 @@ class FileManager:
         ttl_max = self.missing_ttl_max
         row = self.db.fetch_one(
             "SELECT MAX(ts) FROM attached_files WHERE project_id = :project_id "
-            "AND COALESCE(missing_ttl, :ttl_max) >= :ttl_max",
+            "AND COALESCE(missing_ttl, :ttl_max) > 0",
             {"project_id": project_id, "ttl_max": ttl_max},
         )
         if not row or row[0] is None:

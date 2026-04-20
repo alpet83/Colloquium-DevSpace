@@ -87,10 +87,13 @@ name = "sandwich_lib"
 src = "{target_dir}/agent/lib"
 dst = "{sandwich_repo}/src/lib"
 exclude_globs = [
+  "code_index_incremental.py",
   "basic_logger.py",
   "esctext.py",
   "execute_commands.py",
+  "file_attr.py",
   "file_watchdog.py",
+  "project_scan_filter.py",
   "session_context.py",
   "smart_grep_scope_cache.py",
   "test_log.py",
